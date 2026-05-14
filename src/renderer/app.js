@@ -6,14 +6,26 @@ import { ChaserShader } from './shaders/ChaserShader.js'
 import { SaberShader } from './shaders/SaberShader.js'
 import { ParticleShader } from './shaders/ParticleShader.js'
 import { GeometryShader } from './shaders/GeometryShader.js'
+import { KaleidoscopeShader } from './shaders/KaleidoscopeShader.js'
+import { VoronoiShader } from './shaders/VoronoiShader.js'
+import { ChromaGlitchShader } from './shaders/ChromaGlitchShader.js'
+import { PlasmaWaveShader } from './shaders/PlasmaWaveShader.js'
+import { StarFieldShader } from './shaders/StarFieldShader.js'
+import { DomainWarpShader } from './shaders/DomainWarpShader.js'
 
 const { ipcRenderer } = require('electron')
 
 const SHADER_REGISTRY = {
-  Chaser:    renderer => new ChaserShader(renderer),
-  Saber:     renderer => new SaberShader(renderer),
-  Particles: renderer => new ParticleShader(renderer),
-  Geometry:  renderer => new GeometryShader(renderer),
+  Chaser:        renderer => new ChaserShader(renderer),
+  Saber:         renderer => new SaberShader(renderer),
+  Particles:     renderer => new ParticleShader(renderer),
+  Geometry:      renderer => new GeometryShader(renderer),
+  Kaleidoscope:  renderer => new KaleidoscopeShader(renderer),
+  Voronoi:       renderer => new VoronoiShader(renderer),
+  ChromaGlitch:  renderer => new ChromaGlitchShader(renderer),
+  PlasmaWave:    renderer => new PlasmaWaveShader(renderer),
+  StarField:     renderer => new StarFieldShader(renderer),
+  DomainWarp:    renderer => new DomainWarpShader(renderer),
 }
 
 class SpaceGen {
