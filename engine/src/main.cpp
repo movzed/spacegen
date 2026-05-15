@@ -50,7 +50,7 @@ int main() {
         GL_CHECK(glClearColor(0.0f, 0.0f, 0.0f, 1.0f));
         GL_CHECK(glClear(GL_COLOR_BUFFER_BIT));
 
-        layers.render();
+        layers.render(gui.masterFX());
 
         gui.beginFrame();
         gui.render(clock, layers);

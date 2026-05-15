@@ -1,5 +1,6 @@
 #pragma once
 #include "../layers/ILayer.h"
+#include "MasterFX.h"
 #include "RenderTarget.h"
 #include "gl.h"
 #include <vector>
@@ -19,7 +20,7 @@ public:
 
     bool init(int width, int height);
     void update(float time, float delta, bool beat, double bpm);
-    void render();
+    void render(const MasterFX& fx = {});
     void renderGUI();
     void resize(int width, int height);
     void shutdown();
@@ -45,7 +46,13 @@ private:
     GLuint m_compVao     = 0;
     GLuint m_compProgram = 0;
 
+    // Master FX post-proc
+    GLuint m_fxVao       = 0;
+    GLuint m_fxProgram   = 0;
+    RenderTarget m_fxRT;              // composite target before post-proc
+
     bool buildCompProgram();
+    bool buildFXProgram();
     void applyBlend(int mode);
     void resetBlend();
 };
