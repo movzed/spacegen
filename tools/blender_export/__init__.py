@@ -10,7 +10,11 @@ Output (in the chosen folder):
                    the engine consumes the projection matrix verbatim.
   structure.glb  — selected meshes exported as glTF 2.0 binary, in Blender's
                    Z-up coordinate system (export_yup=False) so meshes and
-                   camera matrices share one convention.
+                   camera matrices share one convention. PBR materials
+                   (baseColor, roughness, metallic, emissive) are embedded
+                   from the Principled BSDF nodes of each mesh's material
+                   and consumed by SpaceGen as a glTF MetallicRoughness
+                   workflow.
   preview.png    — optional single-frame Cycles/Eevee render at the output
                    resolution, for visual diff against engine output.
 
@@ -182,7 +186,7 @@ def export_structure_glb(mesh_objects, glb_path, context):
             use_selection=True,
             export_apply=True,
             export_yup=False,                # Z-up — match camera matrices
-            export_materials='NONE',         # holdout has no materials
+            export_materials='EXPORT',       # PBR for realtime lighting in SpaceGen
             export_animations=False,
         )
     finally:

@@ -37,7 +37,7 @@ In the chosen folder:
 | File | Purpose |
 |---|---|
 | `scene.json` | Manifest. Camera intrinsics + view matrix + projection matrix + structure metadata. Authoritative — the engine consumes `projection_matrix` verbatim. |
-| `structure.glb` | Selected meshes as glTF 2.0 binary in Blender's Z-up convention (`export_yup=False`). Loaded by the engine as the invisible depth holdout. |
+| `structure.glb` | Selected meshes as glTF 2.0 binary in Blender's Z-up convention (`export_yup=False`). Includes PBR materials (baseColor, roughness, metallic, emissive) read from each mesh's Principled BSDF and exported as glTF MetallicRoughness. Loaded by the engine as a real, visibly lit surface — illuminated by SpaceGen's realtime lights and also serving as the depth occluder for other effects. |
 | `preview.png` | Optional — single-frame render through the camera at output resolution. For visual diff against engine output. |
 
 ## Schema versioning
@@ -48,5 +48,6 @@ In the chosen folder:
 
 - Only `PERSP` cameras (panoramic + orthographic not supported)
 - Static camera only — no animation export. (Resolume + Blender's animated camera sync is out of scope; SpaceGen renders a single fixed pose.)
-- No material/texture export from meshes (holdout doesn't need them)
-- No lights export (SpaceGen lights are FX, not scene lights)
+- PBR materials only — Principled BSDF nodes export cleanly as glTF MetallicRoughness; non-Principled shaders fall back to a glTF default (mid-gray, roughness 1, non-metal).
+- Texture maps (base color / normal / roughness textures) export via glTF if they're connected to the Principled BSDF in Blender. Procedural Blender materials baked to texture are out of scope (bake manually in Blender first).
+- No lights export — SpaceGen owns the lights. Lights live inside SpaceGen so they can be animated realtime (BPM-driven, operator-controlled, MIDI-mapped). Blender lights in the scene are ignored by this exporter.
