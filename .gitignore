@@ -1,0 +1,29 @@
+.DS_Store
+.vscode/
+.idea/
+
+# Build
+build/
+.cache/
+*.o
+*.a
+*.dylib
+*.so
+compile_commands.json
+
+# Python (Blender add-on)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Blender
+*.blend1
+*.blend2
+
+# Logs
+*.log
+
+# Local secrets / env
+.env
+.env.local
