@@ -1,6 +1,8 @@
 # SpaceGen — orientation for AI assistants
 
-Realtime 3D VFX engine. Output to Resolume Arena via Syphon/NDI. Notch-class content generator.
+Realtime 3D VFX engine, **native per-platform**. Output to Resolume Arena via Syphon (macOS) / Spout (Windows) / NDI. Notch-class content generator.
+
+**Target platforms (v1)**: macOS on Apple Silicon (M1/M2/M3/M4) — primary, built first. Windows 10/11 x64 on NVIDIA RTX 30+ — fase 2 port. Linux is not a v1 target.
 
 ## What this project IS
 
@@ -32,61 +34,144 @@ The user authors a scene in Blender (the physical structure modeled with PBR mat
 
 ## Stack
 
-C++17 · GLFW 3.4 · OpenGL 4.1 Core · GLSL 410 · Dear ImGui (docking) · GLM · tinygltf · Syphon-Framework · NDI SDK · CMake 3.25 + FetchContent.
+**Architectural decision (2026-05-20)**: native graphics API per platform. No cross-platform graphics abstraction (no bgfx, no Vulkan-via-MoltenVK, no OpenGL). Each platform gets its native max-performance API. Reason: the user explicitly rejected a "disappointing common denominator" and is willing to invest in two backends to extract platform peak.
 
-OpenGL 4.1 is the macOS ceiling. Sufficient for everything described unless we hit specific limits (millions of GPU particles, image load/store, advanced compute). Re-evaluate Metal or bgfx only on demonstrated need.
+### Common (both platforms)
 
-## Engine pieces (planned)
+- **Language**: C++17 (pure C++ — use **Metal-cpp** on Mac, not Objective-C++)
+- **Windowing**: GLFW 3.4 (with `GLFW_CLIENT_API = GLFW_NO_API` so GLFW just makes a native window; we attach Metal / D3D12 swapchains ourselves)
+- **GUI**: Dear ImGui (docking branch) — uses `imgui_impl_metal` on Mac, `imgui_impl_dx12` on Windows, `imgui_impl_glfw` for input on both
+- **Math**: GLM (header-only, fine on both)
+- **glTF**: tinygltf (header-only) — produces CPU-side vertex/index/material data that each backend uploads its own way
+- **JSON**: nlohmann_json (`scene.json` parsing)
+- **Build**: CMake 3.25+ with FetchContent, platform branches via `if(APPLE)` / `if(WIN32)`
 
-- **Reused from archive**: BPMClock (drift-free + tap tempo), ShaderProgram (hot-reload), RenderTarget pattern, ImGui knob/fader widgets, fullscreen-triangle vertex shader.
-- **New**:
-  - Scene graph (transforms, lights, cameras, meshes)
-  - Camera class — loads projection + view from `scene.json`
-  - Mesh class — glTF + PBR materials via tinygltf, VAO/VBO/EBO
-  - Light types — Spot / Point / Directional, with realtime animatable params
-  - **StructurePass** — forward PBR rendering of the structure mesh, lit by active lights, writes color + alpha + depth
-  - Layer types: `MeshLayer` (additional 3D geometry), `ParticleLayer` (Transform Feedback), `VolumetricLayer` (raymarched beams/fog), `FullscreenLayer` (post-process / 2D shaders)
-  - SyphonServer (macOS), NDISender, post-FX node chain
+### macOS (v1, built first)
+
+- **Render API**: **Metal 3** via **Metal-cpp** (Apple's official C++ headers, no Objective-C/ObjC++ mixing required)
+- **Shading language**: **MSL** (Metal Shading Language — C++14-like) in `.metal` files
+- **Min target**: macOS 13 Ventura (when Metal-cpp stabilized) — likely bump to 14 Sonoma
+- **Texture sharing**: Syphon — uses IOSurface, native to Metal (no GL-to-IOSurface dance)
+- **Profiling**: Xcode GPU Frame Capture, Metal Performance HUD, Instruments
+
+### Windows (fase 2, port from Metal)
+
+- **Render API**: **DirectX 12** via the official D3D12 headers (`d3d12.h`, `dxgi1_6.h`, `d3dx12.h`)
+- **Shading language**: **HLSL** in `.hlsl` files, compiled with **DXC** (the modern DXIL compiler) at build time
+- **Min target**: Windows 10 21H2 + DX12-feature-level 11.0 hardware (RTX 30+ has 12_2 — we have plenty of headroom)
+- **Texture sharing**: Spout 2 (D3D12 shared resources)
+- **Profiling**: PIX on Windows, NVIDIA Nsight Graphics, RenderDoc
+
+### Shaders — translation strategy
+
+Open decision: write shaders **twice** (`.metal` for Mac + `.hlsl` for Windows, hand-tuned per platform) **or** write once in HLSL and translate to MSL via DXC + SPIRV-Cross. Both are real options; will be decided when we start writing the first shader. Default leaning: **hand-write per platform** for v1 since the shader surface is small (~5-10 shaders for Notch-class core) and the perf control is worth the duplication. Reconsider for v2 if shader count grows.
+
+## Engine pieces
+
+Code is split into **platform-agnostic** (`engine/core/`, `engine/fx/`, `engine/gui/`) and **per-backend** (`engine/backends/metal/`, future `engine/backends/dx12/`). Everything platform-agnostic talks to graphics through an `IRenderer` interface; backends implement it.
+
+- **Reused conceptually from archive** (will be re-implemented on Metal — the GL versions are reference only): BPMClock (drift-free + tap tempo), shader hot-reload pattern, RenderTarget pattern, ImGui knob/fader widgets.
+- **Platform-agnostic (`engine/core/`)**:
+  - `BPMClock` — pure C++ time math
+  - `Window` — thin GLFW wrapper, no graphics API
+  - `Scene` — parses `scene.json`, owns Cameras/Meshes/Lights/Materials as CPU-side data
+  - `Camera` — projection + view matrices loaded from JSON
+  - `Mesh` (CPU-side) — vertex/index buffers from tinygltf, no GPU handles
+  - `Material` — PBR struct (baseColor, roughness, metallic, emissive)
+  - `Light` — Spot / Point / Directional with animatable params + BPM hooks
+  - `ILayer.h` — interface for FX layers
+- **Render interface (`engine/render/`)**:
+  - `IRenderer.h` — abstract: `init(window)`, `createMesh(MeshData)`, `createPipeline(spec)`, `beginFrame()`, `drawStructure(...)`, `drawLayer(...)`, `endFrame()`, `getSharedTexture()`
+  - `RenderTypes.h` — platform-agnostic enums, structs (`PipelineSpec`, `MeshHandle`, `TextureHandle`, etc.)
+- **Metal backend (`engine/backends/metal/`)**:
+  - `MetalRenderer` — implements IRenderer using Metal-cpp
+  - `MetalMesh`, `MetalPipeline`, `MetalCommandBuffer` — wrappers
+  - `engine/backends/metal/shaders/` — `.metal` MSL files
+  - `StructurePass.metal` — forward PBR shader (GGX + Lambert + Schlick)
+- **DX12 backend (`engine/backends/dx12/`, fase 2)**:
+  - Mirror structure with `D3D12Renderer`, etc.
+  - `engine/backends/dx12/shaders/` — `.hlsl` files
+- **Output (`engine/output/`)**:
+  - `IOutputSharing.h` — `publish(TextureHandle, w, h, timestamp)`
+  - `SyphonOutput.cpp` — Mac, native IOSurface from Metal texture
+  - `SpoutOutput.cpp` — Win (fase 2), D3D12 shared resource
+  - `NDIOutput.cpp` — universal, GPU→CPU readback + NDI send
+- **FX (`engine/fx/`)**: post-FX, particles, volumetrics — each `ILayer` impl that calls into `IRenderer`
+- **GUI (`engine/gui/`)**: ImGui panels, platform-agnostic; backend init lives in the renderer impl
 
 ## Conventions
 
-- No raw owning pointers — `unique_ptr` / `shared_ptr` only.
-- Shader hot-reload — edit any `.frag` and changes appear next frame.
-- Every OpenGL call wrapped in `GL_CHECK()` in debug builds.
-- Single output framebuffer is `RGBA16F` with depth attachment.
-- Static camera matrices are uniforms set once at scene load, not updated per frame.
+- **No raw owning pointers** — `unique_ptr` / `shared_ptr` only (Metal-cpp uses `NS::SharedPtr<T>` for Metal objects; treat the same way).
+- **Shader hot-reload** — edit any `.metal` / `.hlsl` and changes appear next frame. Implementation: file watcher → re-compile → swap pipeline state. Compile errors surfaced in ImGui status bar with line numbers.
+- **Validation always on in debug** — Metal validation layer (`MTL_DEBUG_LAYER=1`) on Mac; D3D12 debug layer on Windows. Every API call validated; performance overhead taken willingly in debug builds.
+- **Single output framebuffer** is `RGBA16Float` with `Depth32Float` attachment.
+- **Static camera matrices** are bound once at scene load to a per-frame uniform buffer, not updated per frame.
+- **Platform-agnostic code stays in `engine/core/`** — no Metal/DX12 types leak there. Backend code stays under `engine/backends/`.
+- **Naming**: backend-specific files prefixed by API (`MetalMesh`, `D3D12Mesh`) and live in their backend folder. Common types (`Mesh`, the CPU-side struct) live in `core/`.
 
 ## Repo layout
 
 ```
 spacegen/
-├── engine/                # C++ realtime engine
-│   ├── CMakeLists.txt
-│   └── src/
-│       ├── main.cpp
-│       ├── core/          # Window, BPMClock, ShaderProgram (hot-reload), RenderTarget
-│       ├── scene/         # Camera, Mesh (glTF), Scene (scene.json + structure.glb loader)
-│       ├── layers/        # ILayer, FullscreenLayer, MeshLayer, ParticleLayer, VolumetricLayer
-│       ├── fx/            # Post FX chain
-│       ├── output/        # SyphonServer, NDISender
-│       └── gui/           # ImGui scene tree, per-effect panels
+├── engine/
+│   ├── CMakeLists.txt                # platform branches
+│   ├── main.cpp
+│   ├── core/                         # platform-agnostic C++17
+│   │   ├── BPMClock.{h,cpp}
+│   │   ├── Window.{h,cpp}            # GLFW, no graphics API
+│   │   ├── Scene.{h,cpp}             # parses scene.json
+│   │   ├── Camera.{h,cpp}
+│   │   ├── Mesh.{h,cpp}              # CPU-side glTF data
+│   │   ├── Material.{h,cpp}          # PBR struct
+│   │   ├── Light.{h,cpp}             # Spot/Point/Directional
+│   │   └── ILayer.h                  # FX layer interface
+│   ├── render/
+│   │   ├── IRenderer.h               # abstract graphics interface
+│   │   └── RenderTypes.h             # handles, enums, specs
+│   ├── backends/
+│   │   ├── metal/                    # v1
+│   │   │   ├── MetalRenderer.{h,cpp}
+│   │   │   ├── MetalMesh.{h,cpp}
+│   │   │   ├── MetalPipeline.{h,cpp}
+│   │   │   └── shaders/
+│   │   │       ├── structure.metal
+│   │   │       ├── particles.metal
+│   │   │       └── ...
+│   │   └── dx12/                     # fase 2
+│   │       ├── D3D12Renderer.{h,cpp}
+│   │       └── shaders/*.hlsl
+│   ├── output/
+│   │   ├── IOutputSharing.h
+│   │   ├── SyphonOutput.cpp          # macOS
+│   │   ├── SpoutOutput.cpp           # Windows (fase 2)
+│   │   └── NDIOutput.cpp             # universal
+│   ├── fx/                           # post-FX nodes, particles, volumetrics
+│   └── gui/                          # ImGui panels
 ├── tools/
-│   └── blender_export/    # Blender add-on (Python)
-├── shaders/               # GLSL .frag / .vert files (hot-reloaded)
-└── examples/              # Sample Blender scenes + reference exports
+│   └── blender_export/               # Blender add-on (Python, platform-agnostic)
+└── examples/                         # Sample Blender exports for testing
 ```
+
+Note: no top-level `shaders/` folder anymore — shaders live with their backend since they're API-specific.
 
 ## First deliverable (done — `a5a4bef`)
 
 Blender add-on `tools/blender_export/` writes `scene.json` + `structure.glb` (with PBR materials embedded in glTF) + optional `preview.png` from a Blender scene with an active camera and selected meshes. Establishes the data contract.
 
-## Next milestone
+## Next milestone (Metal-only, macOS)
 
-A minimal engine that:
-1. Opens a window at the export's output resolution
-2. Loads `scene.json` → uploads projection + view matrices
-3. Loads `structure.glb` via tinygltf — meshes, normals, PBR materials
-4. Renders the structure with a PBR forward shader + one hard-coded directional "test light"
-5. Outputs to default framebuffer (Syphon / NDI come after)
+A minimal Metal-backed engine that:
+1. CMake project with FetchContent for GLFW, GLM, tinygltf, nlohmann_json, ImGui (and Metal-cpp downloaded from Apple)
+2. GLFW window with `GLFW_NO_API` + `CAMetalLayer` attached
+3. Loads `scene.json` (nlohmann_json) → uploads projection + view matrices to a uniform buffer
+4. Loads `structure.glb` (tinygltf) → uploads to Metal vertex/index buffers, parses PBR material factors
+5. Renders the structure via a forward PBR shader (MSL) + one hard-coded directional "test light"
+6. Presents to the swapchain (Syphon / NDI come after)
 
-**Success criterion**: side-by-side comparison with `preview.png` from the same export shows correct camera alignment (same vanishing points, same silhouettes) and recognizable PBR shading on the structure (even if the test light doesn't match Cycles exactly — we're verifying geometry + camera, not light parity).
+**Success criterion**: side-by-side comparison with `preview.png` from the same export shows correct camera alignment (same vanishing points, same silhouettes) and recognizable PBR shading on the structure. We're validating geometry + camera + Metal pipeline plumbing, not light parity with Cycles.
+
+## Phases
+
+- **Phase 1 (current)**: Metal/macOS only. Full engine, all effects, Syphon + NDI output. Until Notch-class on Mac.
+- **Phase 2**: DX12/Windows port. Implement `D3D12Renderer` behind same `IRenderer` interface. Spout output. Reuse all `engine/core/`, `engine/fx/`, `engine/gui/` code unchanged.
+- **Phase 3 (optional, deferred)**: any post-launch feature work, possibly Linux via Vulkan if there's demand.
