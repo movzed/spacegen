@@ -19,6 +19,7 @@
 #include "../core/StructureLayer.h"
 #include "../core/BeamLayer.h"
 #include "../core/DirectionalLightLayer.h"
+#include "../core/AmbientLightLayer.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
@@ -170,6 +171,15 @@ void drawLayerRack(spacegen::Scene& scene,
                        scene.bus.layers.size());
         d->name = buf;
         selectedLayerId = d->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Ambient")) {
+        auto* a = scene.bus.add<spacegen::AmbientLightLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Ambient %zu",
+                       scene.bus.layers.size());
+        a->name = buf;
+        selectedLayerId = a->id;
     }
     ImGui::Separator();
 

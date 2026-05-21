@@ -21,7 +21,9 @@ public:
     glm::vec3 baseColor = glm::vec3(0.72f);
     float     roughness = 0.55f;
     float     metallic  = 0.0f;
-    float     ambient   = 0.10f;   // small fill so unlit structure isn't pitch black
+    // Ambient fill is a separate layer (AmbientLightLayer) — add one to the
+    // bus when you want a fill floor on the structure. No more hidden
+    // ambient in the material.
 
     // Output mode:
     //   false (default): structure renders fully — base color + ambient +

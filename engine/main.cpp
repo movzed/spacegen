@@ -26,6 +26,7 @@
 #include "core/StructureLayer.h"
 #include "core/BeamLayer.h"
 #include "core/DirectionalLightLayer.h"
+#include "core/AmbientLightLayer.h"
 #include "backends/metal/MetalRenderer.h"
 #include "gui/Workstation.h"
 
@@ -38,7 +39,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M3-B.3 (motion patterns + lights-only)";
+constexpr char kWindowTitle[] = "SpaceGen — M3-B.4 (ambient as layer + dark stage default)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);
@@ -184,17 +185,23 @@ int main(int argc, char** argv) {
     std::printf("[SpaceGen] Renderer: %zu meshes, %zu triangles total on GPU\n",
                  renderer->meshCount(), renderer->totalTriangles());
 
-    // Populate the bus with the default starter layers:
-    //   Structure (the mesh)
-    //   Key directional (fill light from above-right)
-    //   Spot 1 (moving head from the camera position)
+    // Populate the bus with the default starter layers. Everything except
+    // Structure starts disabled so the operator sees a dark stage and adds
+    // light explicitly — no implicit gray fill on the relief.
     scene.bus.add<spacegen::StructureLayer>();
+    {
+        auto* a = scene.bus.add<spacegen::AmbientLightLayer>();
+        a->name      = "Ambient";
+        a->intensity = 0.02f;
+        a->state     = spacegen::LayerState::Disabled;
+    }
     {
         auto* d = scene.bus.add<spacegen::DirectionalLightLayer>();
         d->name      = "Key fill";
         d->panDeg    = 35.0f;
         d->tiltDeg   = -55.0f;
-        d->intensity = 1.4f;
+        d->intensity = 1.0f;
+        d->state     = spacegen::LayerState::Disabled;
     }
     {
         auto* b = scene.bus.add<spacegen::BeamLayer>();
@@ -203,9 +210,9 @@ int main(int argc, char** argv) {
         b->origin       = glm::vec3(scene.camera.world[3]);
         b->panDeg       = 0.0f;
         b->tiltDeg      = 0.0f;
-        b->intensity    = 8.0f;
-        b->innerDeg     = 6.0f;
-        b->outerDeg     = 12.0f;
+        b->intensity    = 4.0f;
+        b->innerDeg     = 12.0f;
+        b->outerDeg     = 22.0f;
     }
 
     // ImGui Workstation (overlays panels on top of the rendered scene).

@@ -60,7 +60,8 @@ struct Uniforms {
     float4x4  model;
     float4    cameraWorldPos;
     float4    baseColorRoughness;   // .rgb base, .a roughness
-    float4    metallicAmbient;      // .x metallic, .y ambient, .z spotCount, .w dirCount
+    float4    metallicCounts;       // .x metallic, .y unused, .z spotCount, .w dirCount
+    float4    ambientColor;         // .rgb ambient fill, .a unused
     float4    modeFlags;            // .x emitLightsOnly (0/1), others reserved
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
@@ -131,10 +132,10 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
 
     float3 baseColor = u.baseColorRoughness.rgb;
     float  roughness = max(u.baseColorRoughness.a, 0.04);
-    float  metallic  = u.metallicAmbient.r;
-    float  ambient   = u.metallicAmbient.g;
-    int    spotCount = int(u.metallicAmbient.b);
-    int    dirCount  = int(u.metallicAmbient.a);
+    float  metallic  = u.metallicCounts.r;
+    float3 ambient   = u.ambientColor.rgb;
+    int    spotCount = int(u.metallicCounts.b);
+    int    dirCount  = int(u.metallicCounts.a);
 
     float3 F0 = mix(float3(0.04), baseColor, metallic);
 
@@ -222,7 +223,8 @@ struct Uniforms {
     glm::mat4 model;
     glm::vec4 cameraWorldPos;
     glm::vec4 baseColorRoughness;
-    glm::vec4 metallicAmbient;   // .z spotCount, .w dirCount (both as floats)
+    glm::vec4 metallicCounts;    // .x metallic, .z spotCount, .w dirCount
+    glm::vec4 ambientColor;      // .rgb ambient fill
     glm::vec4 modeFlags;         // .x emitLightsOnly (0/1)
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
@@ -429,7 +431,8 @@ void MetalRenderer::renderStructureMeshes(
     RenderContext& ctx,
     const StructureLayer& layer,
     const std::vector<const BeamLayer*>& spots,
-    const std::vector<const DirectionalLightLayer*>& dirs)
+    const std::vector<const DirectionalLightLayer*>& dirs,
+    const glm::vec3& ambientColor)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -509,10 +512,11 @@ void MetalRenderer::renderStructureMeshes(
         u.model              = gm.transform;
         u.cameraWorldPos     = glm::vec4(ctx.cameraWorldPos, 1.0f);
         u.baseColorRoughness = glm::vec4(layer.baseColor, layer.roughness);
-        u.metallicAmbient    = glm::vec4(layer.metallic,
-                                          layer.ambient,
+        u.metallicCounts     = glm::vec4(layer.metallic,
+                                          0.0f,
                                           static_cast<float>(spotCount),
                                           static_cast<float>(dirCount));
+        u.ambientColor       = glm::vec4(ambientColor, 0.0f);
         u.modeFlags          = glm::vec4(layer.emitLightsOnly ? 1.0f : 0.0f,
                                           0.0f, 0.0f, 0.0f);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);

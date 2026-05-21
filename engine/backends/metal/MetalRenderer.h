@@ -46,13 +46,15 @@ public:
 
     // ---- Per-layer render helpers (called from Layer::render) ----
     // Structure pass: PBR forward over all loaded meshes with the layer's
-    // material + up to 16 spot lights + up to 4 directional lights, all
-    // collected from the bus. LoadAction=Clear.
+    // material + up to 16 spot lights + up to 4 directional lights + a
+    // summed ambient color (from all enabled AmbientLightLayers in the bus).
+    // LoadAction=Clear.
     void renderStructureMeshes(
         RenderContext& ctx,
         const StructureLayer& layer,
         const std::vector<const BeamLayer*>& spots,
-        const std::vector<const DirectionalLightLayer*>& dirs);
+        const std::vector<const DirectionalLightLayer*>& dirs,
+        const glm::vec3& ambientColor);
 
     // Public scene matrices (used by Layers when building their uniforms).
     const glm::mat4& projection()      const { return projection_; }

@@ -1,5 +1,6 @@
 #include "StructureLayer.h"
 
+#include "AmbientLightLayer.h"
 #include "BeamLayer.h"
 #include "DirectionalLightLayer.h"
 #include "Scene.h"
@@ -22,6 +23,7 @@ void StructureLayer::render(RenderContext& ctx) {
     // integrates them in one pass — we don't render visible beams in air.
     std::vector<const BeamLayer*>             spots;
     std::vector<const DirectionalLightLayer*> dirs;
+    glm::vec3 ambientColor(0.0f);  // sum of enabled AmbientLightLayers
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -31,10 +33,12 @@ void StructureLayer::render(RenderContext& ctx) {
                 spots.push_back(b);
             } else if (auto* d = dynamic_cast<const DirectionalLightLayer*>(l.get())) {
                 dirs.push_back(d);
+            } else if (auto* a = dynamic_cast<const AmbientLightLayer*>(l.get())) {
+                ambientColor += a->color * (a->intensity * a->opacity);
             }
         }
     }
-    ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs);
+    ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs, ambientColor);
 }
 
 void StructureLayer::drawInspector() {
@@ -55,9 +59,9 @@ void StructureLayer::drawInspector() {
                           | ImGuiColorEditFlags_Float);
         ImGui::SliderFloat("Roughness##s", &roughness, 0.04f, 1.0f);
         ImGui::SliderFloat("Metallic##s",  &metallic,  0.0f,  1.0f);
-        ImGui::SliderFloat("Ambient##s",   &ambient,   0.0f,  0.4f);
     }
-    ImGui::TextDisabled("Add a Directional or Spot layer in the rack.");
+    ImGui::TextDisabled("Add Ambient / Directional / Spot layers");
+    ImGui::TextDisabled("from the rack to light the structure.");
 }
 
 } // namespace spacegen

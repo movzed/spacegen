@@ -139,6 +139,7 @@ add_executable(spacegen
     core/StructureLayer.cpp
     core/BeamLayer.cpp
     core/DirectionalLightLayer.cpp
+    core/AmbientLightLayer.cpp
     backends/metal/MetalRenderer.cpp
     gui/Workstation.mm
     ${IMGUI_SOURCES}
