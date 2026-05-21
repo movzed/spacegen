@@ -28,6 +28,9 @@ examples/*/
 # Logs
 *.log
 
+# ImGui session layout (per-user, not source)
+imgui.ini
+
 # Local secrets / env
 .env
 .env.local
