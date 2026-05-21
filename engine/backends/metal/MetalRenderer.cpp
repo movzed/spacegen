@@ -70,6 +70,7 @@ struct Uniforms {
     float4    matEmissive;          // .rgb material emissiveFactor
     float4    matMR;                // .x metallicFactor, .y roughnessFactor
     float4    fx;                   // .x displaceAmount, .y displaceScale, .z twistAmount
+    float4    syphonMixTint;        // .x mix (0..1), .yzw tint RGB
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
@@ -164,6 +165,7 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
                         texture2d<float> baseColorMap [[texture(0)]],
                         texture2d<float> mrMap        [[texture(1)]],
                         texture2d<float> emissiveMap  [[texture(2)]],
+                        texture2d<float> syphonMap    [[texture(3)]],
                         sampler          smp          [[sampler(0)]])
 {
     float3 N = normalize(in.worldNormal);
@@ -175,11 +177,19 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     float4 mrTex   = mrMap       .sample(smp, in.uv);
     float3 emiTex  = emissiveMap .sample(smp, in.uv).rgb;
 
+    // Live Syphon texture: mixed into the base color according to mix slider.
+    // Syphon publishes sRGB textures by convention; the texture binding is
+    // configured to read as sRGB so the sample is already linear here.
+    float3 syphonSample = syphonMap.sample(smp, in.uv).rgb * u.syphonMixTint.yzw;
+    float  syphonMix    = saturate(u.syphonMixTint.x);
+
     // Compose final material values:
-    //   final = operator_tint × material_factor × texture
-    float3 baseColor = u.baseColorRoughness.rgb
+    //   final = operator_tint × material_factor × texture, then mix the
+    //   Syphon overlay on top of that for the base color channel.
+    float3 baseMat   = u.baseColorRoughness.rgb
                      * u.matBaseColor.rgb
                      * baseTex.rgb;
+    float3 baseColor = mix(baseMat, syphonSample, syphonMix);
     float  roughness = max(u.baseColorRoughness.a
                           * u.matMR.y
                           * mrTex.g, 0.04);
@@ -284,6 +294,7 @@ struct Uniforms {
     glm::vec4 matEmissive;       // .rgb emissiveFactor
     glm::vec4 matMR;             // .x metallicFactor, .y roughnessFactor
     glm::vec4 fx;                // .x displace, .y displaceScale, .z twist
+    glm::vec4 syphonMixTint;     // .x mix, .yzw tint
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
@@ -619,7 +630,10 @@ void MetalRenderer::renderStructureMeshes(
     const StructureLayer& layer,
     const std::vector<const BeamLayer*>& spots,
     const std::vector<const DirectionalLightLayer*>& dirs,
-    const glm::vec3& ambientColor)
+    const glm::vec3& ambientColor,
+    MTL::Texture* syphonTex,
+    float          syphonMix,
+    const glm::vec3& syphonTint)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -741,6 +755,7 @@ void MetalRenderer::renderStructureMeshes(
             twistEff += mods->eval(layer.twistModSlot,    t) * layer.twistModDepth;
         }
         u.fx = glm::vec4(dispEff, layer.displaceScale, twistEff, 0.0f);
+        u.syphonMixTint = glm::vec4(syphonMix, syphonTint);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 
@@ -757,6 +772,8 @@ void MetalRenderer::renderStructureMeshes(
             ? mat.mrTex         : defaultLinear_, 1);
         enc->setFragmentTexture(mat.emissiveTex
             ? mat.emissiveTex   : defaultBlack_,  2);
+        enc->setFragmentTexture(syphonTex
+            ? syphonTex         : defaultBlack_,  3);
         enc->setFragmentSamplerState(linearSampler_, 0);
 
         enc->drawIndexedPrimitives(

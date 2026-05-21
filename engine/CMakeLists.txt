@@ -140,6 +140,7 @@ add_executable(spacegen
     core/BeamLayer.cpp
     core/DirectionalLightLayer.cpp
     core/AmbientLightLayer.cpp
+    core/SyphonInputLayer.mm
     backends/metal/MetalRenderer.cpp
     gui/Workstation.mm
     ${IMGUI_SOURCES}
@@ -161,10 +162,21 @@ target_link_libraries(spacegen PRIVATE
     "-framework QuartzCore"
     "-framework Metal"
     "-framework AppKit"
+    "-F${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+    "-framework Syphon"
+)
+
+# Set rpath so the binary finds Syphon.framework next to the executable.
+# Build output lives in engine/build/spacegen; framework lives in
+# engine/third_party/Syphon.framework — relative path is ../third_party.
+set_target_properties(spacegen PROPERTIES
+    BUILD_RPATH   "${CMAKE_CURRENT_SOURCE_DIR}/third_party;@loader_path/../third_party"
+    INSTALL_RPATH "@loader_path/../third_party"
 )
 
 target_compile_options(spacegen PRIVATE
     -Wall -Wextra -Wno-unused-parameter
+    "-F${CMAKE_CURRENT_SOURCE_DIR}/third_party"
 )
 
 # Useful at config time

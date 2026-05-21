@@ -20,6 +20,7 @@
 #include "../core/BeamLayer.h"
 #include "../core/DirectionalLightLayer.h"
 #include "../core/AmbientLightLayer.h"
+#include "../core/SyphonInputLayer.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
@@ -184,6 +185,15 @@ void drawLayerRack(spacegen::Scene& scene,
                        scene.bus.layers.size());
         a->name = buf;
         selectedLayerId = a->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Syphon")) {
+        auto* s = scene.bus.add<spacegen::SyphonInputLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Syphon %zu",
+                       scene.bus.layers.size());
+        s->name = buf;
+        selectedLayerId = s->id;
     }
     ImGui::Separator();
 

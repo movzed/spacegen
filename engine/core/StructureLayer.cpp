@@ -4,6 +4,7 @@
 #include "BeamLayer.h"
 #include "DirectionalLightLayer.h"
 #include "Scene.h"
+#include "SyphonInputLayer.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include "imgui.h"
@@ -23,7 +24,10 @@ void StructureLayer::render(RenderContext& ctx) {
     // integrates them in one pass — we don't render visible beams in air.
     std::vector<const BeamLayer*>             spots;
     std::vector<const DirectionalLightLayer*> dirs;
-    glm::vec3 ambientColor(0.0f);  // sum of enabled AmbientLightLayers
+    glm::vec3 ambientColor(0.0f);
+    MTL::Texture*  syphonTex      = nullptr;
+    float          syphonMix      = 0.0f;
+    glm::vec3      syphonTint(1.0f);
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -35,10 +39,21 @@ void StructureLayer::render(RenderContext& ctx) {
                 dirs.push_back(d);
             } else if (auto* a = dynamic_cast<const AmbientLightLayer*>(l.get())) {
                 ambientColor += a->color * (a->intensity * a->opacity);
+            } else if (auto* s = dynamic_cast<SyphonInputLayer*>(l.get())) {
+                // First enabled Syphon input wins. We mutate via a const_cast
+                // because s->render() was called earlier in the bus walk; here
+                // we only query the cached current texture.
+                if (!syphonTex) {
+                    syphonTex  = s->currentTexture();
+                    syphonMix  = s->mix * s->opacity;
+                    syphonTint = s->tint;
+                }
             }
         }
     }
-    ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs, ambientColor);
+    ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs,
+                                          ambientColor,
+                                          syphonTex, syphonMix, syphonTint);
 }
 
 void StructureLayer::drawInspector() {

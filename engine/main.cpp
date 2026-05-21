@@ -39,7 +39,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M3-E (mesh FX: displace + twist)";
+constexpr char kWindowTitle[] = "SpaceGen — M3-F (Syphon input texture)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);

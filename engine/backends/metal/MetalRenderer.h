@@ -54,7 +54,10 @@ public:
         const StructureLayer& layer,
         const std::vector<const BeamLayer*>& spots,
         const std::vector<const DirectionalLightLayer*>& dirs,
-        const glm::vec3& ambientColor);
+        const glm::vec3& ambientColor,
+        MTL::Texture* syphonTex    = nullptr,   // optional live video overlay
+        float          syphonMix   = 0.0f,
+        const glm::vec3& syphonTint = glm::vec3(1.0f));
 
     // Public scene matrices (used by Layers when building their uniforms).
     const glm::mat4& projection()      const { return projection_; }
