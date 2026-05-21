@@ -21,14 +21,14 @@ namespace {
 // Up to MAX_DIRS directional lights + MAX_SPOTS spot lights, all
 // collected from the bus. NO volumetric render — spot lights are
 // projection-mapping style: only visible where they hit the surface.
-constexpr int kMaxSpots = 16;
+constexpr int kMaxSpots = 32;   // up to ~4 rigs × 8 fixtures
 constexpr int kMaxDirs  = 4;
 constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
 constant float PI         = 3.14159265359;
-constant int   MAX_SPOTS  = 16;
+constant int   MAX_SPOTS  = 32;
 constant int   MAX_DIRS   = 4;
 
 struct VertexIn {
@@ -468,18 +468,18 @@ void MetalRenderer::renderStructureMeshes(
 
     const double t = ctx.elapsedSeconds;
 
-    // Pack spot lights (evaluate pan/tilt/intensity LFOs).
-    int spotCount = std::min(static_cast<int>(spots.size()), kMaxSpots);
+    // Pack spot lights. Each BeamLayer is a rig that expands to N fixtures;
+    // each fixture has its own world position, color, and phase-shifted LFO
+    // evaluation. Total spots clamped to kMaxSpots.
     GpuSpot spotsPacked[kMaxSpots]{};
-    for (int i = 0; i < spotCount; ++i) {
-        const BeamLayer* s = spots[i];
-        if (!s) continue;
+    int spotCount = 0;
+    for (const BeamLayer* s : spots) {
+        if (!s || spotCount >= kMaxSpots) break;
         glm::vec3 baseFwd = s->followCamera
             ? glm::normalize(ctx.cameraForward)
             : glm::vec3(0.0f, 1.0f, 0.0f);
-        glm::vec3 origin = s->followCamera ? ctx.cameraWorldPos : s->origin;
-        glm::vec3 dir    = s->directionAtTime(t, baseFwd);
-        float     inten  = s->intensityAtTime(t) * s->opacity;
+        auto positions = s->fixturePositions(ctx);
+        int  N = static_cast<int>(positions.size());
 
         float innerRad = s->innerDeg * 3.14159265f / 180.0f;
         float outerRad = s->outerDeg * 3.14159265f / 180.0f;
@@ -487,10 +487,22 @@ void MetalRenderer::renderStructureMeshes(
         float innerCos = std::cos(innerRad);
         float outerCos = std::cos(outerRad);
 
-        spotsPacked[i].posIntensity = glm::vec4(origin, inten);
-        spotsPacked[i].dirRange     = glm::vec4(dir, s->range);
-        spotsPacked[i].colorInner   = glm::vec4(s->color, innerCos);
-        spotsPacked[i].paramsOuter  = glm::vec4(outerCos, 0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < N && spotCount < kMaxSpots; ++i, ++spotCount) {
+            glm::vec3 origin = positions[i];
+            glm::vec3 dir    = s->directionAtTimeForFixture(t, i, N, baseFwd);
+            float     inten  = s->intensityAtTimeForFixture(t, i, N)
+                               * s->opacity;
+            glm::vec3 col    = s->colorForFixture(i);
+
+            spotsPacked[spotCount].posIntensity =
+                glm::vec4(origin, inten);
+            spotsPacked[spotCount].dirRange     =
+                glm::vec4(dir, s->range);
+            spotsPacked[spotCount].colorInner   =
+                glm::vec4(col, innerCos);
+            spotsPacked[spotCount].paramsOuter  =
+                glm::vec4(outerCos, 0.0f, 0.0f, 0.0f);
+        }
     }
 
     // Pack directional lights (pan/tilt + intensity LFOs).

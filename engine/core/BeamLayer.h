@@ -11,6 +11,8 @@
 #include "Layer.h"
 #include "LFO.h"
 
+#include <vector>
+
 namespace spacegen {
 
 class BeamLayer : public ILayer {
@@ -21,6 +23,44 @@ public:
     const char* typeName() const override { return "Spot Light"; }
     void        render(RenderContext& /*ctx*/) override {}  // consumed by StructureLayer
     void        drawInspector() override;
+
+    // ---- Rig layout ----
+    // The layer is conceptually a rig of N identical fixtures arranged
+    // symmetrically around the center (camera if followCamera, else origin).
+    // All fixtures share color / intensity / pan / tilt / cone. Only their
+    // world position differs.
+    enum class Layout : int {
+        Single = 0,   // 1 fixture at the center
+        Linear = 1,   // N fixtures evenly spaced on the camera's right axis
+        Arc    = 2,   // N fixtures on a horizontal arc, all looking inward
+    };
+
+    Layout   layout       = Layout::Single;
+    int      fixtureCount = 1;       // 1..8 (max 4 per side around center)
+    float    spacing      = 1.0f;    // meters between adjacent fixtures (Linear)
+    float    arcRadius    = 4.0f;    // distance from center for Arc layout
+    float    arcSpreadDeg = 90.0f;   // total angular spread for Arc layout
+
+    // Per-fixture phase distribution for ALL LFOs (per-axis + motion).
+    // 0.0 -> every fixture sees the LFOs in sync (vertical sweep up/down).
+    // 1.0 -> the LFO cycle is distributed evenly across fixtures, producing
+    //        chase effects (figure-8s "pursue each other", waves travel).
+    // Intermediate values blend continuously.
+    float    fixturePhase = 0.0f;    // 0..1
+
+    // Per-fixture colors. If `useFixtureColors == true`, fixture i uses
+    // fixtureColors[i] (mod size). Otherwise all fixtures use `color`.
+    bool                    useFixtureColors = false;
+    std::vector<glm::vec3>  fixtureColors;   // resized lazily to fixtureCount
+
+    // Returns world-space positions of the N fixtures.
+    std::vector<glm::vec3> fixturePositions(const RenderContext& ctx) const;
+
+    // Per-fixture helpers (account for fixturePhase and useFixtureColors).
+    glm::vec3 colorForFixture(int idx) const;
+    glm::vec3 directionAtTimeForFixture(double t, int idx, int total,
+                                          const glm::vec3& baseForward) const;
+    float     intensityAtTimeForFixture(double t, int idx, int total) const;
 
     // ---- Position ----
     glm::vec3 origin       = glm::vec3(0.0f, -6.0f, 1.0f);

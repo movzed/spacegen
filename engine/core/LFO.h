@@ -22,11 +22,14 @@ struct LFO {
     Wave   wave     = Wave::Sine;
 
     // Returns the modulation offset at time `t` (seconds).
-    // Caller adds this to the base value.
-    float eval(double t) const {
+    // `extraPhase` lets callers offset the cycle (for per-fixture chases:
+    // pass i/N to spread N fixtures evenly across the LFO cycle).
+    float eval(double t, float extraPhase = 0.0f) const {
         if (!enabled) return 0.0f;
         // u is the fractional phase in [0, 1).
-        double cycle = t * static_cast<double>(freqHz) + static_cast<double>(phase);
+        double cycle = t * static_cast<double>(freqHz)
+                     + static_cast<double>(phase)
+                     + static_cast<double>(extraPhase);
         double u = cycle - std::floor(cycle);
         float v = 0.0f;
         switch (wave) {
@@ -72,12 +75,13 @@ struct MotionLFO {
 
     struct Output { float panDeg, tiltDeg, intensity; };
 
-    Output eval(double t) const {
+    Output eval(double t, float extraPhase = 0.0f) const {
         Output out{0.0f, 0.0f, 0.0f};
         if (pattern == Pattern::Off) return out;
 
         double cycle = t * static_cast<double>(freqHz)
-                     + static_cast<double>(phase);
+                     + static_cast<double>(phase)
+                     + static_cast<double>(extraPhase);
         double a     = cycle * 6.283185307179586;  // radians
         double s     = std::sin(a);
         double c     = std::cos(a);
