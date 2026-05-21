@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Layer.h"
+#include "ModulatorBank.h"
 
 #include <cstdint>
 #include <string>
@@ -105,6 +106,7 @@ struct Scene {
     std::vector<TextureData>    textures;
     std::vector<Light>          lights;
     Bus                         bus;
+    ModulatorBank               modulators;
 
     // Loads `scene.json` from `folderPath`, then optionally `structure.glb`
     // referenced by the manifest. Throws std::runtime_error on hard failure

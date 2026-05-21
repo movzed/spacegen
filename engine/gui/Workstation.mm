@@ -32,6 +32,7 @@ namespace {
 constexpr const char* kCompositionWindowName = "Composition";
 constexpr const char* kStatsWindowName       = "Stats";
 constexpr const char* kLayersWindowName      = "Layers";
+constexpr const char* kModulatorsWindowName  = "Modulators";
 constexpr const char* kInspectorWindowName   = "Inspector";
 
 void styleSpaceGen() {
@@ -76,12 +77,14 @@ void buildDefaultLayout(ImGuiID dockspace_id) {
 
     ImGui::DockBuilderDockWindow(kStatsWindowName,       dockLeft);
     ImGui::DockBuilderDockWindow(kLayersWindowName,      dockLeftBottom);
+    ImGui::DockBuilderDockWindow(kModulatorsWindowName,  dockLeftBottom);
     ImGui::DockBuilderDockWindow(kInspectorWindowName,   dockRight);
     ImGui::DockBuilderDockWindow(kCompositionWindowName, dockCenter);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
 void drawMainMenuBar(bool& showStats, bool& showLayers,
+                     bool& showModulators,
                      bool& showInspector, bool& showDemo) {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
@@ -94,9 +97,10 @@ void drawMainMenuBar(bool& showStats, bool& showLayers,
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem(kStatsWindowName,     nullptr, &showStats);
-            ImGui::MenuItem(kLayersWindowName,    nullptr, &showLayers);
-            ImGui::MenuItem(kInspectorWindowName, nullptr, &showInspector);
+            ImGui::MenuItem(kStatsWindowName,      nullptr, &showStats);
+            ImGui::MenuItem(kLayersWindowName,     nullptr, &showLayers);
+            ImGui::MenuItem(kModulatorsWindowName, nullptr, &showModulators);
+            ImGui::MenuItem(kInspectorWindowName,  nullptr, &showInspector);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &showDemo);
             ImGui::EndMenu();
@@ -267,6 +271,44 @@ void drawLayerRack(spacegen::Scene& scene,
     ImGui::End();
 }
 
+// Modulators panel: global pool of N LFOs. Each can be bound from any
+// modulatable parameter (currently spot pan / tilt / intensity) via the
+// "Mod bank bindings" dropdowns in that layer's Inspector.
+void drawModulators(spacegen::Scene& scene, bool* open) {
+    if (!ImGui::Begin(kModulatorsWindowName, open)) { ImGui::End(); return; }
+    ImGui::TextDisabled("Global LFOs (assign from any param's");
+    ImGui::TextDisabled("'Mod bank bindings' dropdown)");
+    ImGui::Separator();
+
+    static const char* kWaveNames[] = { "Sine", "Triangle", "Square", "Saw" };
+
+    for (int i = 0; i < spacegen::kModulatorBankSize; ++i) {
+        auto& e = scene.modulators.entry(i);
+        ImGui::PushID(i);
+
+        // Header row: enable + slot number + name
+        bool en = e.lfo.enabled;
+        if (ImGui::Checkbox("##en", &en)) e.lfo.enabled = en;
+        ImGui::SameLine();
+        ImGui::Text("%d ▸ %s", i + 1, e.name.c_str());
+
+        if (e.lfo.enabled) {
+            ImGui::Indent(20.0f);
+            int w = static_cast<int>(e.lfo.wave);
+            ImGui::SetNextItemWidth(110.0f);
+            if (ImGui::Combo("wave", &w, kWaveNames, 4)) {
+                e.lfo.wave = static_cast<spacegen::LFO::Wave>(w);
+            }
+            ImGui::SliderFloat("freq (Hz)", &e.lfo.freqHz, 0.0f, 8.0f);
+            ImGui::SliderFloat("phase",     &e.lfo.phase,  0.0f, 1.0f);
+            ImGui::Unindent(20.0f);
+        }
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::End();
+}
+
 // Inspector: shows the selected layer's drawInspector(). If none selected,
 // helpful empty state.
 void drawInspector(spacegen::Scene& scene,
@@ -402,12 +444,14 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
         layoutBuilt_ = true;
     }
 
-    drawMainMenuBar(showStats_, showLayers_, showInspector_, showDemo_);
-    if (showStats_)     drawStatsPanel(scene, renderer,
-                                       currentStats_, &showStats_);
-    if (showLayers_)    drawLayerRack(scene, selectedLayerId_, &showLayers_);
-    if (showInspector_) drawInspector(scene, selectedLayerId_, &showInspector_);
-    if (showDemo_)      ImGui::ShowDemoWindow(&showDemo_);
+    drawMainMenuBar(showStats_, showLayers_, showModulators_,
+                     showInspector_, showDemo_);
+    if (showStats_)      drawStatsPanel(scene, renderer,
+                                        currentStats_, &showStats_);
+    if (showLayers_)     drawLayerRack(scene, selectedLayerId_, &showLayers_);
+    if (showModulators_) drawModulators(scene, &showModulators_);
+    if (showInspector_)  drawInspector(scene, selectedLayerId_, &showInspector_);
+    if (showDemo_)       ImGui::ShowDemoWindow(&showDemo_);
 
     // Selection bookkeeping:
     //  - If the selected id refers to a layer that no longer exists (removed

@@ -57,10 +57,14 @@ public:
     std::vector<glm::vec3> fixturePositions(const RenderContext& ctx) const;
 
     // Per-fixture helpers (account for fixturePhase and useFixtureColors).
+    // `mods` is the global ModulatorBank from Scene; pass nullptr to skip
+    // modulator contributions (useful for unit tests / preview).
     glm::vec3 colorForFixture(int idx) const;
     glm::vec3 directionAtTimeForFixture(double t, int idx, int total,
-                                          const glm::vec3& baseForward) const;
-    float     intensityAtTimeForFixture(double t, int idx, int total) const;
+                                          const glm::vec3& baseForward,
+                                          const class ModulatorBank* mods = nullptr) const;
+    float     intensityAtTimeForFixture(double t, int idx, int total,
+                                          const class ModulatorBank* mods = nullptr) const;
 
     // ---- Position ----
     glm::vec3 origin       = glm::vec3(0.0f, -6.0f, 1.0f);
@@ -90,6 +94,17 @@ public:
     // Multi-axis motion pattern (Circle / Figure8 / Ballyhoo / Wave / etc.).
     // Adds offsets on top of the per-axis LFOs above. Off by default.
     MotionLFO motionLFO;
+
+    // ---- Global modulator-bank bindings ----
+    // Each field can subscribe to one of N global ModulatorBank slots.
+    // slot 0 = unbound. Slot's output (normalized -1..+1) is multiplied
+    // by the depth value and added to the base parameter.
+    int   panModSlot       = 0;
+    float panModDepth      = 30.0f;
+    int   tiltModSlot      = 0;
+    float tiltModDepth     = 20.0f;
+    int   intensityModSlot = 0;
+    float intensityModDepth = 5.0f;
 
     // Compute the world-space pointing direction at time t given a base
     // forward axis (camera forward or world +Y).

@@ -5,6 +5,7 @@
 #include "../../core/StructureLayer.h"
 #include "../../core/BeamLayer.h"
 #include "../../core/DirectionalLightLayer.h"
+#include "../../core/ModulatorBank.h"
 
 #include <algorithm>
 #include <cmath>
@@ -644,10 +645,11 @@ void MetalRenderer::renderStructureMeshes(
         float innerCos = std::cos(innerRad);
         float outerCos = std::cos(outerRad);
 
+        const ModulatorBank* mods = ctx.scene ? &ctx.scene->modulators : nullptr;
         for (int i = 0; i < N && spotCount < kMaxSpots; ++i, ++spotCount) {
             glm::vec3 origin = positions[i];
-            glm::vec3 dir    = s->directionAtTimeForFixture(t, i, N, baseFwd);
-            float     inten  = s->intensityAtTimeForFixture(t, i, N)
+            glm::vec3 dir    = s->directionAtTimeForFixture(t, i, N, baseFwd, mods);
+            float     inten  = s->intensityAtTimeForFixture(t, i, N, mods)
                                * s->opacity;
             glm::vec3 col    = s->colorForFixture(i);
 

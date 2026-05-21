@@ -1,4 +1,5 @@
 #include "BeamLayer.h"
+#include "ModulatorBank.h"
 
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -138,21 +139,30 @@ glm::vec3 BeamLayer::colorForFixture(int idx) const {
 }
 
 glm::vec3 BeamLayer::directionAtTimeForFixture(
-    double t, int idx, int total, const glm::vec3& baseForward) const
+    double t, int idx, int total, const glm::vec3& baseForward,
+    const ModulatorBank* mods) const
 {
     float ph     = fixturePhaseShift(idx, total, fixturePhase);
     auto motion  = motionLFO.eval(t, ph);
     float p      = panDeg  + panLFO.eval(t,  ph) + motion.panDeg;
     float ti     = tiltDeg + tiltLFO.eval(t, ph) + motion.tiltDeg;
+    if (mods) {
+        p  += mods->eval(panModSlot,  t, ph) * panModDepth;
+        ti += mods->eval(tiltModSlot, t, ph) * tiltModDepth;
+    }
     return panTiltToDir(p, ti, baseForward);
 }
 
-float BeamLayer::intensityAtTimeForFixture(double t, int idx, int total) const
+float BeamLayer::intensityAtTimeForFixture(double t, int idx, int total,
+                                              const ModulatorBank* mods) const
 {
     float ph    = fixturePhaseShift(idx, total, fixturePhase);
     auto motion = motionLFO.eval(t, ph);
-    return std::max(0.0f, intensity + intensityLFO.eval(t, ph)
-                          + motion.intensity);
+    float result = intensity + intensityLFO.eval(t, ph) + motion.intensity;
+    if (mods) {
+        result += mods->eval(intensityModSlot, t, ph) * intensityModDepth;
+    }
+    return std::max(0.0f, result);
 }
 
 void BeamLayer::drawInspector() {
@@ -224,6 +234,30 @@ void BeamLayer::drawInspector() {
                         followCamera ? "camera forward" : "world +Y");
     ImGui::SliderFloat("Pan (deg)##spot",  &panDeg,  -180.0f, 180.0f);
     ImGui::SliderFloat("Tilt (deg)##spot", &tiltDeg, -90.0f,  90.0f);
+
+    // Modulator bank bindings: dropdown picks LFO 1..8 (or None) and
+    // depth scales the modulator's normalized output into the parameter
+    // unit (degrees / intensity).
+    static const char* kModNames[] = {
+        "None", "LFO 1", "LFO 2", "LFO 3", "LFO 4",
+        "LFO 5", "LFO 6", "LFO 7", "LFO 8"
+    };
+    ImGui::TextDisabled("Mod bank bindings");
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::Combo("##panmod", &panModSlot, kModNames, 9);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::SliderFloat("Pan depth##pm",   &panModDepth, 0.0f, 180.0f);
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::Combo("##tiltmod", &tiltModSlot, kModNames, 9);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::SliderFloat("Tilt depth##pm",  &tiltModDepth, 0.0f, 90.0f);
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::Combo("##intmod",  &intensityModSlot, kModNames, 9);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::SliderFloat("Int depth##pm",   &intensityModDepth, 0.0f, 30.0f);
 
     ImGui::Separator();
     ImGui::TextDisabled("LIGHT SHAPE");
