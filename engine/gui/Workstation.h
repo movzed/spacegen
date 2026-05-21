@@ -69,9 +69,11 @@ public:
     // into `swapchainTarget` on `cb`. Caller is responsible for present +
     // commit. Reads back the actual central node size and caches it so the
     // next beginFrame can size the offscreen texture exactly.
+    // Scene is non-const because the Layer Rack panel mutates scene.bus
+    // (add / remove layers via the "+ Beam" button etc.).
     void endFrame(MTL::CommandBuffer* cb,
                   MTL::Texture* swapchainTarget,
-                  const Scene& scene,
+                  Scene& scene,
                   MetalRenderer& renderer);
 
 private:
@@ -94,8 +96,12 @@ private:
 
     // Panel visibility toggles.
     bool             showStats_        = true;
+    bool             showLayers_       = true;
     bool             showInspector_    = true;
     bool             showDemo_         = false;
+
+    // Currently selected layer (by id) — drives the Inspector contents.
+    uint32_t         selectedLayerId_  = 0;
 };
 
 } // namespace spacegen::gui

@@ -15,6 +15,9 @@
 
 #include "Workstation.h"
 #include "../core/Scene.h"
+#include "../core/Layer.h"
+#include "../core/StructureLayer.h"
+#include "../core/BeamLayer.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
@@ -26,6 +29,7 @@ namespace {
 
 constexpr const char* kCompositionWindowName = "Composition";
 constexpr const char* kStatsWindowName       = "Stats";
+constexpr const char* kLayersWindowName      = "Layers";
 constexpr const char* kInspectorWindowName   = "Inspector";
 
 void styleSpaceGen() {
@@ -51,27 +55,32 @@ void buildDefaultLayout(ImGuiID dockspace_id) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::DockBuilderSetNodeSize(dockspace_id, vp->WorkSize);
 
-    // Split: 22% left → Stats. Remainder of 78% then split: 28% of THAT → Inspector right.
-    ImGuiID dockLeft = 0, dockRight = 0, dockCenter = dockspace_id;
-    dockLeft   = ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Left,
-                                              0.22f, nullptr, &dockCenter);
-    dockRight  = ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Right,
-                                              0.28f, nullptr, &dockCenter);
+    // Layout: 22% left -> Stats (top half) + Layers (bottom half).
+    //         28% right -> Inspector.
+    //         center   -> Composition (NoTabBar + NoDockingOverMe).
+    ImGuiID dockCenter = dockspace_id;
+    ImGuiID dockLeft   = ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Left,
+                                                      0.22f, nullptr, &dockCenter);
+    ImGuiID dockRight  = ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Right,
+                                                      0.28f, nullptr, &dockCenter);
+    // Split the left dock vertically: Stats on top, Layers below.
+    ImGuiID dockLeftBottom = ImGui::DockBuilderSplitNode(dockLeft, ImGuiDir_Down,
+                                                          0.55f, nullptr, &dockLeft);
 
-    // Mark central node so the user can't accidentally dock other windows
-    // into it (the composition Image always lives there).
     if (auto* node = ImGui::DockBuilderGetNode(dockCenter)) {
         node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar
                           | ImGuiDockNodeFlags_NoDockingOverMe;
     }
 
     ImGui::DockBuilderDockWindow(kStatsWindowName,       dockLeft);
+    ImGui::DockBuilderDockWindow(kLayersWindowName,      dockLeftBottom);
     ImGui::DockBuilderDockWindow(kInspectorWindowName,   dockRight);
     ImGui::DockBuilderDockWindow(kCompositionWindowName, dockCenter);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
-void drawMainMenuBar(bool& showStats, bool& showInspector, bool& showDemo) {
+void drawMainMenuBar(bool& showStats, bool& showLayers,
+                     bool& showInspector, bool& showDemo) {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             ImGui::MenuItem("New scene...",   nullptr, false, false);
@@ -84,13 +93,14 @@ void drawMainMenuBar(bool& showStats, bool& showInspector, bool& showDemo) {
         }
         if (ImGui::BeginMenu("View")) {
             ImGui::MenuItem(kStatsWindowName,     nullptr, &showStats);
+            ImGui::MenuItem(kLayersWindowName,    nullptr, &showLayers);
             ImGui::MenuItem(kInspectorWindowName, nullptr, &showInspector);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &showDemo);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
-            ImGui::MenuItem("SpaceGen M2-C3", nullptr, false, false);
+            ImGui::MenuItem("SpaceGen M3-B", nullptr, false, false);
             ImGui::MenuItem("github.com/movzed/spacegen", nullptr, false, false);
             ImGui::EndMenu();
         }
@@ -132,57 +142,118 @@ void drawStatsPanel(const spacegen::Scene& scene,
     ImGui::End();
 }
 
-void drawInspector(spacegen::MetalRenderer& renderer, bool* open) {
+// Layer rack: list of layers in scene.bus with quick controls per row.
+// Click a layer to select it (the Inspector below shows its drawInspector()).
+void drawLayerRack(spacegen::Scene& scene,
+                   uint32_t& selectedLayerId,
+                   bool* open) {
+    if (!ImGui::Begin(kLayersWindowName, open)) { ImGui::End(); return; }
+
+    // Top toolbar: add buttons.
+    if (ImGui::Button("+ Beam")) {
+        auto* b = scene.bus.add<spacegen::BeamLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Beam %zu", scene.bus.layers.size());
+        b->name = buf;
+        selectedLayerId = b->id;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled(" (more layer types coming)");
+    ImGui::Separator();
+
+    // Layer rows
+    uint32_t toRemove = 0;
+    for (size_t i = 0; i < scene.bus.layers.size(); ++i) {
+        auto& layer = scene.bus.layers[i];
+        if (!layer) continue;
+        ImGui::PushID(static_cast<int>(layer->id));
+
+        // Color tag
+        ImVec4 tag(layer->colorTag.x, layer->colorTag.y, layer->colorTag.z, 1.0f);
+        ImGui::ColorButton("##tag", tag,
+                            ImGuiColorEditFlags_NoTooltip
+                            | ImGuiColorEditFlags_NoPicker
+                            | ImGuiColorEditFlags_NoBorder,
+                            ImVec2(12.0f, 16.0f));
+        ImGui::SameLine();
+
+        // Enable toggle (state primary)
+        bool enabled = layer->state == spacegen::LayerState::Enabled;
+        if (ImGui::Checkbox("##en", &enabled)) {
+            layer->state = enabled ? spacegen::LayerState::Enabled
+                                    : spacegen::LayerState::Disabled;
+        }
+        ImGui::SameLine();
+
+        // Selectable name (click selects, double-click renames eventually)
+        bool isSelected = (layer->id == selectedLayerId);
+        char label[80];
+        std::snprintf(label, sizeof(label), "%s##sel", layer->name.c_str());
+        if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_AllowDoubleClick,
+                              ImVec2(0.0f, 0.0f))) {
+            selectedLayerId = layer->id;
+        }
+        // Right-click on the row gives a context menu.
+        if (ImGui::BeginPopupContextItem("##ctx")) {
+            ImGui::TextDisabled("%s", layer->typeName());
+            ImGui::Separator();
+            if (ImGui::MenuItem("Remove")) {
+                toRemove = layer->id;
+            }
+            ImGui::EndPopup();
+        }
+
+        // Compact blend + opacity (small row beneath)
+        ImGui::Indent(20.0f);
+        const char* blendNames[] = { "Normal", "Add" };
+        int blendIdx = (layer->blendMode == spacegen::BlendMode::Add) ? 1 : 0;
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::Combo("##blend", &blendIdx, blendNames, IM_ARRAYSIZE(blendNames))) {
+            layer->blendMode = (blendIdx == 1) ? spacegen::BlendMode::Add
+                                                : spacegen::BlendMode::Normal;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.0f);
+        ImGui::SliderFloat("##op", &layer->opacity, 0.0f, 1.0f, "%.2f");
+        ImGui::Unindent(20.0f);
+
+        ImGui::PopID();
+    }
+    if (toRemove != 0) {
+        // Don't remove the only StructureLayer if it's selected — for v1 the
+        // StructureLayer is the only Structure type we have, so allow removal
+        // (operator can re-add via a future menu). Keep simple.
+        scene.bus.remove(toRemove);
+        if (selectedLayerId == toRemove) selectedLayerId = 0;
+    }
+    ImGui::End();
+}
+
+// Inspector: shows the selected layer's drawInspector(). If none selected,
+// helpful empty state.
+void drawInspector(spacegen::Scene& scene,
+                   uint32_t selectedLayerId,
+                   bool* open) {
     if (!ImGui::Begin(kInspectorWindowName, open)) { ImGui::End(); return; }
 
-    if (ImGui::CollapsingHeader("Structure material",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::ColorEdit3("Base color##mat",
-                          &renderer.baseColor[0],
-                          ImGuiColorEditFlags_PickerHueWheel
-                          | ImGuiColorEditFlags_Float);
-        ImGui::SliderFloat("Roughness##mat", &renderer.roughness, 0.04f, 1.0f);
-        ImGui::SliderFloat("Metallic##mat",  &renderer.metallic,  0.0f, 1.0f);
-        ImGui::SliderFloat("Ambient##mat",   &renderer.ambient,   0.0f, 0.4f);
+    spacegen::ILayer* sel = nullptr;
+    for (auto& l : scene.bus.layers) {
+        if (l && l->id == selectedLayerId) { sel = l.get(); break; }
+    }
+    if (!sel) {
+        ImGui::TextDisabled("Select a layer in the Layers panel.");
+        ImGui::End();
+        return;
     }
 
-    if (ImGui::CollapsingHeader("Directional light",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::Button("Reset direction")) {
-            renderer.lightDirection = glm::vec3(0.4f, -0.6f, -0.6f);
-        }
-        ImGui::SliderFloat3("Direction##light",
-                            &renderer.lightDirection[0], -1.0f, 1.0f);
-        ImGui::ColorEdit3("Color##light",
-                          &renderer.lightColor[0],
-                          ImGuiColorEditFlags_PickerHueWheel
-                          | ImGuiColorEditFlags_Float);
-        ImGui::SliderFloat("Intensity##light",
-                           &renderer.lightIntensity, 0.0f, 10.0f);
+    ImGui::Text("%s — %s", sel->name.c_str(), sel->typeName());
+    char nameBuf[128];
+    std::snprintf(nameBuf, sizeof(nameBuf), "%s", sel->name.c_str());
+    if (ImGui::InputText("Name", nameBuf, sizeof(nameBuf))) {
+        sel->name = nameBuf;
     }
-
-    if (ImGui::CollapsingHeader("Volumetric beam",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Enabled##beam",       &renderer.beamEnabled);
-        ImGui::DragFloat3("Origin##beam",       &renderer.beamOrigin[0],
-                          0.05f, -10.0f, 10.0f);
-        ImGui::SliderFloat3("Direction##beam",  &renderer.beamDirection[0],
-                            -1.0f, 1.0f);
-        ImGui::ColorEdit3("Color##beam",        &renderer.beamColor[0],
-                          ImGuiColorEditFlags_PickerHueWheel
-                          | ImGuiColorEditFlags_Float);
-        ImGui::SliderFloat("Intensity##beam",   &renderer.beamIntensity,
-                           0.0f, 5.0f);
-        ImGui::SliderFloat("Range (m)##beam",   &renderer.beamRange,
-                           0.5f, 40.0f);
-        ImGui::SliderFloat("Cone (deg)##beam",  &renderer.beamConeDeg,
-                           1.0f, 60.0f);
-        ImGui::SliderFloat("Falloff##beam",     &renderer.beamFalloff,
-                           0.5f, 6.0f);
-        ImGui::SliderInt  ("Steps##beam",       &renderer.beamSteps,
-                           8, 128);
-    }
-
+    ImGui::Separator();
+    sel->drawInspector();
     ImGui::End();
 }
 
@@ -292,7 +363,7 @@ CompositionTarget Workstation::beginFrame(int swapchainW,
 
 void Workstation::endFrame(MTL::CommandBuffer* cb,
                             MTL::Texture* swapchainTarget,
-                            const Scene& scene,
+                            Scene& scene,
                             MetalRenderer& renderer)
 {
     if (!cb || !swapchainTarget) return;
@@ -307,11 +378,27 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
         layoutBuilt_ = true;
     }
 
-    drawMainMenuBar(showStats_, showInspector_, showDemo_);
+    drawMainMenuBar(showStats_, showLayers_, showInspector_, showDemo_);
     if (showStats_)     drawStatsPanel(scene, renderer,
                                        currentStats_, &showStats_);
-    if (showInspector_) drawInspector(renderer, &showInspector_);
+    if (showLayers_)    drawLayerRack(scene, selectedLayerId_, &showLayers_);
+    if (showInspector_) drawInspector(scene, selectedLayerId_, &showInspector_);
     if (showDemo_)      ImGui::ShowDemoWindow(&showDemo_);
+
+    // Default selection: pick the first non-Structure layer if nothing yet
+    // (so opening the app shows the Beam's controls right away).
+    if (selectedLayerId_ == 0 && !scene.bus.layers.empty()) {
+        for (auto& l : scene.bus.layers) {
+            if (l && l->kind() == LayerKind::Generator
+                && std::string(l->typeName()) != "Structure") {
+                selectedLayerId_ = l->id;
+                break;
+            }
+        }
+        if (selectedLayerId_ == 0 && scene.bus.layers.front()) {
+            selectedLayerId_ = scene.bus.layers.front()->id;
+        }
+    }
 
     // ---- Composition central window: shows the offscreen texture ----
     // Use no-padding so the image fills the dock node edge-to-edge.

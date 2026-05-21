@@ -1,6 +1,9 @@
 #include "MetalRenderer.h"
 
 #include "../../core/Scene.h"
+#include "../../core/Layer.h"
+#include "../../core/StructureLayer.h"
+#include "../../core/BeamLayer.h"
 
 #include <cmath>
 #include <cstdio>
@@ -478,22 +481,27 @@ void MetalRenderer::onResize(int widthPixels, int heightPixels) {
     depthH_ = heightPixels;
 }
 
-void MetalRenderer::renderFrame(MTL::CommandBuffer* cmdBuf,
-                                 MTL::Texture* colorTarget,
-                                 double /*elapsedSeconds*/)
-{
-    if (!cmdBuf || !colorTarget) return;
+void MetalRenderer::renderFrame(RenderContext& ctx, Bus& bus) {
+    if (!ctx.cmdBuf || !ctx.colorTarget) return;
     // Ensure depth matches color size.
-    onResize(static_cast<int>(colorTarget->width()),
-             static_cast<int>(colorTarget->height()));
+    onResize(static_cast<int>(ctx.colorTarget->width()),
+             static_cast<int>(ctx.colorTarget->height()));
+    bus.render(ctx);
+}
+
+void MetalRenderer::renderStructureMeshes(RenderContext& ctx,
+                                            const StructureLayer& layer)
+{
+    if (!ctx.cmdBuf || !ctx.colorTarget) return;
+    onResize(static_cast<int>(ctx.colorTarget->width()),
+             static_cast<int>(ctx.colorTarget->height()));
 
     MTL::RenderPassDescriptor* rpd =
         MTL::RenderPassDescriptor::renderPassDescriptor();
     auto* colorAttachment = rpd->colorAttachments()->object(0);
-    colorAttachment->setTexture(colorTarget);
+    colorAttachment->setTexture(ctx.colorTarget);
     colorAttachment->setLoadAction(MTL::LoadActionClear);
     colorAttachment->setStoreAction(MTL::StoreActionStore);
-    // Dark teal background so structure (rendered in red) shows clearly.
     colorAttachment->setClearColor(MTL::ClearColor(0.06, 0.08, 0.10, 1.0));
 
     auto* depthAttachment = rpd->depthAttachment();
@@ -502,25 +510,26 @@ void MetalRenderer::renderFrame(MTL::CommandBuffer* cmdBuf,
     depthAttachment->setStoreAction(MTL::StoreActionDontCare);
     depthAttachment->setClearDepth(1.0);
 
-    MTL::RenderCommandEncoder* enc = cmdBuf->renderCommandEncoder(rpd);
+    MTL::RenderCommandEncoder* enc = ctx.cmdBuf->renderCommandEncoder(rpd);
     if (!enc) return;
 
     enc->setRenderPipelineState(pipeline_);
     enc->setDepthStencilState(depthState_);
-    enc->setCullMode(MTL::CullModeNone); // M2-B: render both sides
+    enc->setCullMode(MTL::CullModeNone);
     enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
 
     for (const auto& gm : gpuMeshes_) {
         Uniforms u;
-        u.projection         = projection_;
-        u.view               = view_;
+        u.projection         = ctx.projection;
+        u.view               = ctx.view;
         u.model              = gm.transform;
-        u.cameraWorldPos     = glm::vec4(cameraWorldPos_, 1.0f);
-        u.baseColorRoughness = glm::vec4(baseColor, roughness);
-        u.metallicAmbient    = glm::vec4(metallic, ambient, 0.0f, 0.0f);
-        u.lightDirIntensity  = glm::vec4(glm::normalize(lightDirection),
-                                          lightIntensity);
-        u.lightColor         = glm::vec4(lightColor, 0.0f);
+        u.cameraWorldPos     = glm::vec4(ctx.cameraWorldPos, 1.0f);
+        u.baseColorRoughness = glm::vec4(layer.baseColor, layer.roughness);
+        u.metallicAmbient    = glm::vec4(layer.metallic, layer.ambient,
+                                          0.0f, 0.0f);
+        u.lightDirIntensity  = glm::vec4(glm::normalize(layer.lightDirection),
+                                          layer.lightIntensity);
+        u.lightColor         = glm::vec4(layer.lightColor, 0.0f);
 
         enc->setVertexBuffer(gm.positionBuffer, 0, 0);
         enc->setVertexBuffer(gm.normalBuffer,   0, 2);
@@ -536,42 +545,41 @@ void MetalRenderer::renderFrame(MTL::CommandBuffer* cmdBuf,
     }
 
     enc->endEncoding();
+}
 
-    // ---- Beam pass (additive overlay on the same color target) ----
-    if (beamEnabled && beamPipeline_) {
-        MTL::RenderPassDescriptor* brpd =
-            MTL::RenderPassDescriptor::renderPassDescriptor();
-        auto* bcol = brpd->colorAttachments()->object(0);
-        bcol->setTexture(colorTarget);
-        bcol->setLoadAction(MTL::LoadActionLoad);
-        bcol->setStoreAction(MTL::StoreActionStore);
-        // No depth attachment: beam pass is purely additive overlay.
+void MetalRenderer::renderBeam(RenderContext& ctx, const BeamLayer& layer) {
+    if (!ctx.cmdBuf || !ctx.colorTarget || !beamPipeline_) return;
 
-        MTL::RenderCommandEncoder* be = cmdBuf->renderCommandEncoder(brpd);
-        if (be) {
-            be->setRenderPipelineState(beamPipeline_);
+    MTL::RenderPassDescriptor* rpd =
+        MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* col = rpd->colorAttachments()->object(0);
+    col->setTexture(ctx.colorTarget);
+    col->setLoadAction(MTL::LoadActionLoad);
+    col->setStoreAction(MTL::StoreActionStore);
 
-            BeamUniformsCpu bu;
-            bu.invViewProj      = glm::inverse(projection_ * view_);
-            bu.cameraWorldPos   = glm::vec4(cameraWorldPos_, 1.0f);
-            bu.beamOrigin       = glm::vec4(beamOrigin, 0.0f);
-            bu.beamDirIntensity = glm::vec4(glm::normalize(beamDirection),
-                                             beamIntensity);
-            bu.beamColor        = glm::vec4(beamColor, 0.0f);
-            float coneRad       = beamConeDeg * 3.14159265f / 180.0f;
-            float coneCos       = std::cos(coneRad);
-            bu.beamParams       = glm::vec4(coneCos, beamRange,
-                                             beamFalloff,
-                                             static_cast<float>(beamSteps));
+    MTL::RenderCommandEncoder* enc = ctx.cmdBuf->renderCommandEncoder(rpd);
+    if (!enc) return;
 
-            be->setVertexBytes(&bu, sizeof(bu), 0);
-            be->setFragmentBytes(&bu, sizeof(bu), 0);
-            be->drawPrimitives(MTL::PrimitiveTypeTriangle,
-                                static_cast<NS::UInteger>(0),
-                                static_cast<NS::UInteger>(3));
-            be->endEncoding();
-        }
-    }
+    enc->setRenderPipelineState(beamPipeline_);
+
+    BeamUniformsCpu bu;
+    bu.invViewProj      = glm::inverse(ctx.projection * ctx.view);
+    bu.cameraWorldPos   = glm::vec4(ctx.cameraWorldPos, 1.0f);
+    bu.beamOrigin       = glm::vec4(layer.origin, 0.0f);
+    bu.beamDirIntensity = glm::vec4(glm::normalize(layer.direction),
+                                     layer.intensity * layer.opacity);
+    bu.beamColor        = glm::vec4(layer.color, 0.0f);
+    float coneRad       = layer.coneDeg * 3.14159265f / 180.0f;
+    float coneCos       = std::cos(coneRad);
+    bu.beamParams       = glm::vec4(coneCos, layer.range, layer.falloff,
+                                     static_cast<float>(layer.steps));
+
+    enc->setVertexBytes(&bu, sizeof(bu), 0);
+    enc->setFragmentBytes(&bu, sizeof(bu), 0);
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                         static_cast<NS::UInteger>(0),
+                         static_cast<NS::UInteger>(3));
+    enc->endEncoding();
 }
 
 size_t MetalRenderer::totalTriangles() const {

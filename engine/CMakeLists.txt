@@ -135,6 +135,9 @@ add_executable(spacegen
     tinygltf_impl.cpp
     platform_metal_glfw.mm
     core/Scene.cpp
+    core/Layer.cpp
+    core/StructureLayer.cpp
+    core/BeamLayer.cpp
     backends/metal/MetalRenderer.cpp
     gui/Workstation.mm
     ${IMGUI_SOURCES}

@@ -13,11 +13,15 @@ namespace spacegen {
 struct Scene;
 struct MeshData;
 struct Light;
+struct RenderContext;
+class  Bus;
+class  StructureLayer;
+class  BeamLayer;
 
-// M2-C1: PBR forward rendering with realtime lights.
-// Builds a PBR pipeline (GGX + Lambert + Schlick), uploads scene meshes
-// (positions + normals + indices) and renders them through the scene's
-// camera with up to one Directional light (multi-light is M2-C2).
+// M3-B: layer-driven Metal backend.
+// Owns the pipelines + offscreen depth + per-mesh GPU buffers. Exposes
+// granular methods that each Layer calls to do its work. Walks a Bus of
+// layers per frame.
 class MetalRenderer {
 public:
     MetalRenderer(MTL::Device* device, MTL::PixelFormat colorFormat);
@@ -27,20 +31,32 @@ public:
     MetalRenderer(const MetalRenderer&)            = delete;
     MetalRenderer& operator=(const MetalRenderer&) = delete;
 
-    // Uploads all meshes from `scene` into GPU buffers. Stores camera matrices
-    // for use during renderFrame(). Idempotent (re-loading replaces previous
-    // GPU state).
+    // Uploads all meshes from `scene` into GPU buffers. Stores camera
+    // matrices for use during render. Idempotent.
     void loadScene(const Scene& scene);
 
     // Allocates / reallocates the depth texture if size changed.
     void onResize(int widthPixels, int heightPixels);
 
-    // Encodes one frame onto `cmdBuf`. Reads from `colorTarget` (a drawable
-    // texture obtained via CAMetalLayer::nextDrawable()) and writes color +
-    // managed depth. Caller owns commit/present.
-    void renderFrame(MTL::CommandBuffer* cmdBuf,
-                     MTL::Texture* colorTarget,
-                     double elapsedSeconds);
+    // Walks `bus` and renders all enabled layers into ctx.colorTarget.
+    // Each layer's render() calls back into this class via the granular
+    // methods below.
+    void renderFrame(RenderContext& ctx, Bus& bus);
+
+    // ---- Per-layer render helpers (called from Layer::render) ----
+    // Structure pass: PBR forward over all loaded meshes with the layer's
+    // material + light params. LoadAction=Clear (assumes called first).
+    void renderStructureMeshes(RenderContext& ctx, const StructureLayer& layer);
+
+    // Beam pass: raymarched cone scatter, additive blend.
+    // LoadAction=Load (must be called after a structure clear or another
+    // generator that primed the target).
+    void renderBeam(RenderContext& ctx, const BeamLayer& layer);
+
+    // Public scene matrices (used by Layers when building their uniforms).
+    const glm::mat4& projection()      const { return projection_; }
+    const glm::mat4& view()            const { return view_; }
+    const glm::vec3& cameraWorldPos()  const { return cameraWorldPos_; }
 
     // For introspection / logging
     size_t meshCount() const { return gpuMeshes_.size(); }
@@ -77,33 +93,6 @@ private:
     MTL::RenderPipelineState*  beamPipeline_    = nullptr;
 
     void buildBeamPipeline();
-
-    // M2-C1+: hardcoded params, exposed publicly so the Inspector can poke
-    // them per frame. M3+ moves them through the parameter graph.
-public:
-    // Structure material
-    glm::vec3                  baseColor        = glm::vec3(0.72f);
-    float                      roughness        = 0.55f;
-    float                      metallic         = 0.0f;
-    float                      ambient          = 0.04f;
-
-    // Directional light
-    glm::vec3                  lightDirection   = glm::vec3(0.4f, -0.6f, -0.6f);
-    glm::vec3                  lightColor       = glm::vec3(1.0f, 0.96f, 0.92f);
-    float                      lightIntensity   = 1.6f;
-
-    // M3-A: Volumetric beam (first generator beyond the structure).
-    // World-space cone with raymarched scattering, additively blended on
-    // top of the structure pass.
-    bool                       beamEnabled      = true;
-    glm::vec3                  beamOrigin       = glm::vec3(0.0f, 3.0f, 4.0f);
-    glm::vec3                  beamDirection    = glm::vec3(0.0f, -0.8f, -0.6f);
-    glm::vec3                  beamColor        = glm::vec3(0.30f, 0.55f, 1.00f);
-    float                      beamIntensity    = 1.2f;
-    float                      beamRange        = 14.0f;     // meters
-    float                      beamConeDeg      = 14.0f;     // half-angle
-    float                      beamFalloff      = 1.8f;      // radial sharpness
-    int                        beamSteps        = 32;        // raymarch samples
 };
 
 } // namespace spacegen

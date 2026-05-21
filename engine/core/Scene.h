@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Layer.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -59,7 +61,8 @@ struct Light {
 };
 
 // A loaded export from the Blender add-on. Owns CameraData + MeshData(s) +
-// optional Lights (added at runtime, NOT exported from Blender).
+// optional Lights (added at runtime, NOT exported from Blender) + a Bus
+// of layers (StructureLayer + N BeamLayers + future FX layers).
 struct Scene {
     int                     outputWidth   = 1920;
     int                     outputHeight  = 1080;
@@ -69,6 +72,7 @@ struct Scene {
     CameraData              camera;
     std::vector<MeshData>   meshes;
     std::vector<Light>      lights;
+    Bus                     bus;
 
     // Loads `scene.json` from `folderPath`, then optionally `structure.glb`
     // referenced by the manifest. Throws std::runtime_error on hard failure

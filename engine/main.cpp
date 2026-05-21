@@ -22,6 +22,9 @@
 
 #include "platform_metal_glfw.h"
 #include "core/Scene.h"
+#include "core/Layer.h"
+#include "core/StructureLayer.h"
+#include "core/BeamLayer.h"
 #include "backends/metal/MetalRenderer.h"
 #include "gui/Workstation.h"
 
@@ -34,7 +37,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M3-A (volumetric beam)";
+constexpr char kWindowTitle[] = "SpaceGen — M3-B (layer system)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);
@@ -180,6 +183,13 @@ int main(int argc, char** argv) {
     std::printf("[SpaceGen] Renderer: %zu meshes, %zu triangles total on GPU\n",
                  renderer->meshCount(), renderer->totalTriangles());
 
+    // Populate the bus with the default starter layers.
+    scene.bus.add<spacegen::StructureLayer>();
+    {
+        auto* b = scene.bus.add<spacegen::BeamLayer>();
+        b->name = "Beam 1";
+    }
+
     // ImGui Workstation (overlays panels on top of the rendered scene).
     spacegen::gui::Workstation workstation(window, device, kColorFmt);
 
@@ -216,14 +226,27 @@ int main(int argc, char** argv) {
             MTL::CommandBuffer* cb = commandQueue->commandBuffer();
 
             // Phase 1: workstation builds ImGui frame, returns an offscreen
-            // texture sized to the central dock node. Structure renders there.
+            // texture sized to the central dock node. Bus renders there.
             spacegen::gui::FrameStats stats;
             stats.fps         = smoothedFps;
             stats.frameTimeMs = smoothedFrameMs;
             stats.drawableW   = fbW;
             stats.drawableH   = fbH;
             auto target = workstation.beginFrame(fbW, fbH, stats);
-            renderer->renderFrame(cb, target.texture, elapsed);
+
+            spacegen::RenderContext ctx;
+            ctx.renderer       = renderer;
+            ctx.cmdBuf         = cb;
+            ctx.colorTarget    = target.texture;
+            ctx.width          = target.widthPx;
+            ctx.height         = target.heightPx;
+            ctx.projection     = renderer->projection();
+            ctx.view           = renderer->view();
+            ctx.cameraWorldPos = renderer->cameraWorldPos();
+            ctx.elapsedSeconds = elapsed;
+            ctx.frameIndex     = frameCounter;
+
+            renderer->renderFrame(ctx, scene.bus);
 
             // Phase 2: workstation finishes the ImGui frame (panels +
             // composition Image) and submits draw data to the swapchain.
