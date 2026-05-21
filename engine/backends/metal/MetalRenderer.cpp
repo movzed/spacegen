@@ -4,6 +4,7 @@
 #include "../../core/Layer.h"
 #include "../../core/StructureLayer.h"
 #include "../../core/BeamLayer.h"
+#include "../../core/DirectionalLightLayer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -17,18 +18,18 @@ namespace spacegen {
 namespace {
 
 // MSL shader: PBR forward — GGX + Lambert + Schlick.
-// One directional "fill" light from the StructureLayer + up to 16 spot
-// lights collected from the bus (BeamLayer instances). Spot lights are
-// the projection-mapping primary illumination (origin at camera by
-// default), and DO NOT render a visible volume in air — we only see
-// their illumination where they hit the structure surface.
+// Up to MAX_DIRS directional lights + MAX_SPOTS spot lights, all
+// collected from the bus. NO volumetric render — spot lights are
+// projection-mapping style: only visible where they hit the surface.
 constexpr int kMaxSpots = 16;
+constexpr int kMaxDirs  = 4;
 constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
 constant float PI         = 3.14159265359;
 constant int   MAX_SPOTS  = 16;
+constant int   MAX_DIRS   = 4;
 
 struct VertexIn {
     float3 position [[attribute(0)]];
@@ -48,15 +49,19 @@ struct SpotLight {
     float4 paramsOuter;    // .x outerCos
 };
 
+struct DirLight {
+    float4 dirIntensity;   // .xyz dir (FROM light), .w intensity
+    float4 color;          // .rgb
+};
+
 struct Uniforms {
     float4x4  projection;
     float4x4  view;
     float4x4  model;
     float4    cameraWorldPos;
     float4    baseColorRoughness;   // .rgb base, .a roughness
-    float4    metallicAmbient;      // .x metallic, .y ambient, .z spotCount (float)
-    float4    lightDirIntensity;    // directional fallback (.xyz dir, .w intensity)
-    float4    lightColor;
+    float4    metallicAmbient;      // .x metallic, .y ambient, .z spotCount, .w dirCount
+    DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
 
@@ -128,16 +133,20 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     float  metallic  = u.metallicAmbient.r;
     float  ambient   = u.metallicAmbient.g;
     int    spotCount = int(u.metallicAmbient.b);
+    int    dirCount  = int(u.metallicAmbient.a);
 
     float3 F0 = mix(float3(0.04), baseColor, metallic);
 
-    // Directional fallback (preview / fill).
+    // Directional lights.
     float3 LoDir = float3(0.0);
-    if (u.lightDirIntensity.w > 0.0) {
-        float3 L = normalize(-u.lightDirIntensity.xyz);
-        float3 radiance = u.lightColor.rgb * u.lightDirIntensity.w;
-        LoDir = pbrEvalDirect(N, V, L, radiance,
-                              baseColor, roughness, metallic, F0);
+    int dn = min(dirCount, MAX_DIRS);
+    for (int i = 0; i < dn; i++) {
+        DirLight d = u.dirs[i];
+        if (d.dirIntensity.w <= 0.0) continue;
+        float3 L = normalize(-d.dirIntensity.xyz);
+        float3 radiance = d.color.rgb * d.dirIntensity.w;
+        LoDir += pbrEvalDirect(N, V, L, radiance,
+                                baseColor, roughness, metallic, F0);
     }
 
     // Spot lights (projection-mapping primary illumination).
@@ -188,15 +197,19 @@ struct GpuSpot {
     glm::vec4 paramsOuter;
 };
 
+struct GpuDir {
+    glm::vec4 dirIntensity;
+    glm::vec4 color;
+};
+
 struct Uniforms {
     glm::mat4 projection;
     glm::mat4 view;
     glm::mat4 model;
     glm::vec4 cameraWorldPos;
     glm::vec4 baseColorRoughness;
-    glm::vec4 metallicAmbient;   // .z = spotCount as float
-    glm::vec4 lightDirIntensity;
-    glm::vec4 lightColor;
+    glm::vec4 metallicAmbient;   // .z spotCount, .w dirCount (both as floats)
+    GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
 
@@ -400,7 +413,8 @@ void MetalRenderer::renderFrame(RenderContext& ctx, Bus& bus) {
 void MetalRenderer::renderStructureMeshes(
     RenderContext& ctx,
     const StructureLayer& layer,
-    const std::vector<const BeamLayer*>& spots)
+    const std::vector<const BeamLayer*>& spots,
+    const std::vector<const DirectionalLightLayer*>& dirs)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -428,29 +442,43 @@ void MetalRenderer::renderStructureMeshes(
     enc->setCullMode(MTL::CullModeNone);
     enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
 
-    // Pack spot lights once for all meshes.
+    const double t = ctx.elapsedSeconds;
+
+    // Pack spot lights (evaluate pan/tilt/intensity LFOs).
     int spotCount = std::min(static_cast<int>(spots.size()), kMaxSpots);
     GpuSpot spotsPacked[kMaxSpots]{};
     for (int i = 0; i < spotCount; ++i) {
         const BeamLayer* s = spots[i];
         if (!s) continue;
-        glm::vec3 origin    = s->origin;
-        glm::vec3 dir       = glm::normalize(s->direction);
-        if (s->followCamera) {
-            origin = ctx.cameraWorldPos;
-            dir    = glm::normalize(ctx.cameraForward);
-        }
+        glm::vec3 baseFwd = s->followCamera
+            ? glm::normalize(ctx.cameraForward)
+            : glm::vec3(0.0f, 1.0f, 0.0f);
+        glm::vec3 origin = s->followCamera ? ctx.cameraWorldPos : s->origin;
+        glm::vec3 dir    = s->directionAtTime(t, baseFwd);
+        float     inten  = s->intensityAtTime(t) * s->opacity;
+
         float innerRad = s->innerDeg * 3.14159265f / 180.0f;
         float outerRad = s->outerDeg * 3.14159265f / 180.0f;
         if (outerRad < innerRad) outerRad = innerRad;
         float innerCos = std::cos(innerRad);
         float outerCos = std::cos(outerRad);
 
-        spotsPacked[i].posIntensity = glm::vec4(origin,
-                                                  s->intensity * s->opacity);
+        spotsPacked[i].posIntensity = glm::vec4(origin, inten);
         spotsPacked[i].dirRange     = glm::vec4(dir, s->range);
         spotsPacked[i].colorInner   = glm::vec4(s->color, innerCos);
         spotsPacked[i].paramsOuter  = glm::vec4(outerCos, 0.0f, 0.0f, 0.0f);
+    }
+
+    // Pack directional lights (pan/tilt + intensity LFOs).
+    int dirCount = std::min(static_cast<int>(dirs.size()), kMaxDirs);
+    GpuDir dirsPacked[kMaxDirs]{};
+    for (int i = 0; i < dirCount; ++i) {
+        const DirectionalLightLayer* d = dirs[i];
+        if (!d) continue;
+        glm::vec3 dvec = d->directionAtTime(t);
+        float     inten = d->intensityAtTime(t) * d->opacity;
+        dirsPacked[i].dirIntensity = glm::vec4(dvec, inten);
+        dirsPacked[i].color        = glm::vec4(d->color, 0.0f);
     }
 
     for (const auto& gm : gpuMeshes_) {
@@ -463,10 +491,8 @@ void MetalRenderer::renderStructureMeshes(
         u.metallicAmbient    = glm::vec4(layer.metallic,
                                           layer.ambient,
                                           static_cast<float>(spotCount),
-                                          0.0f);
-        u.lightDirIntensity  = glm::vec4(glm::normalize(layer.lightDirection),
-                                          layer.lightIntensity);
-        u.lightColor         = glm::vec4(layer.lightColor, 0.0f);
+                                          static_cast<float>(dirCount));
+        std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 
         enc->setVertexBuffer(gm.positionBuffer, 0, 0);

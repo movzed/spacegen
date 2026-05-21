@@ -25,6 +25,7 @@
 #include "core/Layer.h"
 #include "core/StructureLayer.h"
 #include "core/BeamLayer.h"
+#include "core/DirectionalLightLayer.h"
 #include "backends/metal/MetalRenderer.h"
 #include "gui/Workstation.h"
 
@@ -37,7 +38,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M3-B.1 (spots + aspect-locked)";
+constexpr char kWindowTitle[] = "SpaceGen — M3-B.2 (moving head + directional + LFOs)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);
@@ -183,19 +184,28 @@ int main(int argc, char** argv) {
     std::printf("[SpaceGen] Renderer: %zu meshes, %zu triangles total on GPU\n",
                  renderer->meshCount(), renderer->totalTriangles());
 
-    // Populate the bus with the default starter layers.
+    // Populate the bus with the default starter layers:
+    //   Structure (the mesh)
+    //   Key directional (fill light from above-right)
+    //   Spot 1 (moving head from the camera position)
     scene.bus.add<spacegen::StructureLayer>();
     {
+        auto* d = scene.bus.add<spacegen::DirectionalLightLayer>();
+        d->name      = "Key fill";
+        d->panDeg    = 35.0f;
+        d->tiltDeg   = -55.0f;
+        d->intensity = 1.4f;
+    }
+    {
         auto* b = scene.bus.add<spacegen::BeamLayer>();
-        b->name = "Spot 1";
-        // Default to projection-mapping pose: at the camera, looking at scene.
+        b->name         = "Spot 1";
         b->followCamera = true;
-        b->origin      = glm::vec3(scene.camera.world[3]);
-        b->direction   = -glm::vec3(scene.camera.world[2]);
-        b->intensity   = 5.0f;
-        b->range       = 100.0f;
-        b->innerDeg    = 5.0f;
-        b->outerDeg    = 9.0f;
+        b->origin       = glm::vec3(scene.camera.world[3]);
+        b->panDeg       = 0.0f;
+        b->tiltDeg      = 0.0f;
+        b->intensity    = 8.0f;
+        b->innerDeg     = 6.0f;
+        b->outerDeg     = 12.0f;
     }
 
     // ImGui Workstation (overlays panels on top of the rendered scene).

@@ -17,6 +17,7 @@ struct RenderContext;
 class  Bus;
 class  StructureLayer;
 class  BeamLayer;
+class  DirectionalLightLayer;
 
 // M3-B: layer-driven Metal backend.
 // Owns the pipelines + offscreen depth + per-mesh GPU buffers. Exposes
@@ -45,11 +46,13 @@ public:
 
     // ---- Per-layer render helpers (called from Layer::render) ----
     // Structure pass: PBR forward over all loaded meshes with the layer's
-    // material + the directional fallback light, PLUS up to 16 spot lights
-    // collected from the bus (one per enabled BeamLayer). LoadAction=Clear.
-    void renderStructureMeshes(RenderContext& ctx,
-                                const StructureLayer& layer,
-                                const std::vector<const BeamLayer*>& spots);
+    // material + up to 16 spot lights + up to 4 directional lights, all
+    // collected from the bus. LoadAction=Clear.
+    void renderStructureMeshes(
+        RenderContext& ctx,
+        const StructureLayer& layer,
+        const std::vector<const BeamLayer*>& spots,
+        const std::vector<const DirectionalLightLayer*>& dirs);
 
     // Public scene matrices (used by Layers when building their uniforms).
     const glm::mat4& projection()      const { return projection_; }

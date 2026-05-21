@@ -18,6 +18,7 @@
 #include "../core/Layer.h"
 #include "../core/StructureLayer.h"
 #include "../core/BeamLayer.h"
+#include "../core/DirectionalLightLayer.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
@@ -154,14 +155,22 @@ void drawLayerRack(spacegen::Scene& scene,
         auto* b = scene.bus.add<spacegen::BeamLayer>();
         char buf[64];
         std::snprintf(buf, sizeof(buf), "Spot %zu", scene.bus.layers.size());
-        b->name        = buf;
+        b->name         = buf;
         b->followCamera = true;
         b->origin       = glm::vec3(scene.camera.world[3]);
-        b->direction    = -glm::vec3(scene.camera.world[2]);
+        b->panDeg       = 0.0f;
+        b->tiltDeg      = 0.0f;
         selectedLayerId = b->id;
     }
     ImGui::SameLine();
-    ImGui::TextDisabled(" (more layer types coming)");
+    if (ImGui::Button("+ Directional")) {
+        auto* d = scene.bus.add<spacegen::DirectionalLightLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Directional %zu",
+                       scene.bus.layers.size());
+        d->name = buf;
+        selectedLayerId = d->id;
+    }
     ImGui::Separator();
 
     // Layer rows

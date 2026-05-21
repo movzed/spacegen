@@ -1,15 +1,15 @@
 #pragma once
-// BeamLayer — a spot light (projector-style) that illuminates the structure
-// in the structure pass. Despite the name, this is NOT a volumetric beam:
-// in projection mapping the light is the projector itself, so we don't see
-// the cone in air — we only see its illumination on the surface.
+// BeamLayer — a moving-head-style spot light. Cone of light emitted from
+// `origin`, pointed via pan/tilt (yaw/pitch) like a real intelligent fixture.
+// LFOs on pan, tilt and intensity provide the classic stage-light movement
+// effects (sweeps, figure-8s, breathing intensity, strobing).
 //
-// The light data is consumed by StructureLayer::render() which queries the
-// bus for all enabled BeamLayers, packs them into the structure shader's
-// spot-light array, and renders the structure once with all spots applied.
-// Therefore BeamLayer::render() itself is a no-op.
+// In projection-mapping mode (followCamera=true) the origin tracks the
+// scene camera each frame, and pan/tilt rotate the beam relative to the
+// camera's forward direction.
 
 #include "Layer.h"
+#include "LFO.h"
 
 namespace spacegen {
 
@@ -22,18 +22,34 @@ public:
     void        render(RenderContext& /*ctx*/) override {}  // consumed by StructureLayer
     void        drawInspector() override;
 
-    // Spot-light params (world space).
-    glm::vec3 origin    = glm::vec3(0.0f, -6.0f, 1.0f);     // overwritten on creation
-    glm::vec3 direction = glm::vec3(0.0f, 1.0f, 0.0f);      // overwritten on creation
-    glm::vec3 color     = glm::vec3(1.0f, 1.0f, 1.0f);
-    float     intensity = 5.0f;
-    float     range     = 100.0f;                            // meters; large -> no falloff
-    float     innerDeg  = 8.0f;                              // full-intensity half-angle
-    float     outerDeg  = 14.0f;                             // edge half-angle (soft falloff)
+    // ---- Position ----
+    glm::vec3 origin       = glm::vec3(0.0f, -6.0f, 1.0f);
+    bool      followCamera = true;  // if true, origin = ctx.cameraWorldPos each frame
 
-    // Convenience: snap the spot to the scene camera. Used by the "+ Beam"
-    // button so new lights start as projector lights from the camera.
-    bool      followCamera = false;
+    // ---- Aim (moving head) ----
+    // Pan / tilt are degrees relative to the base forward axis.
+    // - When followCamera = true, base forward = ctx.cameraForward.
+    // - When followCamera = false, base forward = world +Y.
+    // pan=0, tilt=0 -> straight ahead. tilt positive = up, negative = down.
+    float     panDeg       = 0.0f;
+    float     tiltDeg      = 0.0f;
+
+    // ---- Light shape ----
+    glm::vec3 color        = glm::vec3(1.0f, 1.0f, 1.0f);
+    float     intensity    = 5.0f;
+    float     range        = 100.0f;
+    float     innerDeg     = 5.0f;   // full-intensity half-angle
+    float     outerDeg     = 9.0f;   // edge half-angle (soft falloff)
+
+    // ---- LFO modulators (moving head choreography) ----
+    LFO       panLFO;
+    LFO       tiltLFO;
+    LFO       intensityLFO;
+
+    // Compute the world-space pointing direction at time t given a base
+    // forward axis (camera forward or world +Y).
+    glm::vec3 directionAtTime(double t, const glm::vec3& baseForward) const;
+    float     intensityAtTime(double t) const;
 };
 
 } // namespace spacegen
