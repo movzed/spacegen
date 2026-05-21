@@ -34,7 +34,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M2-C2 (PBR + ImGui)";
+constexpr char kWindowTitle[] = "SpaceGen — M2-C3 (workstation layout)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);
@@ -214,16 +214,22 @@ int main(int argc, char** argv) {
             const double elapsed = std::chrono::duration<double>(now - t0).count();
 
             MTL::CommandBuffer* cb = commandQueue->commandBuffer();
-            // Main pass: PBR-lit structure.
-            renderer->renderFrame(cb, drawable->texture(), elapsed);
-            // UI pass: ImGui panels overlaid (uses LoadAction=Load).
+
+            // Phase 1: workstation builds ImGui frame, returns an offscreen
+            // texture sized to the central dock node. Structure renders there.
             spacegen::gui::FrameStats stats;
             stats.fps         = smoothedFps;
             stats.frameTimeMs = smoothedFrameMs;
             stats.drawableW   = fbW;
             stats.drawableH   = fbH;
-            workstation.buildAndSubmit(cb, drawable->texture(),
-                                        scene, *renderer, stats);
+            auto target = workstation.beginFrame(fbW, fbH, stats);
+            renderer->renderFrame(cb, target.texture, elapsed);
+
+            // Phase 2: workstation finishes the ImGui frame (panels +
+            // composition Image) and submits draw data to the swapchain.
+            workstation.endFrame(cb, drawable->texture(),
+                                  scene, *renderer);
+
             cb->presentDrawable(drawable);
             cb->commit();
         }
