@@ -27,16 +27,46 @@ struct CameraData {
     float       clipEnd       = 1000.0f;
 };
 
+// Decoded image (RGBA8) ready for upload to a GPU 2D texture.
+struct TextureData {
+    int                   width  = 0;
+    int                   height = 0;
+    std::vector<uint8_t>  rgba;          // tightly packed RGBA8
+    std::string           name;          // for debugging / inspector
+    bool                  isSRGB = true; // baseColor + emissive are sRGB;
+                                          // normal + metallicRoughness are linear
+};
+
+// PBR material data (glTF 2.0 MetallicRoughness workflow). Texture indices
+// point into Scene::textures; -1 means "no texture, use factor only".
+struct PbrMaterial {
+    std::string  name;
+
+    glm::vec4    baseColorFactor   = glm::vec4(1.0f);   // multiplies texture
+    float        metallicFactor    = 1.0f;
+    float        roughnessFactor   = 1.0f;
+    glm::vec3    emissiveFactor    = glm::vec3(0.0f);
+    float        normalScale       = 1.0f;
+    float        occlusionStrength = 1.0f;
+
+    int          baseColorTex         = -1;  // sRGB
+    int          metallicRoughnessTex = -1;  // linear: G=roughness, B=metallic
+    int          normalTex            = -1;  // linear, tangent-space
+    int          emissiveTex          = -1;  // sRGB
+    int          occlusionTex         = -1;  // linear, R-channel
+};
+
 // CPU-side mesh data ready for upload to a backend (Metal/DX12).
 // Positions + normals are in mesh-local space; `transform` is mesh-local-to-world.
-// M2-C: positions + normals + indices. PBR materials still pending — handled
-// from glTF MetallicRoughness in a later step.
 struct MeshData {
     std::string             name;
     std::vector<glm::vec3>  positions;
     std::vector<glm::vec3>  normals;     // empty if glTF primitive had no NORMAL attribute
+    std::vector<glm::vec2>  uvs;         // empty if no TEXCOORD_0
+    std::vector<glm::vec3>  tangents;    // empty if no TANGENT attribute (for normal mapping)
     std::vector<uint32_t>   indices;
-    glm::mat4               transform = glm::mat4(1.0f);
+    glm::mat4               transform   = glm::mat4(1.0f);
+    int                     materialIdx = -1; // index into Scene::materials, -1 = default
 };
 
 // A realtime light, owned by SpaceGen (NOT exported from Blender — Blender
@@ -69,10 +99,12 @@ struct Scene {
     int                     schemaVersion = 0;
     std::string             sourceBlend;
     std::string             folderPath;
-    CameraData              camera;
-    std::vector<MeshData>   meshes;
-    std::vector<Light>      lights;
-    Bus                     bus;
+    CameraData                  camera;
+    std::vector<MeshData>       meshes;
+    std::vector<PbrMaterial>    materials;
+    std::vector<TextureData>    textures;
+    std::vector<Light>          lights;
+    Bus                         bus;
 
     // Loads `scene.json` from `folderPath`, then optionally `structure.glb`
     // referenced by the manifest. Throws std::runtime_error on hard failure

@@ -68,14 +68,33 @@ public:
 private:
     void buildPipeline();
     void releaseDepthTexture();
+    void buildDefaultTexturesAndSampler();
+    void releaseTexturePool();
+    MTL::Texture* createTextureFromRgba(const uint8_t* rgba,
+                                          int width, int height,
+                                          bool isSRGB,
+                                          const char* debugName);
 
     struct GpuMesh {
         MTL::Buffer* positionBuffer = nullptr;   // float3 positions
         MTL::Buffer* normalBuffer   = nullptr;   // float3 normals (may be null)
+        MTL::Buffer* uvBuffer       = nullptr;   // float2 UV0 (may be null)
         MTL::Buffer* indexBuffer    = nullptr;   // uint32 indices
         uint32_t     indexCount     = 0;
         glm::mat4    transform      = glm::mat4(1.0f);
+        int          materialIdx    = -1;        // -1 = default material
         std::string  name;
+    };
+
+    // GPU material: pointers to textures (owned by texturePool_) + factors.
+    struct GpuMaterial {
+        MTL::Texture* baseColorTex = nullptr;
+        MTL::Texture* mrTex        = nullptr;    // metallicRoughness
+        MTL::Texture* emissiveTex  = nullptr;
+        glm::vec4 baseColorFactor  = glm::vec4(1.0f);
+        glm::vec3 emissiveFactor   = glm::vec3(0.0f);
+        float     metallicFactor   = 1.0f;
+        float     roughnessFactor  = 1.0f;
     };
 
     MTL::Device*               device_       = nullptr; // non-owning
@@ -86,6 +105,15 @@ private:
     MTL::Texture*              depthTex_     = nullptr;
     int                        depthW_       = 0;
     int                        depthH_       = 0;
+
+    MTL::SamplerState*         linearSampler_  = nullptr;
+    MTL::Texture*              defaultWhite_   = nullptr;   // 1x1 sRGB white
+    MTL::Texture*              defaultLinear_  = nullptr;   // 1x1 linear white
+    MTL::Texture*              defaultBlack_   = nullptr;   // 1x1 linear black
+
+    std::vector<MTL::Texture*> texturePool_;   // uploaded from Scene.textures
+    std::vector<GpuMaterial>   gpuMaterials_;  // mirror of Scene.materials
+    GpuMaterial                defaultMaterial_;
 
     std::vector<GpuMesh>       gpuMeshes_;
     glm::mat4                  projection_      = glm::mat4(1.0f);

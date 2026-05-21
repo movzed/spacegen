@@ -150,6 +150,55 @@ void processPrimitive(const tinygltf::Model& model,
                   << "' has no NORMAL attribute. Lighting will be undefined.\n";
     }
 
+    // TEXCOORD_0 attribute (UVs for texture sampling). Optional — falls
+    // back to (0,0) per vertex when absent.
+    auto uvIt = prim.attributes.find("TEXCOORD_0");
+    if (uvIt != prim.attributes.end()) {
+        const auto& uvAcc = model.accessors[uvIt->second];
+        const auto& uvView = model.bufferViews[uvAcc.bufferView];
+        const auto& uvBuf  = model.buffers[uvView.buffer];
+        const auto* uvBytes = uvBuf.data.data()
+            + uvView.byteOffset + uvAcc.byteOffset;
+        const size_t uvStride = uvView.byteStride > 0
+            ? uvView.byteStride
+            : sizeof(float) * 2;
+        out.uvs.resize(uvAcc.count);
+        if (uvStride == sizeof(float) * 2
+            && uvAcc.count == posAccessor.count) {
+            std::memcpy(out.uvs.data(), uvBytes,
+                        sizeof(float) * 2 * uvAcc.count);
+        } else {
+            for (size_t i = 0; i < uvAcc.count; ++i) {
+                const float* p = reinterpret_cast<const float*>(uvBytes + i * uvStride);
+                out.uvs[i] = glm::vec2(p[0], p[1]);
+            }
+        }
+    }
+
+    // TANGENT attribute (for normal mapping). Optional.
+    auto tanIt = prim.attributes.find("TANGENT");
+    if (tanIt != prim.attributes.end()) {
+        const auto& tAcc = model.accessors[tanIt->second];
+        const auto& tView = model.bufferViews[tAcc.bufferView];
+        const auto& tBuf  = model.buffers[tView.buffer];
+        const auto* tBytes = tBuf.data.data()
+            + tView.byteOffset + tAcc.byteOffset;
+        // glTF tangents are vec4 (xyz + handedness w). We only keep xyz
+        // for now and assume right-handed; full bitangent computation
+        // (cross(normal, tangent) * w) lives in the shader if needed.
+        const size_t tStride = tView.byteStride > 0
+            ? tView.byteStride
+            : sizeof(float) * 4;
+        out.tangents.resize(tAcc.count);
+        for (size_t i = 0; i < tAcc.count; ++i) {
+            const float* p = reinterpret_cast<const float*>(tBytes + i * tStride);
+            out.tangents[i] = glm::vec3(p[0], p[1], p[2]);
+        }
+    }
+
+    // Material index (-1 = use default material)
+    out.materialIdx = prim.material;
+
     if (prim.indices >= 0) {
         const auto& idxAccessor = model.accessors[prim.indices];
         const auto& idxView     = model.bufferViews[idxAccessor.bufferView];
@@ -199,6 +248,111 @@ void processPrimitive(const tinygltf::Model& model,
     outMeshes.push_back(std::move(out));
     std::printf("[Scene]   Stored.\n");
     std::fflush(stdout);
+}
+
+// Decode tinygltf images into RGBA8 TextureData. tinygltf already decoded
+// the bytes (we built it with STB_IMAGE_IMPLEMENTATION), so each image has
+// `image` = raw decoded pixels. We re-pack to RGBA8 for uniform handling.
+void extractTextures(const tinygltf::Model& model,
+                      std::vector<TextureData>& outTextures,
+                      const std::vector<bool>& sRGBFlags)
+{
+    outTextures.clear();
+    outTextures.reserve(model.images.size());
+    for (size_t i = 0; i < model.images.size(); ++i) {
+        const auto& img = model.images[i];
+        TextureData td;
+        td.name   = img.name.empty()
+            ? ("image_" + std::to_string(i))
+            : img.name;
+        td.width  = img.width;
+        td.height = img.height;
+        td.isSRGB = (i < sRGBFlags.size()) ? sRGBFlags[i] : true;
+
+        if (img.width <= 0 || img.height <= 0 || img.image.empty()) {
+            std::cerr << "[Scene] Image '" << td.name
+                      << "' is empty/undecoded. Skipping.\n";
+            outTextures.push_back(std::move(td));  // keep slot for indexing
+            continue;
+        }
+
+        const int n = img.component;            // 1, 3 or 4
+        const int pxCount = img.width * img.height;
+        td.rgba.resize(static_cast<size_t>(pxCount) * 4);
+        for (int p = 0; p < pxCount; ++p) {
+            const uint8_t* src = &img.image[static_cast<size_t>(p) * n];
+            uint8_t* dst = &td.rgba[static_cast<size_t>(p) * 4];
+            if (n == 1) {
+                dst[0] = dst[1] = dst[2] = src[0]; dst[3] = 255;
+            } else if (n == 2) {
+                dst[0] = dst[1] = dst[2] = src[0]; dst[3] = src[1];
+            } else if (n == 3) {
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255;
+            } else { // n == 4
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+            }
+        }
+        outTextures.push_back(std::move(td));
+    }
+}
+
+// Walk model.materials → Scene.materials. Also returns a flag per glTF image
+// telling whether it should be treated as sRGB (baseColor + emissive) or
+// linear (normal / metallicRoughness / occlusion). Same image referenced by
+// two roles is rare; we choose sRGB by default and only flip to linear if
+// the image is referenced as a linear-only role.
+void extractMaterials(const tinygltf::Model& model,
+                       std::vector<PbrMaterial>& outMats,
+                       std::vector<bool>& outIsSRGB)
+{
+    outIsSRGB.assign(model.images.size(), true); // optimistic default
+
+    auto markLinear = [&](int textureIdx) {
+        if (textureIdx < 0
+            || textureIdx >= static_cast<int>(model.textures.size())) return;
+        int imgIdx = model.textures[textureIdx].source;
+        if (imgIdx >= 0 && imgIdx < static_cast<int>(model.images.size())) {
+            outIsSRGB[imgIdx] = false;
+        }
+    };
+
+    outMats.clear();
+    outMats.reserve(model.materials.size());
+    for (size_t i = 0; i < model.materials.size(); ++i) {
+        const auto& m = model.materials[i];
+        PbrMaterial pm;
+        pm.name = m.name.empty() ? ("material_" + std::to_string(i)) : m.name;
+
+        const auto& pbr = m.pbrMetallicRoughness;
+        if (pbr.baseColorFactor.size() == 4) {
+            pm.baseColorFactor = glm::vec4(
+                pbr.baseColorFactor[0], pbr.baseColorFactor[1],
+                pbr.baseColorFactor[2], pbr.baseColorFactor[3]);
+        }
+        pm.metallicFactor  = static_cast<float>(pbr.metallicFactor);
+        pm.roughnessFactor = static_cast<float>(pbr.roughnessFactor);
+
+        if (m.emissiveFactor.size() == 3) {
+            pm.emissiveFactor = glm::vec3(
+                m.emissiveFactor[0], m.emissiveFactor[1], m.emissiveFactor[2]);
+        }
+        pm.normalScale       = static_cast<float>(m.normalTexture.scale);
+        pm.occlusionStrength = static_cast<float>(m.occlusionTexture.strength);
+
+        pm.baseColorTex         = pbr.baseColorTexture.index;
+        pm.metallicRoughnessTex = pbr.metallicRoughnessTexture.index;
+        pm.normalTex            = m.normalTexture.index;
+        pm.emissiveTex          = m.emissiveTexture.index;
+        pm.occlusionTex         = m.occlusionTexture.index;
+
+        // Mark linear-role textures.
+        markLinear(pm.metallicRoughnessTex);
+        markLinear(pm.normalTex);
+        markLinear(pm.occlusionTex);
+        // baseColorTex and emissiveTex stay sRGB by default.
+
+        outMats.push_back(std::move(pm));
+    }
 }
 
 void walkNode(const tinygltf::Model& model,
@@ -331,6 +485,15 @@ Scene Scene::loadFromFolder(const std::string& folderPath) {
                 throw std::runtime_error(
                     "Failed to load " + glbPath.string() + ": " + err);
             }
+
+            // Materials first (we need to mark images as sRGB/linear before
+            // texture extraction). Then images. Then walk meshes.
+            std::vector<bool> isSRGB;
+            extractMaterials(model, scene.materials, isSRGB);
+            extractTextures(model, scene.textures, isSRGB);
+            std::printf("[Scene] Loaded %zu materials, %zu textures.\n",
+                         scene.materials.size(), scene.textures.size());
+            std::fflush(stdout);
 
             int sceneIdx = model.defaultScene;
             if (sceneIdx < 0) sceneIdx = 0;

@@ -34,12 +34,14 @@ constant int   MAX_DIRS   = 4;
 struct VertexIn {
     float3 position [[attribute(0)]];
     float3 normal   [[attribute(1)]];
+    float2 uv       [[attribute(2)]];
 };
 
 struct VertexOut {
     float4 position [[position]];
     float3 worldPos;
     float3 worldNormal;
+    float2 uv;
 };
 
 struct SpotLight {
@@ -59,10 +61,13 @@ struct Uniforms {
     float4x4  view;
     float4x4  model;
     float4    cameraWorldPos;
-    float4    baseColorRoughness;   // .rgb base, .a roughness
-    float4    metallicCounts;       // .x metallic, .y unused, .z spotCount, .w dirCount
+    float4    baseColorRoughness;   // .rgb operator tint, .a operator roughness multiplier
+    float4    metallicCounts;       // .x metallic operator, .z spotCount, .w dirCount
     float4    ambientColor;         // .rgb ambient fill, .a unused
     float4    modeFlags;            // .x emitLightsOnly (0/1), others reserved
+    float4    matBaseColor;         // .rgba material baseColorFactor (texture multiplier)
+    float4    matEmissive;          // .rgb material emissiveFactor
+    float4    matMR;                // .x metallicFactor, .y roughnessFactor
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
@@ -75,6 +80,7 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
     out.position = u.projection * u.view * world;
     out.worldPos = world.xyz;
     out.worldNormal = (u.model * float4(in.normal, 0.0)).xyz;
+    out.uv = in.uv;
     return out;
 }
 
@@ -125,14 +131,33 @@ static float3 pbrEvalDirect(float3 N, float3 V, float3 L,
 }
 
 fragment float4 fs_main(VertexOut in [[stage_in]],
-                        constant Uniforms& u [[buffer(0)]])
+                        constant Uniforms& u [[buffer(0)]],
+                        texture2d<float> baseColorMap [[texture(0)]],
+                        texture2d<float> mrMap        [[texture(1)]],
+                        texture2d<float> emissiveMap  [[texture(2)]],
+                        sampler          smp          [[sampler(0)]])
 {
     float3 N = normalize(in.worldNormal);
     float3 V = normalize(u.cameraWorldPos.xyz - in.worldPos);
 
-    float3 baseColor = u.baseColorRoughness.rgb;
-    float  roughness = max(u.baseColorRoughness.a, 0.04);
-    float  metallic  = u.metallicCounts.r;
+    // Sample material textures (default-bound to 1x1 fallbacks when material
+    // has no texture for that channel).
+    float4 baseTex = baseColorMap.sample(smp, in.uv);
+    float4 mrTex   = mrMap       .sample(smp, in.uv);
+    float3 emiTex  = emissiveMap .sample(smp, in.uv).rgb;
+
+    // Compose final material values:
+    //   final = operator_tint × material_factor × texture
+    float3 baseColor = u.baseColorRoughness.rgb
+                     * u.matBaseColor.rgb
+                     * baseTex.rgb;
+    float  roughness = max(u.baseColorRoughness.a
+                          * u.matMR.y
+                          * mrTex.g, 0.04);
+    float  metallic  = u.metallicCounts.r
+                     * u.matMR.x
+                     * mrTex.b;
+    float3 emission  = u.matEmissive.rgb * emiTex;
     float3 ambient   = u.ambientColor.rgb;
     int    spotCount = int(u.metallicCounts.b);
     int    dirCount  = int(u.metallicCounts.a);
@@ -185,7 +210,7 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
                                   baseColor, roughness, metallic, F0);
     }
 
-    float3 totalLight = LoDir + LoSpots;
+    float3 totalLight = LoDir + LoSpots + emission;
     bool   lightsOnly = u.modeFlags.x > 0.5;
 
     if (lightsOnly) {
@@ -226,6 +251,9 @@ struct Uniforms {
     glm::vec4 metallicCounts;    // .x metallic, .z spotCount, .w dirCount
     glm::vec4 ambientColor;      // .rgb ambient fill
     glm::vec4 modeFlags;         // .x emitLightsOnly (0/1)
+    glm::vec4 matBaseColor;      // material baseColorFactor (RGBA)
+    glm::vec4 matEmissive;       // .rgb emissiveFactor
+    glm::vec4 matMR;             // .x metallicFactor, .y roughnessFactor
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
@@ -242,6 +270,7 @@ MetalRenderer::MetalRenderer(MTL::Device* device, MTL::PixelFormat colorFormat)
     if (!device_) {
         throw std::runtime_error("MetalRenderer: device is null");
     }
+    buildDefaultTexturesAndSampler();
     buildPipeline();
 }
 
@@ -249,11 +278,76 @@ MetalRenderer::~MetalRenderer() {
     for (auto& gm : gpuMeshes_) {
         if (gm.positionBuffer) gm.positionBuffer->release();
         if (gm.normalBuffer)   gm.normalBuffer->release();
+        if (gm.uvBuffer)       gm.uvBuffer->release();
         if (gm.indexBuffer)    gm.indexBuffer->release();
     }
+    releaseTexturePool();
+    if (defaultWhite_)  defaultWhite_->release();
+    if (defaultLinear_) defaultLinear_->release();
+    if (defaultBlack_)  defaultBlack_->release();
+    if (linearSampler_) linearSampler_->release();
     if (pipeline_)   pipeline_->release();
     if (depthState_) depthState_->release();
     releaseDepthTexture();
+}
+
+void MetalRenderer::releaseTexturePool() {
+    for (auto* t : texturePool_) {
+        if (t) t->release();
+    }
+    texturePool_.clear();
+    gpuMaterials_.clear();
+}
+
+MTL::Texture* MetalRenderer::createTextureFromRgba(
+    const uint8_t* rgba, int width, int height,
+    bool isSRGB, const char* /*debugName*/)
+{
+    if (width <= 0 || height <= 0 || !rgba) return nullptr;
+    MTL::PixelFormat fmt = isSRGB
+        ? MTL::PixelFormatRGBA8Unorm_sRGB
+        : MTL::PixelFormatRGBA8Unorm;
+    MTL::TextureDescriptor* td = MTL::TextureDescriptor::texture2DDescriptor(
+        fmt, width, height, false);
+    td->setStorageMode(MTL::StorageModeShared);
+    td->setUsage(MTL::TextureUsageShaderRead);
+    MTL::Texture* tex = device_->newTexture(td);
+    if (!tex) return nullptr;
+    MTL::Region region = MTL::Region::Make2D(0, 0, width, height);
+    tex->replaceRegion(region, 0, rgba,
+                        static_cast<NS::UInteger>(width) * 4);
+    return tex;
+}
+
+void MetalRenderer::buildDefaultTexturesAndSampler() {
+    // 1x1 fallback textures so the shader's texture binding never sees null.
+    static const uint8_t white[4]  = {255, 255, 255, 255};
+    static const uint8_t black[4]  = {  0,   0,   0, 255};
+    defaultWhite_  = createTextureFromRgba(white, 1, 1, true,  "default_white_srgb");
+    defaultLinear_ = createTextureFromRgba(white, 1, 1, false, "default_white_lin");
+    defaultBlack_  = createTextureFromRgba(black, 1, 1, false, "default_black");
+
+    // Linear sampler with mipmap-ready settings (we don't generate mipmaps
+    // yet — small perf hit, fine for v1).
+    MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+    sd->setMinFilter(MTL::SamplerMinMagFilterLinear);
+    sd->setMagFilter(MTL::SamplerMinMagFilterLinear);
+    sd->setMipFilter(MTL::SamplerMipFilterLinear);
+    sd->setSAddressMode(MTL::SamplerAddressModeRepeat);
+    sd->setTAddressMode(MTL::SamplerAddressModeRepeat);
+    sd->setMaxAnisotropy(8);
+    linearSampler_ = device_->newSamplerState(sd);
+    sd->release();
+
+    // Default material (used when a mesh has no material): factor 1, no
+    // emission, dielectric medium roughness.
+    defaultMaterial_.baseColorTex    = defaultWhite_;
+    defaultMaterial_.mrTex           = defaultLinear_;
+    defaultMaterial_.emissiveTex     = defaultBlack_;
+    defaultMaterial_.baseColorFactor = glm::vec4(1.0f);
+    defaultMaterial_.emissiveFactor  = glm::vec3(0.0f);
+    defaultMaterial_.metallicFactor  = 0.0f;
+    defaultMaterial_.roughnessFactor = 1.0f;
 }
 
 void MetalRenderer::releaseDepthTexture() {
@@ -292,6 +386,7 @@ void MetalRenderer::buildPipeline() {
     // Vertex descriptor:
     //   attribute(0) = position (float3) in buffer(0)
     //   attribute(1) = normal   (float3) in buffer(2)   <- buffer(1) is uniforms
+    //   attribute(2) = uv       (float2) in buffer(3)
     MTL::VertexDescriptor* vd = MTL::VertexDescriptor::alloc()->init();
     auto* attr0 = vd->attributes()->object(0);
     attr0->setFormat(MTL::VertexFormatFloat3);
@@ -301,12 +396,19 @@ void MetalRenderer::buildPipeline() {
     attr1->setFormat(MTL::VertexFormatFloat3);
     attr1->setOffset(0);
     attr1->setBufferIndex(2);
+    auto* attr2 = vd->attributes()->object(2);
+    attr2->setFormat(MTL::VertexFormatFloat2);
+    attr2->setOffset(0);
+    attr2->setBufferIndex(3);
     auto* layout0 = vd->layouts()->object(0);
     layout0->setStride(sizeof(float) * 3);
     layout0->setStepFunction(MTL::VertexStepFunctionPerVertex);
     auto* layout2 = vd->layouts()->object(2);
     layout2->setStride(sizeof(float) * 3);
     layout2->setStepFunction(MTL::VertexStepFunctionPerVertex);
+    auto* layout3 = vd->layouts()->object(3);
+    layout3->setStride(sizeof(float) * 2);
+    layout3->setStepFunction(MTL::VertexStepFunctionPerVertex);
 
     MTL::RenderPipelineDescriptor* pd =
         MTL::RenderPipelineDescriptor::alloc()->init();
@@ -339,19 +441,61 @@ void MetalRenderer::buildPipeline() {
 }
 
 void MetalRenderer::loadScene(const Scene& scene) {
-    // Drop existing GPU meshes.
+    // Drop existing GPU meshes + textures + materials.
     for (auto& gm : gpuMeshes_) {
         if (gm.positionBuffer) gm.positionBuffer->release();
         if (gm.normalBuffer)   gm.normalBuffer->release();
+        if (gm.uvBuffer)       gm.uvBuffer->release();
         if (gm.indexBuffer)    gm.indexBuffer->release();
     }
     gpuMeshes_.clear();
     gpuMeshes_.reserve(scene.meshes.size());
+    releaseTexturePool();
 
     projection_     = scene.camera.projection;
     view_           = scene.camera.view;
     // Camera world position = 4th column of the camera-to-world matrix.
     cameraWorldPos_ = glm::vec3(scene.camera.world[3]);
+
+    // ---- Upload textures from scene.textures ----
+    texturePool_.reserve(scene.textures.size());
+    for (size_t i = 0; i < scene.textures.size(); ++i) {
+        const auto& t = scene.textures[i];
+        MTL::Texture* mt = (t.width > 0 && t.height > 0 && !t.rgba.empty())
+            ? createTextureFromRgba(t.rgba.data(), t.width, t.height,
+                                      t.isSRGB, t.name.c_str())
+            : nullptr;
+        texturePool_.push_back(mt);
+        if (mt) {
+            std::printf("[MetalRenderer] Tex %zu '%s' %dx%d %s\n",
+                         i, t.name.c_str(), t.width, t.height,
+                         t.isSRGB ? "sRGB" : "linear");
+        }
+    }
+
+    // ---- Resolve materials ----
+    auto resolveTex = [&](int texIdx, MTL::Texture* fallback) -> MTL::Texture* {
+        if (texIdx < 0
+            || texIdx >= static_cast<int>(texturePool_.size())) return fallback;
+        return texturePool_[texIdx] ? texturePool_[texIdx] : fallback;
+    };
+    gpuMaterials_.reserve(scene.materials.size());
+    for (const auto& m : scene.materials) {
+        GpuMaterial gm;
+        gm.baseColorTex   = resolveTex(m.baseColorTex,
+                                         defaultWhite_);
+        gm.mrTex          = resolveTex(m.metallicRoughnessTex,
+                                         defaultLinear_);
+        gm.emissiveTex    = resolveTex(m.emissiveTex,
+                                         defaultBlack_);
+        gm.baseColorFactor = m.baseColorFactor;
+        gm.metallicFactor  = m.metallicFactor;
+        gm.roughnessFactor = m.roughnessFactor;
+        gm.emissiveFactor  = m.emissiveFactor;
+        gpuMaterials_.push_back(gm);
+    }
+    std::printf("[MetalRenderer] Materials loaded: %zu (textures pool: %zu)\n",
+                 gpuMaterials_.size(), texturePool_.size());
 
     for (const auto& m : scene.meshes) {
         if (m.positions.empty() || m.indices.empty()) {
@@ -365,6 +509,7 @@ void MetalRenderer::loadScene(const Scene& scene) {
         gm.name = m.name;
         gm.transform = m.transform;
         gm.indexCount = static_cast<uint32_t>(m.indices.size());
+        gm.materialIdx = m.materialIdx;
 
         const size_t vbBytes = m.positions.size() * sizeof(glm::vec3);
         gm.positionBuffer = device_->newBuffer(
@@ -375,13 +520,25 @@ void MetalRenderer::loadScene(const Scene& scene) {
             gm.normalBuffer = device_->newBuffer(
                 m.normals.data(), nbBytes, MTL::ResourceStorageModeShared);
         } else {
-            // Fallback: synthesize a +Z normal buffer so the pipeline still
-            // has something to read at buffer(2). Visually wrong but won't
-            // crash.
             std::vector<glm::vec3> fakeNormals(m.positions.size(),
                                                 glm::vec3(0, 0, 1));
             gm.normalBuffer = device_->newBuffer(
                 fakeNormals.data(), fakeNormals.size() * sizeof(glm::vec3),
+                MTL::ResourceStorageModeShared);
+        }
+
+        // UV buffer (vec2). Synthesize (0,0) per vertex if no UVs were
+        // exported — keeps the vertex layout uniform so the shader always
+        // has something at attribute(2).
+        if (!m.uvs.empty()) {
+            const size_t uvBytes = m.uvs.size() * sizeof(glm::vec2);
+            gm.uvBuffer = device_->newBuffer(
+                m.uvs.data(), uvBytes, MTL::ResourceStorageModeShared);
+        } else {
+            std::vector<glm::vec2> fakeUVs(m.positions.size(),
+                                            glm::vec2(0.0f, 0.0f));
+            gm.uvBuffer = device_->newBuffer(
+                fakeUVs.data(), fakeUVs.size() * sizeof(glm::vec2),
                 MTL::ResourceStorageModeShared);
         }
 
@@ -518,6 +675,13 @@ void MetalRenderer::renderStructureMeshes(
     }
 
     for (const auto& gm : gpuMeshes_) {
+        // Resolve the material for this mesh (or the default).
+        const GpuMaterial& mat =
+            (gm.materialIdx >= 0
+             && gm.materialIdx < static_cast<int>(gpuMaterials_.size()))
+            ? gpuMaterials_[gm.materialIdx]
+            : defaultMaterial_;
+
         Uniforms u{};
         u.projection         = ctx.projection;
         u.view               = ctx.view;
@@ -531,13 +695,28 @@ void MetalRenderer::renderStructureMeshes(
         u.ambientColor       = glm::vec4(ambientColor, 0.0f);
         u.modeFlags          = glm::vec4(layer.emitLightsOnly ? 1.0f : 0.0f,
                                           0.0f, 0.0f, 0.0f);
+        u.matBaseColor       = mat.baseColorFactor;
+        u.matEmissive        = glm::vec4(mat.emissiveFactor, 0.0f);
+        u.matMR              = glm::vec4(mat.metallicFactor,
+                                          mat.roughnessFactor,
+                                          0.0f, 0.0f);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 
         enc->setVertexBuffer(gm.positionBuffer, 0, 0);
         enc->setVertexBuffer(gm.normalBuffer,   0, 2);
+        enc->setVertexBuffer(gm.uvBuffer,       0, 3);
         enc->setVertexBytes(&u, sizeof(u), 1);
         enc->setFragmentBytes(&u, sizeof(u), 0);
+
+        // Bind material textures + sampler.
+        enc->setFragmentTexture(mat.baseColorTex
+            ? mat.baseColorTex  : defaultWhite_,  0);
+        enc->setFragmentTexture(mat.mrTex
+            ? mat.mrTex         : defaultLinear_, 1);
+        enc->setFragmentTexture(mat.emissiveTex
+            ? mat.emissiveTex   : defaultBlack_,  2);
+        enc->setFragmentSamplerState(linearSampler_, 0);
 
         enc->drawIndexedPrimitives(
             MTL::PrimitiveTypeTriangle,
