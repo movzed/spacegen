@@ -23,6 +23,7 @@
 #include "platform_metal_glfw.h"
 #include "core/Scene.h"
 #include "backends/metal/MetalRenderer.h"
+#include "gui/Workstation.h"
 
 #include <chrono>
 #include <cstdio>
@@ -33,7 +34,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M2-C1 (PBR + 1 light)";
+constexpr char kWindowTitle[] = "SpaceGen — M2-C2 (PBR + ImGui)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);
@@ -179,12 +180,17 @@ int main(int argc, char** argv) {
     std::printf("[SpaceGen] Renderer: %zu meshes, %zu triangles total on GPU\n",
                  renderer->meshCount(), renderer->totalTriangles());
 
+    // ImGui Workstation (overlays panels on top of the rendered scene).
+    spacegen::gui::Workstation workstation(window, device, kColorFmt);
+
     // ============================================================
     // Render loop
     // ============================================================
     auto t0     = std::chrono::steady_clock::now();
     auto tFrame = t0;
     int  frameCounter = 0;
+    double smoothedFps     = 60.0;
+    double smoothedFrameMs = 16.67;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -208,7 +214,16 @@ int main(int argc, char** argv) {
             const double elapsed = std::chrono::duration<double>(now - t0).count();
 
             MTL::CommandBuffer* cb = commandQueue->commandBuffer();
+            // Main pass: PBR-lit structure.
             renderer->renderFrame(cb, drawable->texture(), elapsed);
+            // UI pass: ImGui panels overlaid (uses LoadAction=Load).
+            spacegen::gui::FrameStats stats;
+            stats.fps         = smoothedFps;
+            stats.frameTimeMs = smoothedFrameMs;
+            stats.drawableW   = fbW;
+            stats.drawableH   = fbH;
+            workstation.buildAndSubmit(cb, drawable->texture(),
+                                        scene, *renderer, stats);
             cb->presentDrawable(drawable);
             cb->commit();
         }
@@ -216,9 +231,10 @@ int main(int argc, char** argv) {
         frameCounter++;
 
         const auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - tFrame).count() >= 1.0) {
-            std::printf("[SpaceGen] %d fps  (drawable %dx%d, %zu tris)\n",
-                         frameCounter, fbW, fbH, renderer->totalTriangles());
+        double sinceLast = std::chrono::duration<double>(now - tFrame).count();
+        if (sinceLast >= 0.5) {
+            smoothedFps    = frameCounter / sinceLast;
+            smoothedFrameMs = sinceLast * 1000.0 / frameCounter;
             frameCounter = 0;
             tFrame = now;
         }

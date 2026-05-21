@@ -106,6 +106,25 @@ if(NOT TARGET tinygltf)
 endif()
 target_include_directories(tinygltf INTERFACE "${tinygltf_SOURCE_DIR}")
 
+# ---- Dear ImGui (docking branch). Compiled into the spacegen binary
+#      directly; no library target. Uses GLFW + Metal backends. ----
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        docking
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(imgui)
+set(IMGUI_SOURCES
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm
+)
+
 # ============================================================
 # Engine executable
 # ============================================================
@@ -117,10 +136,14 @@ add_executable(spacegen
     platform_metal_glfw.mm
     core/Scene.cpp
     backends/metal/MetalRenderer.cpp
+    gui/Workstation.mm
+    ${IMGUI_SOURCES}
 )
 
 target_include_directories(spacegen PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${imgui_SOURCE_DIR}"
+    "${imgui_SOURCE_DIR}/backends"
 )
 
 target_link_libraries(spacegen PRIVATE
