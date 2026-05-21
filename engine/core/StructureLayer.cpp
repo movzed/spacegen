@@ -38,6 +38,15 @@ void StructureLayer::render(RenderContext& ctx) {
 }
 
 void StructureLayer::drawInspector() {
+    if (ImGui::CollapsingHeader("Output",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Lights only (transparent base)##out",
+                         &emitLightsOnly);
+        if (emitLightsOnly) {
+            ImGui::TextDisabled("Structure body invisible; output alpha");
+            ImGui::TextDisabled("tracks light contribution. Composite-ready.");
+        }
+    }
     if (ImGui::CollapsingHeader("Material",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::ColorEdit3("Base color##s",

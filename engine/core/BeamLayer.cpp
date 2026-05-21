@@ -71,13 +71,15 @@ BeamLayer::BeamLayer() {
 glm::vec3 BeamLayer::directionAtTime(double t,
                                        const glm::vec3& baseForward) const
 {
-    float p = panDeg  + panLFO.eval(t);
-    float ti = tiltDeg + tiltLFO.eval(t);
+    auto motion = motionLFO.eval(t);
+    float p  = panDeg  + panLFO.eval(t)  + motion.panDeg;
+    float ti = tiltDeg + tiltLFO.eval(t) + motion.tiltDeg;
     return panTiltToDir(p, ti, baseForward);
 }
 
 float BeamLayer::intensityAtTime(double t) const {
-    return std::max(0.0f, intensity + intensityLFO.eval(t));
+    auto motion = motionLFO.eval(t);
+    return std::max(0.0f, intensity + intensityLFO.eval(t) + motion.intensity);
 }
 
 void BeamLayer::drawInspector() {
@@ -105,7 +107,31 @@ void BeamLayer::drawInspector() {
     ImGui::SliderFloat("Outer cone (deg)##spot", &outerDeg, 0.5f, 60.0f);
     if (outerDeg < innerDeg) outerDeg = innerDeg;
 
-    if (ImGui::CollapsingHeader("LFO modulation (moving head)")) {
+    if (ImGui::CollapsingHeader("Motion pattern (3-axis)",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* patterns[] = {
+            "Off", "Circle", "Figure-8", "Ballyhoo", "Wave",
+            "Sweep", "Can-can", "Strobe + pan"
+        };
+        int pat = static_cast<int>(motionLFO.pattern);
+        ImGui::SetNextItemWidth(170.0f);
+        if (ImGui::Combo("Pattern##motion", &pat, patterns, 8)) {
+            motionLFO.pattern = static_cast<MotionLFO::Pattern>(pat);
+        }
+        if (motionLFO.pattern != MotionLFO::Pattern::Off) {
+            ImGui::Indent(8.0f);
+            ImGui::SliderFloat("Freq (Hz)##m", &motionLFO.freqHz, 0.0f, 4.0f);
+            ImGui::SliderFloat("Pan amp##m",   &motionLFO.panAmp,  0.0f, 180.0f);
+            ImGui::SliderFloat("Tilt amp##m",  &motionLFO.tiltAmp, 0.0f, 90.0f);
+            ImGui::SliderFloat("Int amp##m",   &motionLFO.intAmp,  0.0f, 20.0f);
+            ImGui::SliderFloat("Phase##m",     &motionLFO.phase,   0.0f, 1.0f);
+            ImGui::TextDisabled("Tip: copy this spot, change only Phase");
+            ImGui::TextDisabled("for fan / wave effects across N fixtures.");
+            ImGui::Unindent(8.0f);
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Per-axis LFO modulation")) {
         drawLFOWidget("pan",       panLFO,       180.0f);
         drawLFOWidget("tilt",      tiltLFO,      90.0f);
         drawLFOWidget("intensity", intensityLFO, 20.0f);

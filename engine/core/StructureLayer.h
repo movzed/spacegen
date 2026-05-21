@@ -22,6 +22,15 @@ public:
     float     roughness = 0.55f;
     float     metallic  = 0.0f;
     float     ambient   = 0.10f;   // small fill so unlit structure isn't pitch black
+
+    // Output mode:
+    //   false (default): structure renders fully — base color + ambient +
+    //                    lighting. Alpha = 1. Operator sees the relief.
+    //   true:            structure base color and ambient are suppressed.
+    //                    Output is only the lighting contribution, with
+    //                    alpha proportional to brightness. Perfect for
+    //                    compositing in Resolume on top of Blender plates.
+    bool      emitLightsOnly = false;
 };
 
 } // namespace spacegen

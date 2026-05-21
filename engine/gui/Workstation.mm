@@ -197,13 +197,29 @@ void drawLayerRack(spacegen::Scene& scene,
         }
         ImGui::SameLine();
 
-        // Selectable name (click selects, double-click renames eventually)
+        // Selectable name (click selects). Selected row gets a clear visual
+        // marker (arrow prefix + accent color) so the operator knows which
+        // layer the Inspector is showing.
         bool isSelected = (layer->id == selectedLayerId);
-        char label[80];
-        std::snprintf(label, sizeof(label), "%s##sel", layer->name.c_str());
-        if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_AllowDoubleClick,
-                              ImVec2(0.0f, 0.0f))) {
+        char label[96];
+        std::snprintf(label, sizeof(label), "%s %s##sel",
+                       isSelected ? ">" : " ",
+                       layer->name.c_str());
+        if (isSelected) {
+            ImGui::PushStyleColor(ImGuiCol_Header,
+                                   ImVec4(0.18f, 0.40f, 0.78f, 0.70f));
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
+                                   ImVec4(0.22f, 0.46f, 0.86f, 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                   ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+        if (ImGui::Selectable(label, isSelected,
+                               ImGuiSelectableFlags_AllowDoubleClick,
+                               ImVec2(0.0f, 0.0f))) {
             selectedLayerId = layer->id;
+        }
+        if (isSelected) {
+            ImGui::PopStyleColor(3);
         }
         // Right-click on the row gives a context menu.
         if (ImGui::BeginPopupContextItem("##ctx")) {
@@ -383,12 +399,20 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
     if (showInspector_) drawInspector(scene, selectedLayerId_, &showInspector_);
     if (showDemo_)      ImGui::ShowDemoWindow(&showDemo_);
 
-    // Default selection: pick the first non-Structure layer if nothing yet
-    // (so opening the app shows the Beam's controls right away).
+    // Selection bookkeeping:
+    //  - If the selected id refers to a layer that no longer exists (removed
+    //    via the Remove menu), clear the selection.
+    //  - If nothing is selected and the bus has layers, pick a sensible
+    //    default — the first non-Structure layer if available, otherwise
+    //    the first layer.
+    bool selectionExists = false;
+    for (auto& l : scene.bus.layers) {
+        if (l && l->id == selectedLayerId_) { selectionExists = true; break; }
+    }
+    if (!selectionExists) selectedLayerId_ = 0;
     if (selectedLayerId_ == 0 && !scene.bus.layers.empty()) {
         for (auto& l : scene.bus.layers) {
-            if (l && l->kind() == LayerKind::Generator
-                && std::string(l->typeName()) != "Structure") {
+            if (l && std::string(l->typeName()) != "Structure") {
                 selectedLayerId_ = l->id;
                 break;
             }

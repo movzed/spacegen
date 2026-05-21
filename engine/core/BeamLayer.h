@@ -42,9 +42,14 @@ public:
     float     outerDeg     = 9.0f;   // edge half-angle (soft falloff)
 
     // ---- LFO modulators (moving head choreography) ----
+    // Per-axis LFOs (offsets added independently to base pan/tilt/intensity)
     LFO       panLFO;
     LFO       tiltLFO;
     LFO       intensityLFO;
+
+    // Multi-axis motion pattern (Circle / Figure8 / Ballyhoo / Wave / etc.).
+    // Adds offsets on top of the per-axis LFOs above. Off by default.
+    MotionLFO motionLFO;
 
     // Compute the world-space pointing direction at time t given a base
     // forward axis (camera forward or world +Y).

@@ -61,6 +61,7 @@ struct Uniforms {
     float4    cameraWorldPos;
     float4    baseColorRoughness;   // .rgb base, .a roughness
     float4    metallicAmbient;      // .x metallic, .y ambient, .z spotCount, .w dirCount
+    float4    modeFlags;            // .x emitLightsOnly (0/1), others reserved
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
@@ -183,7 +184,20 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
                                   baseColor, roughness, metallic, F0);
     }
 
-    float3 colorLin = ambient * baseColor + LoDir + LoSpots;
+    float3 totalLight = LoDir + LoSpots;
+    bool   lightsOnly = u.modeFlags.x > 0.5;
+
+    if (lightsOnly) {
+        // Lights-only / composite mode: alpha tracks light brightness, base
+        // color and ambient suppressed. Premultiplied output so it composites
+        // cleanly in Resolume on top of Blender plates.
+        float lum   = dot(totalLight, float3(0.2126, 0.7152, 0.0722));
+        float alpha = saturate(lum);
+        float3 colorOut = pow(max(totalLight, 0.0), float3(1.0 / 2.2));
+        return float4(colorOut * alpha, alpha);
+    }
+
+    float3 colorLin = ambient * baseColor + totalLight;
     float3 colorOut = pow(max(colorLin, 0.0), float3(1.0 / 2.2));
     return float4(colorOut, 1.0);
 }
@@ -209,6 +223,7 @@ struct Uniforms {
     glm::vec4 cameraWorldPos;
     glm::vec4 baseColorRoughness;
     glm::vec4 metallicAmbient;   // .z spotCount, .w dirCount (both as floats)
+    glm::vec4 modeFlags;         // .x emitLightsOnly (0/1)
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
@@ -426,7 +441,13 @@ void MetalRenderer::renderStructureMeshes(
     colorAttachment->setTexture(ctx.colorTarget);
     colorAttachment->setLoadAction(MTL::LoadActionClear);
     colorAttachment->setStoreAction(MTL::StoreActionStore);
-    colorAttachment->setClearColor(MTL::ClearColor(0.04, 0.05, 0.07, 1.0));
+    // In lights-only mode the clear is fully transparent so unlit areas
+    // composite cleanly. Otherwise dark slate so the relief reads.
+    if (layer.emitLightsOnly) {
+        colorAttachment->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 0.0));
+    } else {
+        colorAttachment->setClearColor(MTL::ClearColor(0.04, 0.05, 0.07, 1.0));
+    }
 
     auto* depthAttachment = rpd->depthAttachment();
     depthAttachment->setTexture(depthTex_);
@@ -492,6 +513,8 @@ void MetalRenderer::renderStructureMeshes(
                                           layer.ambient,
                                           static_cast<float>(spotCount),
                                           static_cast<float>(dirCount));
+        u.modeFlags          = glm::vec4(layer.emitLightsOnly ? 1.0f : 0.0f,
+                                          0.0f, 0.0f, 0.0f);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 
