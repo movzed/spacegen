@@ -69,15 +69,43 @@ struct Uniforms {
     float4    matBaseColor;         // .rgba material baseColorFactor (texture multiplier)
     float4    matEmissive;          // .rgb material emissiveFactor
     float4    matMR;                // .x metallicFactor, .y roughnessFactor
+    float4    fx;                   // .x displaceAmount, .y displaceScale, .z twistAmount
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
+
+// Hash-based pseudo-random scalar in [-1, 1] from a 3D position.
+static float vsHash(float3 p) {
+    float3 s = sin(p * float3(127.1, 311.7, 74.7));
+    return fract(s.x + s.y + s.z) * 2.0 - 1.0;
+}
 
 vertex VertexOut vs_main(VertexIn in [[stage_in]],
                          constant Uniforms& u [[buffer(1)]])
 {
     VertexOut out;
-    float4 world = u.model * float4(in.position, 1.0);
+
+    // ---- Mesh-effect displacement (local space) ----
+    float3 pos = in.position;
+    float displaceAmount = u.fx.x;
+    float displaceScale  = u.fx.y;
+    float twistAmount    = u.fx.z;
+
+    if (twistAmount != 0.0) {
+        // Twist around the Z axis as a function of height.
+        float angle = pos.z * twistAmount;
+        float ca = cos(angle), sa = sin(angle);
+        pos = float3(ca * pos.x - sa * pos.y,
+                     sa * pos.x + ca * pos.y,
+                     pos.z);
+    }
+    if (displaceAmount != 0.0) {
+        float n = vsHash(pos * displaceScale);
+        // Move outward along the normal, modulated by noise.
+        pos += in.normal * displaceAmount * (1.0 + n) * 0.5;
+    }
+
+    float4 world = u.model * float4(pos, 1.0);
     out.position = u.projection * u.view * world;
     out.worldPos = world.xyz;
     out.worldNormal = (u.model * float4(in.normal, 0.0)).xyz;
@@ -255,6 +283,7 @@ struct Uniforms {
     glm::vec4 matBaseColor;      // material baseColorFactor (RGBA)
     glm::vec4 matEmissive;       // .rgb emissiveFactor
     glm::vec4 matMR;             // .x metallicFactor, .y roughnessFactor
+    glm::vec4 fx;                // .x displace, .y displaceScale, .z twist
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
@@ -702,6 +731,16 @@ void MetalRenderer::renderStructureMeshes(
         u.matMR              = glm::vec4(mat.metallicFactor,
                                           mat.roughnessFactor,
                                           0.0f, 0.0f);
+        // Mesh-effect uniforms. ModulatorBank-driven contributions are
+        // added on top of the operator's static values.
+        const ModulatorBank* mods = ctx.scene ? &ctx.scene->modulators : nullptr;
+        float dispEff = layer.displaceAmount;
+        float twistEff = layer.twistAmount;
+        if (mods) {
+            dispEff  += mods->eval(layer.displaceModSlot, t) * layer.displaceModDepth;
+            twistEff += mods->eval(layer.twistModSlot,    t) * layer.twistModDepth;
+        }
+        u.fx = glm::vec4(dispEff, layer.displaceScale, twistEff, 0.0f);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 

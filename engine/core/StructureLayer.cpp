@@ -60,6 +60,30 @@ void StructureLayer::drawInspector() {
         ImGui::SliderFloat("Roughness##s", &roughness, 0.04f, 1.0f);
         ImGui::SliderFloat("Metallic##s",  &metallic,  0.0f,  1.0f);
     }
+    if (ImGui::CollapsingHeader("3D mesh effects",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        static const char* kModNames[] = {
+            "None", "LFO 1", "LFO 2", "LFO 3", "LFO 4",
+            "LFO 5", "LFO 6", "LFO 7", "LFO 8"
+        };
+        ImGui::TextDisabled("Displace (along normals + noise)");
+        ImGui::SliderFloat("Amount (m)##d", &displaceAmount, 0.0f, 2.0f);
+        ImGui::SliderFloat("Noise scale##d", &displaceScale, 0.1f, 10.0f);
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::Combo("##dmod", &displaceModSlot, kModNames, 9);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("D depth##dm", &displaceModDepth, 0.0f, 2.0f);
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Twist (around Z by height)");
+        ImGui::SliderFloat("Twist amount##t", &twistAmount, -2.0f, 2.0f);
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::Combo("##tmod", &twistModSlot, kModNames, 9);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::SliderFloat("T depth##tm", &twistModDepth, 0.0f, 2.0f);
+    }
     ImGui::TextDisabled("Add Ambient / Directional / Spot layers");
     ImGui::TextDisabled("from the rack to light the structure.");
 }

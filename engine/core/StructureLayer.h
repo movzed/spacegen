@@ -33,6 +33,21 @@ public:
     //                    alpha proportional to brightness. Perfect for
     //                    compositing in Resolume on top of Blender plates.
     bool      emitLightsOnly = false;
+
+    // ---- 3D mesh effects (vertex displacement) ----
+    // displaceAmount: meters of outward displacement along the vertex normal,
+    //   modulated by hash-noise. 0 = no effect. Operator can animate via
+    //   binding to a ModulatorBank LFO (slot 0 = unbound).
+    // displaceScale: spatial frequency of the noise (larger = finer detail).
+    // twistAmount: shear that rotates vertices around the Z axis as a
+    //   function of their height — gives a "tornado" / "unraveling" feel.
+    float     displaceAmount = 0.0f;
+    float     displaceScale  = 1.5f;
+    float     twistAmount    = 0.0f;
+    int       displaceModSlot   = 0;
+    float     displaceModDepth  = 1.0f;
+    int       twistModSlot      = 0;
+    float     twistModDepth     = 0.5f;
 };
 
 } // namespace spacegen
