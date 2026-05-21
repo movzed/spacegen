@@ -55,14 +55,17 @@ public:
     Workstation(const Workstation&)            = delete;
     Workstation& operator=(const Workstation&) = delete;
 
-    // Phase 1: begin ImGui frame, build dockspace if first run, allocate /
-    // resize the offscreen composition texture, and return it for the caller
-    // to render into. The texture's size matches the current central dock
-    // node's content region (in pixels, already accounting for backing scale).
-    // On the very first frame an estimate is used; subsequent frames are
-    // exact because the previous frame's composition size is cached.
-    CompositionTarget beginFrame(int swapchainW,
-                                  int swapchainH,
+    // Phase 1: begin ImGui frame, build dockspace if first run, allocate
+    // (or reuse) the offscreen composition texture at the SCENE's authored
+    // output resolution, and return it for the caller to render into.
+    //
+    // The texture's size is FIXED to the scene's camera resolution, NOT to
+    // the central dock node's size — this preserves the camera's aspect
+    // ratio regardless of how the operator resizes the panels. The
+    // Composition window then fits-inside-with-letterboxing when it
+    // displays the texture.
+    CompositionTarget beginFrame(int sceneOutputW,
+                                  int sceneOutputH,
                                   const FrameStats& stats);
 
     // Phase 2: draw panels and the composition Image, render ImGui draw data
@@ -85,11 +88,6 @@ private:
     MTL::Texture*    offscreen_        = nullptr;
     int              offscreenW_       = 0;
     int              offscreenH_       = 0;
-
-    // Cached central-node size from the previous endFrame() — used to size
-    // the offscreen at next beginFrame() so it always matches.
-    int              cachedCompW_      = 0;
-    int              cachedCompH_      = 0;
 
     bool             layoutBuilt_      = false;
     FrameStats       currentStats_;

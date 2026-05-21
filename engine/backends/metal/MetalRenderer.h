@@ -45,13 +45,11 @@ public:
 
     // ---- Per-layer render helpers (called from Layer::render) ----
     // Structure pass: PBR forward over all loaded meshes with the layer's
-    // material + light params. LoadAction=Clear (assumes called first).
-    void renderStructureMeshes(RenderContext& ctx, const StructureLayer& layer);
-
-    // Beam pass: raymarched cone scatter, additive blend.
-    // LoadAction=Load (must be called after a structure clear or another
-    // generator that primed the target).
-    void renderBeam(RenderContext& ctx, const BeamLayer& layer);
+    // material + the directional fallback light, PLUS up to 16 spot lights
+    // collected from the bus (one per enabled BeamLayer). LoadAction=Clear.
+    void renderStructureMeshes(RenderContext& ctx,
+                                const StructureLayer& layer,
+                                const std::vector<const BeamLayer*>& spots);
 
     // Public scene matrices (used by Layers when building their uniforms).
     const glm::mat4& projection()      const { return projection_; }
@@ -89,10 +87,6 @@ private:
     glm::mat4                  view_            = glm::mat4(1.0f);
     glm::vec3                  cameraWorldPos_  = glm::vec3(0.0f);
 
-    // Beam pipeline state (separate from structure pipeline).
-    MTL::RenderPipelineState*  beamPipeline_    = nullptr;
-
-    void buildBeamPipeline();
 };
 
 } // namespace spacegen

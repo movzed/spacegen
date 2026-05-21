@@ -37,7 +37,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M3-B (layer system)";
+constexpr char kWindowTitle[] = "SpaceGen — M3-B.1 (spots + aspect-locked)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);
@@ -187,7 +187,15 @@ int main(int argc, char** argv) {
     scene.bus.add<spacegen::StructureLayer>();
     {
         auto* b = scene.bus.add<spacegen::BeamLayer>();
-        b->name = "Beam 1";
+        b->name = "Spot 1";
+        // Default to projection-mapping pose: at the camera, looking at scene.
+        b->followCamera = true;
+        b->origin      = glm::vec3(scene.camera.world[3]);
+        b->direction   = -glm::vec3(scene.camera.world[2]);
+        b->intensity   = 5.0f;
+        b->range       = 100.0f;
+        b->innerDeg    = 5.0f;
+        b->outerDeg    = 9.0f;
     }
 
     // ImGui Workstation (overlays panels on top of the rendered scene).
@@ -232,10 +240,12 @@ int main(int argc, char** argv) {
             stats.frameTimeMs = smoothedFrameMs;
             stats.drawableW   = fbW;
             stats.drawableH   = fbH;
-            auto target = workstation.beginFrame(fbW, fbH, stats);
+            auto target = workstation.beginFrame(
+                scene.outputWidth, scene.outputHeight, stats);
 
             spacegen::RenderContext ctx;
             ctx.renderer       = renderer;
+            ctx.scene          = &scene;
             ctx.cmdBuf         = cb;
             ctx.colorTarget    = target.texture;
             ctx.width          = target.widthPx;
@@ -243,6 +253,8 @@ int main(int argc, char** argv) {
             ctx.projection     = renderer->projection();
             ctx.view           = renderer->view();
             ctx.cameraWorldPos = renderer->cameraWorldPos();
+            // Camera forward in world space = -Z of camera's local frame.
+            ctx.cameraForward  = -glm::vec3(scene.camera.world[2]);
             ctx.elapsedSeconds = elapsed;
             ctx.frameIndex     = frameCounter;
 

@@ -1,7 +1,13 @@
 #pragma once
-// BeamLayer — one world-space volumetric beam, raymarched, additive.
-// Instantiable N times in the Bus (the operator can add multiple beams
-// of different colors / origins via the Layer Rack UI).
+// BeamLayer — a spot light (projector-style) that illuminates the structure
+// in the structure pass. Despite the name, this is NOT a volumetric beam:
+// in projection mapping the light is the projector itself, so we don't see
+// the cone in air — we only see its illumination on the surface.
+//
+// The light data is consumed by StructureLayer::render() which queries the
+// bus for all enabled BeamLayers, packs them into the structure shader's
+// spot-light array, and renders the structure once with all spots applied.
+// Therefore BeamLayer::render() itself is a no-op.
 
 #include "Layer.h"
 
@@ -12,18 +18,22 @@ public:
     BeamLayer();
 
     LayerKind   kind()     const override { return LayerKind::Generator; }
-    const char* typeName() const override { return "VolumetricBeam"; }
-    void        render(RenderContext& ctx) override;
+    const char* typeName() const override { return "Spot Light"; }
+    void        render(RenderContext& /*ctx*/) override {}  // consumed by StructureLayer
     void        drawInspector() override;
 
-    glm::vec3 origin     = glm::vec3(0.0f, 3.0f, 4.0f);
-    glm::vec3 direction  = glm::vec3(0.0f, -0.8f, -0.6f);
-    glm::vec3 color      = glm::vec3(0.30f, 0.55f, 1.00f);
-    float     intensity  = 1.2f;
-    float     range      = 14.0f;
-    float     coneDeg    = 14.0f;
-    float     falloff    = 1.8f;
-    int       steps      = 32;
+    // Spot-light params (world space).
+    glm::vec3 origin    = glm::vec3(0.0f, -6.0f, 1.0f);     // overwritten on creation
+    glm::vec3 direction = glm::vec3(0.0f, 1.0f, 0.0f);      // overwritten on creation
+    glm::vec3 color     = glm::vec3(1.0f, 1.0f, 1.0f);
+    float     intensity = 5.0f;
+    float     range     = 100.0f;                            // meters; large -> no falloff
+    float     innerDeg  = 8.0f;                              // full-intensity half-angle
+    float     outerDeg  = 14.0f;                             // edge half-angle (soft falloff)
+
+    // Convenience: snap the spot to the scene camera. Used by the "+ Beam"
+    // button so new lights start as projector lights from the camera.
+    bool      followCamera = false;
 };
 
 } // namespace spacegen

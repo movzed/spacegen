@@ -23,7 +23,7 @@
 #include <glm/mat4x4.hpp>
 
 namespace MTL { class CommandBuffer; class Texture; }
-namespace spacegen { class MetalRenderer; }
+namespace spacegen { class MetalRenderer; struct Scene; }
 
 namespace spacegen {
 
@@ -34,6 +34,7 @@ enum class BlendMode  { Normal, Add };  // Multiply / Screen / Overlay added lat
 // Per-frame context handed to each layer's render() call.
 struct RenderContext {
     MetalRenderer*       renderer;         // for backend-specific helpers
+    Scene*               scene;            // for cross-layer queries (lights, etc.)
     MTL::CommandBuffer*  cmdBuf;
     MTL::Texture*        colorTarget;      // accumulator: read+write for effects
     int                  width;
@@ -41,6 +42,7 @@ struct RenderContext {
     glm::mat4            projection;
     glm::mat4            view;
     glm::vec3            cameraWorldPos;
+    glm::vec3            cameraForward;    // world-space camera forward
     double               elapsedSeconds;
     int                  frameIndex;
 };

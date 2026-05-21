@@ -5,8 +5,10 @@
 #include "../../core/StructureLayer.h"
 #include "../../core/BeamLayer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -14,14 +16,19 @@ namespace spacegen {
 
 namespace {
 
-// MSL shader: PBR forward — GGX specular + Lambert diffuse + Schlick Fresnel,
-// metallic-roughness workflow. Single directional light for M2-C1; M2-C2
-// generalizes to an array of mixed light types.
+// MSL shader: PBR forward — GGX + Lambert + Schlick.
+// One directional "fill" light from the StructureLayer + up to 16 spot
+// lights collected from the bus (BeamLayer instances). Spot lights are
+// the projection-mapping primary illumination (origin at camera by
+// default), and DO NOT render a visible volume in air — we only see
+// their illumination where they hit the structure surface.
+constexpr int kMaxSpots = 16;
 constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
-constant float PI = 3.14159265359;
+constant float PI         = 3.14159265359;
+constant int   MAX_SPOTS  = 16;
 
 struct VertexIn {
     float3 position [[attribute(0)]];
@@ -34,15 +41,23 @@ struct VertexOut {
     float3 worldNormal;
 };
 
+struct SpotLight {
+    float4 posIntensity;   // .xyz pos, .w intensity
+    float4 dirRange;       // .xyz dir (FROM light, normalized), .w range
+    float4 colorInner;     // .rgb color, .a innerCos
+    float4 paramsOuter;    // .x outerCos
+};
+
 struct Uniforms {
-    float4x4 projection;
-    float4x4 view;
-    float4x4 model;
-    float4   cameraWorldPos;       // .xyz used
-    float4   baseColorRoughness;   // .rgb = base color (linear),  .a = roughness
-    float4   metallicAmbient;      // .r = metallic, .g = ambient
-    float4   lightDirIntensity;    // .xyz = world direction (FROM light), .w = intensity
-    float4   lightColor;           // .rgb = linear radiance, .a unused
+    float4x4  projection;
+    float4x4  view;
+    float4x4  model;
+    float4    cameraWorldPos;
+    float4    baseColorRoughness;   // .rgb base, .a roughness
+    float4    metallicAmbient;      // .x metallic, .y ambient, .z spotCount (float)
+    float4    lightDirIntensity;    // directional fallback (.xyz dir, .w intensity)
+    float4    lightColor;
+    SpotLight spots[MAX_SPOTS];
 };
 
 vertex VertexOut vs_main(VertexIn in [[stage_in]],
@@ -52,20 +67,15 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
     float4 world = u.model * float4(in.position, 1.0);
     out.position = u.projection * u.view * world;
     out.worldPos = world.xyz;
-    // Uniform-scale-safe normal transform (assumes mostly uniform scale —
-    // good enough for M2-C1; switch to inverse-transpose if non-uniform
-    // scaled assets land).
-    float3 wn = (u.model * float4(in.normal, 0.0)).xyz;
-    out.worldNormal = wn;
+    out.worldNormal = (u.model * float4(in.normal, 0.0)).xyz;
     return out;
 }
 
-// ---- PBR helpers (metallic-roughness, GGX + Smith + Schlick) ----
-
+// ---- PBR helpers ----
 static float3 fresnelSchlick(float cosTheta, float3 F0) {
     float x = 1.0 - cosTheta;
     float x2 = x * x;
-    return F0 + (1.0 - F0) * (x2 * x2 * x); // x^5
+    return F0 + (1.0 - F0) * (x2 * x2 * x);
 }
 
 static float distributionGGX(float NdotH, float roughness) {
@@ -76,7 +86,6 @@ static float distributionGGX(float NdotH, float roughness) {
 }
 
 static float geometrySchlickGGX(float NdotV, float roughness) {
-    // Karis remap (UE4) — direct lighting variant
     float r = roughness + 1.0;
     float k = (r * r) / 8.0;
     return NdotV / max(NdotV * (1.0 - k) + k, 1e-5);
@@ -87,163 +96,113 @@ static float geometrySmith(float NdotV, float NdotL, float roughness) {
          * geometrySchlickGGX(NdotL, roughness);
 }
 
+// Evaluate one PBR light contribution at a surface point.
+static float3 pbrEvalDirect(float3 N, float3 V, float3 L,
+                            float3 radiance,
+                            float3 baseColor, float roughness, float metallic,
+                            float3 F0)
+{
+    float NdotL = max(dot(N, L), 0.0);
+    if (NdotL <= 0.0) return float3(0.0);
+    float3 H = normalize(V + L);
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+    float3 F = fresnelSchlick(VdotH, F0);
+    float  D = distributionGGX(NdotH, roughness);
+    float  G = geometrySmith(NdotV, NdotL, roughness);
+    float3 spec = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
+    float3 kd   = (1.0 - F) * (1.0 - metallic);
+    float3 diff = kd * baseColor / PI;
+    return (diff + spec) * radiance * NdotL;
+}
+
 fragment float4 fs_main(VertexOut in [[stage_in]],
                         constant Uniforms& u [[buffer(0)]])
 {
     float3 N = normalize(in.worldNormal);
     float3 V = normalize(u.cameraWorldPos.xyz - in.worldPos);
-    // Light direction in shader convention: TOWARDS the light (negate the
-    // direction the light is travelling).
-    float3 L = normalize(-u.lightDirIntensity.xyz);
-    float3 H = normalize(V + L);
-
-    float NdotL = max(dot(N, L), 0.0);
-    float NdotV = max(dot(N, V), 0.0);
-    float NdotH = max(dot(N, H), 0.0);
-    float VdotH = max(dot(V, H), 0.0);
 
     float3 baseColor = u.baseColorRoughness.rgb;
     float  roughness = max(u.baseColorRoughness.a, 0.04);
     float  metallic  = u.metallicAmbient.r;
     float  ambient   = u.metallicAmbient.g;
+    int    spotCount = int(u.metallicAmbient.b);
 
-    // F0: 4% for dielectrics, baseColor-tinted for metals.
     float3 F0 = mix(float3(0.04), baseColor, metallic);
 
-    float3 F = fresnelSchlick(VdotH, F0);
-    float  D = distributionGGX(NdotH, roughness);
-    float  G = geometrySmith(NdotV, NdotL, roughness);
+    // Directional fallback (preview / fill).
+    float3 LoDir = float3(0.0);
+    if (u.lightDirIntensity.w > 0.0) {
+        float3 L = normalize(-u.lightDirIntensity.xyz);
+        float3 radiance = u.lightColor.rgb * u.lightDirIntensity.w;
+        LoDir = pbrEvalDirect(N, V, L, radiance,
+                              baseColor, roughness, metallic, F0);
+    }
 
-    float3 spec = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
-    float3 kd = (1.0 - F) * (1.0 - metallic);
-    float3 diff = kd * baseColor / PI;
+    // Spot lights (projection-mapping primary illumination).
+    float3 LoSpots = float3(0.0);
+    int count = min(spotCount, MAX_SPOTS);
+    for (int i = 0; i < count; i++) {
+        SpotLight s = u.spots[i];
+        float3 sp = s.posIntensity.xyz;
+        float  si = s.posIntensity.w;
+        float3 sd = normalize(s.dirRange.xyz);
+        float  rg = s.dirRange.w;
+        float3 sc = s.colorInner.rgb;
+        float  ic = s.colorInner.a;
+        float  oc = s.paramsOuter.x;
 
-    float3 radiance = u.lightColor.rgb * u.lightDirIntensity.w;
-    float3 Lo       = (diff + spec) * radiance * NdotL;
+        float3 toLight = sp - in.worldPos;
+        float  dist    = length(toLight);
+        if (dist > rg) continue;
+        float3 L = toLight / max(dist, 1e-4);
 
-    float3 colorLin = ambient * baseColor + Lo;
-    // Cheap gamma encode for the BGRA8Unorm swapchain (we don't have an sRGB
-    // attachment yet). Replace with proper sRGB pipeline output later.
+        // Cone test: sd points FROM light TO scene; -L points FROM surface
+        // TO light. Their dot is high when the surface is inside the cone.
+        float spotCos = dot(-L, sd);
+        if (spotCos < oc) continue;
+        float cone = smoothstep(oc, ic, spotCos);
+
+        // Distance falloff: linear within range (projector-style, no
+        // inverse-square — operator wants predictable intensity at typical
+        // 5-20m projection distances).
+        float rangeFade = saturate(1.0 - dist / rg);
+
+        float3 radiance = sc * si * cone * rangeFade;
+        LoSpots += pbrEvalDirect(N, V, L, radiance,
+                                  baseColor, roughness, metallic, F0);
+    }
+
+    float3 colorLin = ambient * baseColor + LoDir + LoSpots;
     float3 colorOut = pow(max(colorLin, 0.0), float3(1.0 / 2.2));
-
     return float4(colorOut, 1.0);
 }
 )MSL";
 
-// CPU mirror of MSL Uniforms. Use vec4s everywhere so the std430-ish layout
-// matches Metal's 16-byte alignment without padding gymnastics.
+// CPU mirror of MSL types.
+struct GpuSpot {
+    glm::vec4 posIntensity;
+    glm::vec4 dirRange;
+    glm::vec4 colorInner;
+    glm::vec4 paramsOuter;
+};
+
 struct Uniforms {
     glm::mat4 projection;
     glm::mat4 view;
     glm::mat4 model;
     glm::vec4 cameraWorldPos;
     glm::vec4 baseColorRoughness;
-    glm::vec4 metallicAmbient;
+    glm::vec4 metallicAmbient;   // .z = spotCount as float
     glm::vec4 lightDirIntensity;
     glm::vec4 lightColor;
+    GpuSpot   spots[kMaxSpots];
 };
 
-// ---- Volumetric beam pass ----------------------------------------------
-// Fullscreen triangle (no vertex buffer; uses [[vertex_id]]). Reads NDC from
-// vertex_id, marches a ray from the camera through each pixel and integrates
-// scattering whenever it falls inside a world-space cone.
-
-constexpr const char* kVolumetricBeamMSL = R"MSL(
-#include <metal_stdlib>
-using namespace metal;
-
-struct BeamUniforms {
-    float4x4 invViewProj;       // unprojects NDC -> world
-    float4   cameraWorldPos;    // .xyz
-    float4   beamOrigin;        // .xyz
-    float4   beamDirIntensity;  // .xyz dir (normalized), .w intensity
-    float4   beamColor;         // .rgb linear
-    float4   beamParams;        // .x cone cos (inner), .y range, .z falloff, .w steps
-};
-
-struct V2F {
-    float4 position [[position]];
-    float2 ndc;
-};
-
-vertex V2F vs_beam(uint vid [[vertex_id]]) {
-    V2F out;
-    // Big triangle: (-1,-1), (3,-1), (-1,3)
-    float2 p;
-    p.x = (vid == 1) ? 3.0 : -1.0;
-    p.y = (vid == 2) ? 3.0 : -1.0;
-    out.position = float4(p, 0.0, 1.0);
-    out.ndc = p;
-    return out;
-}
-
-fragment float4 fs_beam(V2F in [[stage_in]],
-                        constant BeamUniforms& u [[buffer(0)]])
-{
-    // Reconstruct world-space ray for this pixel.
-    // Near plane: NDC z = 0 in Metal. Far plane: NDC z = 1.
-    float4 nearH = u.invViewProj * float4(in.ndc, 0.0, 1.0);
-    float4 farH  = u.invViewProj * float4(in.ndc, 1.0, 1.0);
-    float3 nearW = nearH.xyz / nearH.w;
-    float3 farW  = farH.xyz  / farH.w;
-
-    float3 rayOrigin = nearW;
-    float3 rayDir    = normalize(farW - nearW);
-
-    float3 beamPos   = u.beamOrigin.xyz;
-    float3 beamDir   = normalize(u.beamDirIntensity.xyz);
-    float  beamInt   = u.beamDirIntensity.w;
-    float3 beamCol   = u.beamColor.rgb;
-    float  coneCos   = u.beamParams.x;
-    float  beamRange = u.beamParams.y;
-    float  falloff   = u.beamParams.z;
-    int    steps     = max(int(u.beamParams.w), 4);
-
-    // March from camera near plane out to range.
-    float marchEnd = beamRange * 2.5;  // generous; falloff handles attenuation
-    float dt = marchEnd / float(steps);
-    float3 accum = float3(0.0);
-
-    for (int i = 0; i < steps; i++) {
-        float t  = (float(i) + 0.5) * dt;
-        float3 p = rayOrigin + rayDir * t;
-
-        // Position relative to beam origin
-        float3 d = p - beamPos;
-        float along = dot(d, beamDir);
-        if (along <= 0.0 || along > beamRange) continue;
-
-        float3 perp     = d - along * beamDir;
-        float perpLen   = length(perp);
-
-        // Cone radius at this depth (using tan from cone cos -> half-angle).
-        // tan = sqrt(1 - cos^2) / cos
-        float coneTan   = sqrt(max(1.0 - coneCos * coneCos, 0.0)) / max(coneCos, 1e-4);
-        float coneRad   = along * coneTan;
-        if (perpLen > coneRad) continue;
-
-        // Radial profile (falls off from center to edge)
-        float radial    = pow(saturate(1.0 - perpLen / max(coneRad, 1e-4)), falloff);
-        // Range falloff
-        float rangeFade = saturate(1.0 - along / beamRange);
-        // Soft origin start (avoid clipping right at the beam origin)
-        float originFade = smoothstep(0.0, beamRange * 0.08, along);
-
-        accum += beamCol * (radial * rangeFade * originFade) * (beamInt * dt);
-    }
-
-    return float4(accum, 1.0);
-}
-)MSL";
-
-struct BeamUniformsCpu {
-    glm::mat4 invViewProj;
-    glm::vec4 cameraWorldPos;
-    glm::vec4 beamOrigin;
-    glm::vec4 beamDirIntensity;
-    glm::vec4 beamColor;
-    glm::vec4 beamParams;  // x=coneCos, y=range, z=falloff, w=steps
-};
+// (Volumetric beam pass removed in M3-B refresh: spot lights are now
+// integrated into the structure shader so we don't render a visible cone
+// in air — only the illumination where it lands on the structure.)
 
 } // namespace
 
@@ -254,7 +213,6 @@ MetalRenderer::MetalRenderer(MTL::Device* device, MTL::PixelFormat colorFormat)
         throw std::runtime_error("MetalRenderer: device is null");
     }
     buildPipeline();
-    buildBeamPipeline();
 }
 
 MetalRenderer::~MetalRenderer() {
@@ -263,59 +221,9 @@ MetalRenderer::~MetalRenderer() {
         if (gm.normalBuffer)   gm.normalBuffer->release();
         if (gm.indexBuffer)    gm.indexBuffer->release();
     }
-    if (pipeline_)     pipeline_->release();
-    if (beamPipeline_) beamPipeline_->release();
-    if (depthState_)   depthState_->release();
+    if (pipeline_)   pipeline_->release();
+    if (depthState_) depthState_->release();
     releaseDepthTexture();
-}
-
-void MetalRenderer::buildBeamPipeline() {
-    NS::Error* err = nullptr;
-    NS::String* src = NS::String::string(kVolumetricBeamMSL,
-                                          NS::UTF8StringEncoding);
-    MTL::CompileOptions* opts = MTL::CompileOptions::alloc()->init();
-    MTL::Library* lib = device_->newLibrary(src, opts, &err);
-    opts->release();
-    if (!lib) {
-        std::string msg = "Beam MSL compile failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
-    }
-    MTL::Function* vsFn = lib->newFunction(
-        NS::String::string("vs_beam", NS::UTF8StringEncoding));
-    MTL::Function* fsFn = lib->newFunction(
-        NS::String::string("fs_beam", NS::UTF8StringEncoding));
-
-    MTL::RenderPipelineDescriptor* pd =
-        MTL::RenderPipelineDescriptor::alloc()->init();
-    pd->setVertexFunction(vsFn);
-    pd->setFragmentFunction(fsFn);
-    pd->setVertexDescriptor(nullptr); // fullscreen triangle, no vbo
-    auto* colorAtt = pd->colorAttachments()->object(0);
-    colorAtt->setPixelFormat(colorFormat_);
-    // Additive blending: dst = src + dst (color), alpha stays 1.
-    colorAtt->setBlendingEnabled(true);
-    colorAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
-    colorAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
-    colorAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOne);
-    colorAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
-    colorAtt->setSourceAlphaBlendFactor(MTL::BlendFactorZero);
-    colorAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOne);
-    // No depth attachment for the beam pass: we DON'T want depth-test or
-    // depth-write here. The pass is purely additive overlay.
-    pd->setDepthAttachmentPixelFormat(MTL::PixelFormatInvalid);
-
-    beamPipeline_ = device_->newRenderPipelineState(pd, &err);
-    pd->release();
-    vsFn->release();
-    fsFn->release();
-    lib->release();
-
-    if (!beamPipeline_) {
-        std::string msg = "Beam RenderPipelineState build failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
-    }
 }
 
 void MetalRenderer::releaseDepthTexture() {
@@ -489,8 +397,10 @@ void MetalRenderer::renderFrame(RenderContext& ctx, Bus& bus) {
     bus.render(ctx);
 }
 
-void MetalRenderer::renderStructureMeshes(RenderContext& ctx,
-                                            const StructureLayer& layer)
+void MetalRenderer::renderStructureMeshes(
+    RenderContext& ctx,
+    const StructureLayer& layer,
+    const std::vector<const BeamLayer*>& spots)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -502,7 +412,7 @@ void MetalRenderer::renderStructureMeshes(RenderContext& ctx,
     colorAttachment->setTexture(ctx.colorTarget);
     colorAttachment->setLoadAction(MTL::LoadActionClear);
     colorAttachment->setStoreAction(MTL::StoreActionStore);
-    colorAttachment->setClearColor(MTL::ClearColor(0.06, 0.08, 0.10, 1.0));
+    colorAttachment->setClearColor(MTL::ClearColor(0.04, 0.05, 0.07, 1.0));
 
     auto* depthAttachment = rpd->depthAttachment();
     depthAttachment->setTexture(depthTex_);
@@ -518,18 +428,46 @@ void MetalRenderer::renderStructureMeshes(RenderContext& ctx,
     enc->setCullMode(MTL::CullModeNone);
     enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
 
+    // Pack spot lights once for all meshes.
+    int spotCount = std::min(static_cast<int>(spots.size()), kMaxSpots);
+    GpuSpot spotsPacked[kMaxSpots]{};
+    for (int i = 0; i < spotCount; ++i) {
+        const BeamLayer* s = spots[i];
+        if (!s) continue;
+        glm::vec3 origin    = s->origin;
+        glm::vec3 dir       = glm::normalize(s->direction);
+        if (s->followCamera) {
+            origin = ctx.cameraWorldPos;
+            dir    = glm::normalize(ctx.cameraForward);
+        }
+        float innerRad = s->innerDeg * 3.14159265f / 180.0f;
+        float outerRad = s->outerDeg * 3.14159265f / 180.0f;
+        if (outerRad < innerRad) outerRad = innerRad;
+        float innerCos = std::cos(innerRad);
+        float outerCos = std::cos(outerRad);
+
+        spotsPacked[i].posIntensity = glm::vec4(origin,
+                                                  s->intensity * s->opacity);
+        spotsPacked[i].dirRange     = glm::vec4(dir, s->range);
+        spotsPacked[i].colorInner   = glm::vec4(s->color, innerCos);
+        spotsPacked[i].paramsOuter  = glm::vec4(outerCos, 0.0f, 0.0f, 0.0f);
+    }
+
     for (const auto& gm : gpuMeshes_) {
-        Uniforms u;
+        Uniforms u{};
         u.projection         = ctx.projection;
         u.view               = ctx.view;
         u.model              = gm.transform;
         u.cameraWorldPos     = glm::vec4(ctx.cameraWorldPos, 1.0f);
         u.baseColorRoughness = glm::vec4(layer.baseColor, layer.roughness);
-        u.metallicAmbient    = glm::vec4(layer.metallic, layer.ambient,
-                                          0.0f, 0.0f);
+        u.metallicAmbient    = glm::vec4(layer.metallic,
+                                          layer.ambient,
+                                          static_cast<float>(spotCount),
+                                          0.0f);
         u.lightDirIntensity  = glm::vec4(glm::normalize(layer.lightDirection),
                                           layer.lightIntensity);
         u.lightColor         = glm::vec4(layer.lightColor, 0.0f);
+        std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 
         enc->setVertexBuffer(gm.positionBuffer, 0, 0);
         enc->setVertexBuffer(gm.normalBuffer,   0, 2);
@@ -544,41 +482,6 @@ void MetalRenderer::renderStructureMeshes(RenderContext& ctx,
             static_cast<NS::UInteger>(0));
     }
 
-    enc->endEncoding();
-}
-
-void MetalRenderer::renderBeam(RenderContext& ctx, const BeamLayer& layer) {
-    if (!ctx.cmdBuf || !ctx.colorTarget || !beamPipeline_) return;
-
-    MTL::RenderPassDescriptor* rpd =
-        MTL::RenderPassDescriptor::renderPassDescriptor();
-    auto* col = rpd->colorAttachments()->object(0);
-    col->setTexture(ctx.colorTarget);
-    col->setLoadAction(MTL::LoadActionLoad);
-    col->setStoreAction(MTL::StoreActionStore);
-
-    MTL::RenderCommandEncoder* enc = ctx.cmdBuf->renderCommandEncoder(rpd);
-    if (!enc) return;
-
-    enc->setRenderPipelineState(beamPipeline_);
-
-    BeamUniformsCpu bu;
-    bu.invViewProj      = glm::inverse(ctx.projection * ctx.view);
-    bu.cameraWorldPos   = glm::vec4(ctx.cameraWorldPos, 1.0f);
-    bu.beamOrigin       = glm::vec4(layer.origin, 0.0f);
-    bu.beamDirIntensity = glm::vec4(glm::normalize(layer.direction),
-                                     layer.intensity * layer.opacity);
-    bu.beamColor        = glm::vec4(layer.color, 0.0f);
-    float coneRad       = layer.coneDeg * 3.14159265f / 180.0f;
-    float coneCos       = std::cos(coneRad);
-    bu.beamParams       = glm::vec4(coneCos, layer.range, layer.falloff,
-                                     static_cast<float>(layer.steps));
-
-    enc->setVertexBytes(&bu, sizeof(bu), 0);
-    enc->setFragmentBytes(&bu, sizeof(bu), 0);
-    enc->drawPrimitives(MTL::PrimitiveTypeTriangle,
-                         static_cast<NS::UInteger>(0),
-                         static_cast<NS::UInteger>(3));
     enc->endEncoding();
 }
 

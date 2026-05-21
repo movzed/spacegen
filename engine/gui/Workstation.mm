@@ -150,11 +150,14 @@ void drawLayerRack(spacegen::Scene& scene,
     if (!ImGui::Begin(kLayersWindowName, open)) { ImGui::End(); return; }
 
     // Top toolbar: add buttons.
-    if (ImGui::Button("+ Beam")) {
+    if (ImGui::Button("+ Spot")) {
         auto* b = scene.bus.add<spacegen::BeamLayer>();
         char buf[64];
-        std::snprintf(buf, sizeof(buf), "Beam %zu", scene.bus.layers.size());
-        b->name = buf;
+        std::snprintf(buf, sizeof(buf), "Spot %zu", scene.bus.layers.size());
+        b->name        = buf;
+        b->followCamera = true;
+        b->origin       = glm::vec3(scene.camera.world[3]);
+        b->direction    = -glm::vec3(scene.camera.world[2]);
         selectedLayerId = b->id;
     }
     ImGui::SameLine();
@@ -318,30 +321,16 @@ void Workstation::ensureOffscreen(int widthPx, int heightPx) {
     offscreenH_ = heightPx;
 }
 
-CompositionTarget Workstation::beginFrame(int swapchainW,
-                                            int swapchainH,
+CompositionTarget Workstation::beginFrame(int sceneOutputW,
+                                            int sceneOutputH,
                                             const FrameStats& stats)
 {
     currentStats_ = stats;
 
-    // First-frame size estimate: 50% of viewport at backing scale. After
-    // the first frame this is overwritten with the actual measured size.
-    if (cachedCompW_ == 0 || cachedCompH_ == 0) {
-        // ImGui hasn't started a frame yet, so io.DisplayFramebufferScale
-        // may be stale. Use swapchain / NOT-yet-known logical-window ratio:
-        // assume 2x retina if drawableW > 0 and reasonable. Safe default = 2.
-        float sx = 2.0f;
-        float sy = 2.0f;
-        if (swapchainW > 0 && swapchainH > 0) {
-            cachedCompW_ = static_cast<int>(swapchainW * 0.50f);
-            cachedCompH_ = static_cast<int>(swapchainH * 0.95f);
-        } else {
-            cachedCompW_ = 800;
-            cachedCompH_ = 600;
-        }
-        (void)sx; (void)sy;
-    }
-    ensureOffscreen(cachedCompW_, cachedCompH_);
+    // Offscreen size is FIXED to the scene's authored camera resolution.
+    // It does NOT track the central dock node size — that's what would
+    // deform the image when the operator resizes panels.
+    ensureOffscreen(sceneOutputW, sceneOutputH);
 
     // RPD passed to ImGui_ImplMetal_NewFrame must have a real texture so the
     // backend can read pixelFormat + sampleCount for pipeline state setup.
@@ -409,20 +398,33 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
                                 | ImGuiWindowFlags_NoTitleBar;
     if (ImGui::Begin(kCompositionWindowName, nullptr, compFlags)) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
-        if (avail.x > 0.0f && avail.y > 0.0f) {
-            ImGuiIO& io = ImGui::GetIO();
-            float sx = io.DisplayFramebufferScale.x > 0 ? io.DisplayFramebufferScale.x : 1.0f;
-            float sy = io.DisplayFramebufferScale.y > 0 ? io.DisplayFramebufferScale.y : 1.0f;
-            // Cache for NEXT frame's offscreen allocation.
-            cachedCompW_ = static_cast<int>(avail.x * sx);
-            cachedCompH_ = static_cast<int>(avail.y * sy);
+        if (avail.x > 0.0f && avail.y > 0.0f
+            && offscreen_ && offscreenW_ > 0 && offscreenH_ > 0)
+        {
+            // Compute fit-inside-with-aspect (letterbox / pillarbox). The
+            // image is always rendered at the camera's authored resolution
+            // (offscreen) and displayed scaled-to-fit without distortion.
+            const float texAspect   = float(offscreenW_) / float(offscreenH_);
+            const float availAspect = avail.x / avail.y;
+            float drawW, drawH;
+            if (availAspect > texAspect) {
+                // wider available space than image -> fit by height (pillarbox)
+                drawH = avail.y;
+                drawW = drawH * texAspect;
+            } else {
+                // taller available space -> fit by width (letterbox)
+                drawW = avail.x;
+                drawH = drawW / texAspect;
+            }
+            // Center within the available region.
+            ImVec2 cursor = ImGui::GetCursorPos();
+            cursor.x += (avail.x - drawW) * 0.5f;
+            cursor.y += (avail.y - drawH) * 0.5f;
+            ImGui::SetCursorPos(cursor);
 
-            // Display the texture we rendered into during beginFrame's caller.
-            // ImTextureID on Metal backend is reinterpreted as id<MTLTexture>;
-            // Metal-cpp pointers are bit-compatible.
             ImTextureID texId =
                 static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(offscreen_));
-            ImGui::Image(texId, avail);
+            ImGui::Image(texId, ImVec2(drawW, drawH));
         }
     }
     ImGui::End();

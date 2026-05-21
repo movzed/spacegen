@@ -1,5 +1,7 @@
 #include "StructureLayer.h"
 
+#include "BeamLayer.h"
+#include "Scene.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include "imgui.h"
@@ -14,7 +16,21 @@ StructureLayer::StructureLayer() {
 
 void StructureLayer::render(RenderContext& ctx) {
     if (!ctx.renderer) return;
-    ctx.renderer->renderStructureMeshes(ctx, *this);
+    // Collect all enabled spot lights (BeamLayer instances) from the bus.
+    // The structure shader integrates them in one pass — we don't render
+    // visible beams in air for projection mapping.
+    std::vector<const BeamLayer*> spots;
+    if (ctx.scene) {
+        for (auto& l : ctx.scene->bus.layers) {
+            if (!l) continue;
+            if (l->state != LayerState::Enabled) continue;
+            if (l->opacity <= 0.0f) continue;
+            if (auto* b = dynamic_cast<const BeamLayer*>(l.get())) {
+                spots.push_back(b);
+            }
+        }
+    }
+    ctx.renderer->renderStructureMeshes(ctx, *this, spots);
 }
 
 void StructureLayer::drawInspector() {
