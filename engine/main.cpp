@@ -33,7 +33,7 @@
 
 namespace {
 
-constexpr char kWindowTitle[] = "SpaceGen — M2-B";
+constexpr char kWindowTitle[] = "SpaceGen — M2-C1 (PBR + 1 light)";
 
 void glfwErrorCallback(int code, const char* desc) {
     std::fprintf(stderr, "[GLFW error %d] %s\n", code, desc);

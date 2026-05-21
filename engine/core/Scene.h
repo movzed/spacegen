@@ -26,16 +26,40 @@ struct CameraData {
 };
 
 // CPU-side mesh data ready for upload to a backend (Metal/DX12).
-// Positions are in mesh-local space; `transform` is mesh-local-to-world.
-// glTF M2-B: positions + indices only. Normals + materials added in M2-C.
+// Positions + normals are in mesh-local space; `transform` is mesh-local-to-world.
+// M2-C: positions + normals + indices. PBR materials still pending — handled
+// from glTF MetallicRoughness in a later step.
 struct MeshData {
     std::string             name;
     std::vector<glm::vec3>  positions;
+    std::vector<glm::vec3>  normals;     // empty if glTF primitive had no NORMAL attribute
     std::vector<uint32_t>   indices;
     glm::mat4               transform = glm::mat4(1.0f);
 };
 
-// A loaded export from the Blender add-on. Owns CameraData + MeshData(s).
+// A realtime light, owned by SpaceGen (NOT exported from Blender — Blender
+// lights are ignored per the data-contract-blender-engine skill).
+struct Light {
+    enum class Type { Directional, Point, Spot };
+    Type        type      = Type::Directional;
+    std::string name;
+    // World-space direction (FROM the light TOWARDS the scene). Used by
+    // Directional and Spot. Should be normalized.
+    glm::vec3   direction = glm::vec3(0.5f, -0.7f, -0.5f);
+    // World-space position. Used by Point and Spot.
+    glm::vec3   position  = glm::vec3(0.0f);
+    // Radiance multiplier (in arbitrary linear units; tune in UI).
+    glm::vec3   color     = glm::vec3(1.0f);
+    float       intensity = 1.0f;
+    // Spot cone (cosine of inner/outer half-angles).
+    float       coneInnerCos = 0.97f;
+    float       coneOuterCos = 0.95f;
+    // Point/Spot range for inverse-square attenuation softening.
+    float       range        = 100.0f;
+};
+
+// A loaded export from the Blender add-on. Owns CameraData + MeshData(s) +
+// optional Lights (added at runtime, NOT exported from Blender).
 struct Scene {
     int                     outputWidth   = 1920;
     int                     outputHeight  = 1080;
@@ -44,6 +68,7 @@ struct Scene {
     std::string             folderPath;
     CameraData              camera;
     std::vector<MeshData>   meshes;
+    std::vector<Light>      lights;
 
     // Loads `scene.json` from `folderPath`, then optionally `structure.glb`
     // referenced by the manifest. Throws std::runtime_error on hard failure

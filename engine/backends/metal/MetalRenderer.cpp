@@ -10,26 +10,35 @@ namespace spacegen {
 
 namespace {
 
-// MSL shader source — embedded as a raw string for M2-B simplicity.
-// We'll switch to a file-loaded + hot-reload pipeline once we have >1 shader.
-constexpr const char* kStructureFlatMSL = R"MSL(
+// MSL shader: PBR forward — GGX specular + Lambert diffuse + Schlick Fresnel,
+// metallic-roughness workflow. Single directional light for M2-C1; M2-C2
+// generalizes to an array of mixed light types.
+constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
+constant float PI = 3.14159265359;
+
 struct VertexIn {
     float3 position [[attribute(0)]];
+    float3 normal   [[attribute(1)]];
 };
 
 struct VertexOut {
     float4 position [[position]];
     float3 worldPos;
+    float3 worldNormal;
 };
 
 struct Uniforms {
     float4x4 projection;
     float4x4 view;
     float4x4 model;
-    float4   tintColor;
+    float4   cameraWorldPos;       // .xyz used
+    float4   baseColorRoughness;   // .rgb = base color (linear),  .a = roughness
+    float4   metallicAmbient;      // .r = metallic, .g = ambient
+    float4   lightDirIntensity;    // .xyz = world direction (FROM light), .w = intensity
+    float4   lightColor;           // .rgb = linear radiance, .a unused
 };
 
 vertex VertexOut vs_main(VertexIn in [[stage_in]],
@@ -39,22 +48,95 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
     float4 world = u.model * float4(in.position, 1.0);
     out.position = u.projection * u.view * world;
     out.worldPos = world.xyz;
+    // Uniform-scale-safe normal transform (assumes mostly uniform scale —
+    // good enough for M2-C1; switch to inverse-transpose if non-uniform
+    // scaled assets land).
+    float3 wn = (u.model * float4(in.normal, 0.0)).xyz;
+    out.worldNormal = wn;
     return out;
+}
+
+// ---- PBR helpers (metallic-roughness, GGX + Smith + Schlick) ----
+
+static float3 fresnelSchlick(float cosTheta, float3 F0) {
+    float x = 1.0 - cosTheta;
+    float x2 = x * x;
+    return F0 + (1.0 - F0) * (x2 * x2 * x); // x^5
+}
+
+static float distributionGGX(float NdotH, float roughness) {
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-5);
+}
+
+static float geometrySchlickGGX(float NdotV, float roughness) {
+    // Karis remap (UE4) — direct lighting variant
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return NdotV / max(NdotV * (1.0 - k) + k, 1e-5);
+}
+
+static float geometrySmith(float NdotV, float NdotL, float roughness) {
+    return geometrySchlickGGX(NdotV, roughness)
+         * geometrySchlickGGX(NdotL, roughness);
 }
 
 fragment float4 fs_main(VertexOut in [[stage_in]],
                         constant Uniforms& u [[buffer(0)]])
 {
-    return u.tintColor;
+    float3 N = normalize(in.worldNormal);
+    float3 V = normalize(u.cameraWorldPos.xyz - in.worldPos);
+    // Light direction in shader convention: TOWARDS the light (negate the
+    // direction the light is travelling).
+    float3 L = normalize(-u.lightDirIntensity.xyz);
+    float3 H = normalize(V + L);
+
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    float3 baseColor = u.baseColorRoughness.rgb;
+    float  roughness = max(u.baseColorRoughness.a, 0.04);
+    float  metallic  = u.metallicAmbient.r;
+    float  ambient   = u.metallicAmbient.g;
+
+    // F0: 4% for dielectrics, baseColor-tinted for metals.
+    float3 F0 = mix(float3(0.04), baseColor, metallic);
+
+    float3 F = fresnelSchlick(VdotH, F0);
+    float  D = distributionGGX(NdotH, roughness);
+    float  G = geometrySmith(NdotV, NdotL, roughness);
+
+    float3 spec = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
+    float3 kd = (1.0 - F) * (1.0 - metallic);
+    float3 diff = kd * baseColor / PI;
+
+    float3 radiance = u.lightColor.rgb * u.lightDirIntensity.w;
+    float3 Lo       = (diff + spec) * radiance * NdotL;
+
+    float3 colorLin = ambient * baseColor + Lo;
+    // Cheap gamma encode for the BGRA8Unorm swapchain (we don't have an sRGB
+    // attachment yet). Replace with proper sRGB pipeline output later.
+    float3 colorOut = pow(max(colorLin, 0.0), float3(1.0 / 2.2));
+
+    return float4(colorOut, 1.0);
 }
 )MSL";
 
-// Uniforms layout matches MSL `struct Uniforms`. 64*3 + 16 = 208 bytes.
+// CPU mirror of MSL Uniforms. Use vec4s everywhere so the std430-ish layout
+// matches Metal's 16-byte alignment without padding gymnastics.
 struct Uniforms {
     glm::mat4 projection;
     glm::mat4 view;
     glm::mat4 model;
-    glm::vec4 tintColor;
+    glm::vec4 cameraWorldPos;
+    glm::vec4 baseColorRoughness;
+    glm::vec4 metallicAmbient;
+    glm::vec4 lightDirIntensity;
+    glm::vec4 lightColor;
 };
 
 } // namespace
@@ -70,8 +152,9 @@ MetalRenderer::MetalRenderer(MTL::Device* device, MTL::PixelFormat colorFormat)
 
 MetalRenderer::~MetalRenderer() {
     for (auto& gm : gpuMeshes_) {
-        if (gm.vertexBuffer) gm.vertexBuffer->release();
-        if (gm.indexBuffer)  gm.indexBuffer->release();
+        if (gm.positionBuffer) gm.positionBuffer->release();
+        if (gm.normalBuffer)   gm.normalBuffer->release();
+        if (gm.indexBuffer)    gm.indexBuffer->release();
     }
     if (pipeline_)   pipeline_->release();
     if (depthState_) depthState_->release();
@@ -89,7 +172,7 @@ void MetalRenderer::releaseDepthTexture() {
 void MetalRenderer::buildPipeline() {
     NS::Error* err = nullptr;
 
-    NS::String* src = NS::String::string(kStructureFlatMSL,
+    NS::String* src = NS::String::string(kStructurePbrMSL,
                                           NS::UTF8StringEncoding);
     MTL::CompileOptions* opts = MTL::CompileOptions::alloc()->init();
     MTL::Library* lib = device_->newLibrary(src, opts, &err);
@@ -111,15 +194,24 @@ void MetalRenderer::buildPipeline() {
         throw std::runtime_error("MSL: vs_main or fs_main not found");
     }
 
-    // Vertex descriptor: position at attribute 0, buffer 0.
+    // Vertex descriptor:
+    //   attribute(0) = position (float3) in buffer(0)
+    //   attribute(1) = normal   (float3) in buffer(2)   <- buffer(1) is uniforms
     MTL::VertexDescriptor* vd = MTL::VertexDescriptor::alloc()->init();
     auto* attr0 = vd->attributes()->object(0);
     attr0->setFormat(MTL::VertexFormatFloat3);
     attr0->setOffset(0);
     attr0->setBufferIndex(0);
+    auto* attr1 = vd->attributes()->object(1);
+    attr1->setFormat(MTL::VertexFormatFloat3);
+    attr1->setOffset(0);
+    attr1->setBufferIndex(2);
     auto* layout0 = vd->layouts()->object(0);
     layout0->setStride(sizeof(float) * 3);
     layout0->setStepFunction(MTL::VertexStepFunctionPerVertex);
+    auto* layout2 = vd->layouts()->object(2);
+    layout2->setStride(sizeof(float) * 3);
+    layout2->setStepFunction(MTL::VertexStepFunctionPerVertex);
 
     MTL::RenderPipelineDescriptor* pd =
         MTL::RenderPipelineDescriptor::alloc()->init();
@@ -154,14 +246,17 @@ void MetalRenderer::buildPipeline() {
 void MetalRenderer::loadScene(const Scene& scene) {
     // Drop existing GPU meshes.
     for (auto& gm : gpuMeshes_) {
-        if (gm.vertexBuffer) gm.vertexBuffer->release();
-        if (gm.indexBuffer)  gm.indexBuffer->release();
+        if (gm.positionBuffer) gm.positionBuffer->release();
+        if (gm.normalBuffer)   gm.normalBuffer->release();
+        if (gm.indexBuffer)    gm.indexBuffer->release();
     }
     gpuMeshes_.clear();
     gpuMeshes_.reserve(scene.meshes.size());
 
-    projection_ = scene.camera.projection;
-    view_       = scene.camera.view;
+    projection_     = scene.camera.projection;
+    view_           = scene.camera.view;
+    // Camera world position = 4th column of the camera-to-world matrix.
+    cameraWorldPos_ = glm::vec3(scene.camera.world[3]);
 
     for (const auto& m : scene.meshes) {
         if (m.positions.empty() || m.indices.empty()) {
@@ -177,18 +272,39 @@ void MetalRenderer::loadScene(const Scene& scene) {
         gm.indexCount = static_cast<uint32_t>(m.indices.size());
 
         const size_t vbBytes = m.positions.size() * sizeof(glm::vec3);
-        gm.vertexBuffer = device_->newBuffer(
+        gm.positionBuffer = device_->newBuffer(
             m.positions.data(), vbBytes, MTL::ResourceStorageModeShared);
+
+        if (!m.normals.empty()) {
+            const size_t nbBytes = m.normals.size() * sizeof(glm::vec3);
+            gm.normalBuffer = device_->newBuffer(
+                m.normals.data(), nbBytes, MTL::ResourceStorageModeShared);
+        } else {
+            // Fallback: synthesize a +Z normal buffer so the pipeline still
+            // has something to read at buffer(2). Visually wrong but won't
+            // crash.
+            std::vector<glm::vec3> fakeNormals(m.positions.size(),
+                                                glm::vec3(0, 0, 1));
+            gm.normalBuffer = device_->newBuffer(
+                fakeNormals.data(), fakeNormals.size() * sizeof(glm::vec3),
+                MTL::ResourceStorageModeShared);
+        }
 
         const size_t ibBytes = m.indices.size() * sizeof(uint32_t);
         gm.indexBuffer = device_->newBuffer(
             m.indices.data(), ibBytes, MTL::ResourceStorageModeShared);
 
-        std::printf("[MetalRenderer] Uploaded mesh '%s': %zu verts (%.1f MB), "
-                     "%u indices (%.1f MB)\n",
+        const double mbPos = vbBytes / (1024.0 * 1024.0);
+        const double mbNrm = (m.normals.empty()
+            ? m.positions.size() * sizeof(glm::vec3)
+            : m.normals.size() * sizeof(glm::vec3)) / (1024.0 * 1024.0);
+        const double mbIdx = ibBytes / (1024.0 * 1024.0);
+        std::printf("[MetalRenderer] Uploaded mesh '%s': %zu verts "
+                     "(pos %.1f MB + nrm %.1f MB), %u indices (%.1f MB)%s\n",
                      m.name.c_str(),
-                     m.positions.size(), vbBytes / (1024.0 * 1024.0),
-                     gm.indexCount, ibBytes / (1024.0 * 1024.0));
+                     m.positions.size(), mbPos, mbNrm,
+                     gm.indexCount, mbIdx,
+                     m.normals.empty() ? " [synthesized normals]" : "");
 
         gpuMeshes_.push_back(gm);
     }
@@ -242,12 +358,18 @@ void MetalRenderer::renderFrame(MTL::CommandBuffer* cmdBuf,
 
     for (const auto& gm : gpuMeshes_) {
         Uniforms u;
-        u.projection = projection_;
-        u.view       = view_;
-        u.model      = gm.transform;
-        u.tintColor  = glm::vec4(0.90f, 0.30f, 0.30f, 1.0f); // tomato red
+        u.projection         = projection_;
+        u.view               = view_;
+        u.model              = gm.transform;
+        u.cameraWorldPos     = glm::vec4(cameraWorldPos_, 1.0f);
+        u.baseColorRoughness = glm::vec4(baseColor, roughness);
+        u.metallicAmbient    = glm::vec4(metallic, ambient, 0.0f, 0.0f);
+        u.lightDirIntensity  = glm::vec4(glm::normalize(lightDirection),
+                                          lightIntensity);
+        u.lightColor         = glm::vec4(lightColor, 0.0f);
 
-        enc->setVertexBuffer(gm.vertexBuffer, 0, 0);
+        enc->setVertexBuffer(gm.positionBuffer, 0, 0);
+        enc->setVertexBuffer(gm.normalBuffer,   0, 2);
         enc->setVertexBytes(&u, sizeof(u), 1);
         enc->setFragmentBytes(&u, sizeof(u), 0);
 

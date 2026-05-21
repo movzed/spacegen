@@ -12,11 +12,12 @@ namespace spacegen {
 
 struct Scene;
 struct MeshData;
+struct Light;
 
-// M2-B: minimal Metal backend.
-// Builds a flat-color pipeline, uploads scene meshes to GPU buffers, and
-// renders them through the scene's camera matrices into a swapchain-provided
-// color attachment with a managed depth attachment.
+// M2-C1: PBR forward rendering with realtime lights.
+// Builds a PBR pipeline (GGX + Lambert + Schlick), uploads scene meshes
+// (positions + normals + indices) and renders them through the scene's
+// camera with up to one Directional light (multi-light is M2-C2).
 class MetalRenderer {
 public:
     MetalRenderer(MTL::Device* device, MTL::PixelFormat colorFormat);
@@ -50,10 +51,11 @@ private:
     void releaseDepthTexture();
 
     struct GpuMesh {
-        MTL::Buffer* vertexBuffer = nullptr;  // float3 positions
-        MTL::Buffer* indexBuffer  = nullptr;  // uint32 indices
-        uint32_t     indexCount   = 0;
-        glm::mat4    transform    = glm::mat4(1.0f);
+        MTL::Buffer* positionBuffer = nullptr;   // float3 positions
+        MTL::Buffer* normalBuffer   = nullptr;   // float3 normals (may be null)
+        MTL::Buffer* indexBuffer    = nullptr;   // uint32 indices
+        uint32_t     indexCount     = 0;
+        glm::mat4    transform      = glm::mat4(1.0f);
         std::string  name;
     };
 
@@ -67,8 +69,21 @@ private:
     int                        depthH_       = 0;
 
     std::vector<GpuMesh>       gpuMeshes_;
-    glm::mat4                  projection_   = glm::mat4(1.0f);
-    glm::mat4                  view_         = glm::mat4(1.0f);
+    glm::mat4                  projection_      = glm::mat4(1.0f);
+    glm::mat4                  view_            = glm::mat4(1.0f);
+    glm::vec3                  cameraWorldPos_  = glm::vec3(0.0f);
+
+    // M2-C1: single hardcoded light, exposed publicly so main.cpp can poke
+    // direction/color/intensity per frame. M2-C2 will move this through the
+    // parameter graph + ImGui binding.
+public:
+    glm::vec3                  lightDirection   = glm::vec3(0.4f, -0.6f, -0.6f);
+    glm::vec3                  lightColor       = glm::vec3(1.0f, 0.96f, 0.92f);
+    float                      lightIntensity   = 1.6f;
+    glm::vec3                  baseColor        = glm::vec3(0.72f);
+    float                      roughness        = 0.55f;
+    float                      metallic         = 0.0f;
+    float                      ambient          = 0.04f;
 };
 
 } // namespace spacegen

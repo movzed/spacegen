@@ -112,12 +112,8 @@ void processPrimitive(const tinygltf::Model& model,
     MeshData out;
     out.name = meshName.empty() ? std::string("mesh") : meshName;
     out.transform = worldMatrix;
-    std::printf("[Scene]   Processing '%s': %zu verts...\n",
-                 out.name.c_str(), posAccessor.count);
-    std::fflush(stdout);
     out.positions.resize(posAccessor.count);
     if (stride == sizeof(float) * 3) {
-        // Tightly packed: single memcpy
         std::memcpy(out.positions.data(), posBytes,
                     sizeof(float) * 3 * posAccessor.count);
     } else {
@@ -125,6 +121,33 @@ void processPrimitive(const tinygltf::Model& model,
             const float* p = reinterpret_cast<const float*>(posBytes + i * stride);
             out.positions[i] = glm::vec3(p[0], p[1], p[2]);
         }
+    }
+
+    // NORMAL attribute (optional but expected — we requested export_normals=True)
+    auto nrmIt = prim.attributes.find("NORMAL");
+    if (nrmIt != prim.attributes.end()) {
+        const auto& nrmAccessor = model.accessors[nrmIt->second];
+        const auto& nrmView     = model.bufferViews[nrmAccessor.bufferView];
+        const auto& nrmBuffer   = model.buffers[nrmView.buffer];
+        const auto* nrmBytes = nrmBuffer.data.data()
+            + nrmView.byteOffset + nrmAccessor.byteOffset;
+        const size_t nrmStride = nrmView.byteStride > 0
+            ? nrmView.byteStride
+            : sizeof(float) * 3;
+        out.normals.resize(nrmAccessor.count);
+        if (nrmStride == sizeof(float) * 3
+            && nrmAccessor.count == posAccessor.count) {
+            std::memcpy(out.normals.data(), nrmBytes,
+                        sizeof(float) * 3 * nrmAccessor.count);
+        } else {
+            for (size_t i = 0; i < nrmAccessor.count; ++i) {
+                const float* p = reinterpret_cast<const float*>(nrmBytes + i * nrmStride);
+                out.normals[i] = glm::vec3(p[0], p[1], p[2]);
+            }
+        }
+    } else {
+        std::cerr << "[Scene] Mesh '" << out.name
+                  << "' has no NORMAL attribute. Lighting will be undefined.\n";
     }
 
     if (prim.indices >= 0) {
