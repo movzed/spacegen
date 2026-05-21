@@ -128,11 +128,35 @@ void SyphonInputLayer::drawInspector() {
     if (!impl_) return;
     SyphonInputImpl* impl = (__bridge SyphonInputImpl*)impl_;
 
-    ImGui::TextDisabled("Live video → projected on the structure UVs");
+    ImGui::TextDisabled("Live video → mapped onto the structure");
     ImGui::SliderFloat("Mix##sy",   &mix, 0.0f, 1.0f);
     ImGui::ColorEdit3 ("Tint##sy",  &tint[0],
                        ImGuiColorEditFlags_PickerHueWheel
                        | ImGuiColorEditFlags_Float);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Mapping mode");
+    static const char* kModeNames[] = {
+        "Projector (from camera POV)",
+        "Triplanar (world-space tile)",
+        "UV (mesh unwrap)",
+    };
+    int modeIdx = static_cast<int>(projMode);
+    if (ImGui::Combo("##symode", &modeIdx, kModeNames, 3)) {
+        projMode = static_cast<ProjMode>(modeIdx);
+    }
+    if (projMode == ProjMode::Projector) {
+        ImGui::TextDisabled("Projects from the scene camera, like the");
+        ImGui::TextDisabled("real projector. Independent of mesh UVs.");
+    } else if (projMode == ProjMode::Triplanar) {
+        ImGui::SliderFloat("Tile / meter##sytp", &triplanarScale,
+                            0.01f, 4.0f, "%.3f");
+        ImGui::TextDisabled("Tiles in world space, blended by normal.");
+    } else {
+        ImGui::TextDisabled("Uses mesh UV0. Needs a complete unwrap");
+        ImGui::TextDisabled("or non-unwrapped faces show solid color.");
+    }
+    ImGui::Checkbox("Flip Y##syflip", &flipY);
 
     ImGui::Separator();
     NSArray* servers = [impl listServers];

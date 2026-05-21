@@ -43,6 +43,7 @@ struct VertexOut {
     float3 worldPos;
     float3 worldNormal;
     float2 uv;
+    float4 clipPos;   // pre-perspective-divide, used for Syphon Projector mode
 };
 
 struct SpotLight {
@@ -71,6 +72,7 @@ struct Uniforms {
     float4    matMR;                // .x metallicFactor, .y roughnessFactor
     float4    fx;                   // .x displaceAmount, .y displaceScale, .z twistAmount
     float4    syphonMixTint;        // .x mix (0..1), .yzw tint RGB
+    float4    syphonParams;         // .x mode (0 proj, 1 triplanar, 2 uv), .y triplanarScale, .z flipY
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
@@ -108,6 +110,7 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
 
     float4 world = u.model * float4(pos, 1.0);
     out.position = u.projection * u.view * world;
+    out.clipPos  = out.position;
     out.worldPos = world.xyz;
     out.worldNormal = (u.model * float4(in.normal, 0.0)).xyz;
     out.uv = in.uv;
@@ -180,7 +183,57 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     // Live Syphon texture: mixed into the base color according to mix slider.
     // Syphon publishes sRGB textures by convention; the texture binding is
     // configured to read as sRGB so the sample is already linear here.
-    float3 syphonSample = syphonMap.sample(smp, in.uv).rgb * u.syphonMixTint.yzw;
+    //
+    // Mapping mode selects how mesh→video coordinates are computed:
+    //   0 Projector  — clip-space NDC of the rendering camera (real-world
+    //                  projector behavior; mask outside the [0,1] frustum).
+    //                  Independent of mesh UVs — works on meshes without
+    //                  a Blender unwrap.
+    //   1 Triplanar — world-pos projected onto XY/XZ/YZ planes blended by
+    //                  surface normal. Tiles the video in world space.
+    //                  Independent of mesh UVs.
+    //   2 UV        — mesh UV0. Only correct if the mesh has a complete
+    //                  unwrap; non-unwrapped faces show solid color.
+    int    syphonModeI = int(u.syphonParams.x + 0.5);
+    float  tplScale    = u.syphonParams.y;
+    bool   syphonFlipY = u.syphonParams.z > 0.5;
+
+    float3 syphonSample = float3(0.0);
+    if (syphonModeI == 1) {
+        // ---- Triplanar (world position) ----
+        float3 absN = abs(N);
+        float  s    = max(absN.x + absN.y + absN.z, 1e-4);
+        float3 bw   = absN / s;
+        float2 uvX  = in.worldPos.zy * tplScale;
+        float2 uvY  = in.worldPos.xz * tplScale;
+        float2 uvZ  = in.worldPos.xy * tplScale;
+        if (syphonFlipY) { uvX.y = -uvX.y; uvY.y = -uvY.y; uvZ.y = -uvZ.y; }
+        syphonSample = syphonMap.sample(smp, uvX).rgb * bw.x
+                     + syphonMap.sample(smp, uvY).rgb * bw.y
+                     + syphonMap.sample(smp, uvZ).rgb * bw.z;
+    } else if (syphonModeI == 2) {
+        // ---- Mesh UV0 (legacy) ----
+        float2 uv = in.uv;
+        if (syphonFlipY) uv.y = 1.0 - uv.y;
+        syphonSample = syphonMap.sample(smp, uv).rgb;
+    } else {
+        // ---- Projector (default) ----
+        // Perspective divide of the rendering camera's clip pos gives us
+        // NDC; mapping [-1,1] → [0,1] gives the same coordinates the camera
+        // would draw to the screen, so the Syphon image lands on every
+        // surface the camera (= the physical projector) actually illuminates.
+        float w = in.clipPos.w;
+        if (w > 1e-4) {
+            float2 ndc = in.clipPos.xy / w;
+            float2 uv  = ndc * 0.5 + 0.5;
+            // Metal NDC is +Y up; image rows are +Y down → flip by default.
+            if (!syphonFlipY) uv.y = 1.0 - uv.y;
+            if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+                syphonSample = syphonMap.sample(smp, uv).rgb;
+            }
+        }
+    }
+    syphonSample *= u.syphonMixTint.yzw;
     float  syphonMix    = saturate(u.syphonMixTint.x);
 
     // Compose final material values:
@@ -295,6 +348,7 @@ struct Uniforms {
     glm::vec4 matMR;             // .x metallicFactor, .y roughnessFactor
     glm::vec4 fx;                // .x displace, .y displaceScale, .z twist
     glm::vec4 syphonMixTint;     // .x mix, .yzw tint
+    glm::vec4 syphonParams;      // .x mode, .y triplanarScale, .z flipY
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
@@ -633,7 +687,10 @@ void MetalRenderer::renderStructureMeshes(
     const glm::vec3& ambientColor,
     MTL::Texture* syphonTex,
     float          syphonMix,
-    const glm::vec3& syphonTint)
+    const glm::vec3& syphonTint,
+    int            syphonMode,
+    float          syphonTriplanarScale,
+    bool           syphonFlipY)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -756,6 +813,10 @@ void MetalRenderer::renderStructureMeshes(
         }
         u.fx = glm::vec4(dispEff, layer.displaceScale, twistEff, 0.0f);
         u.syphonMixTint = glm::vec4(syphonMix, syphonTint);
+        u.syphonParams  = glm::vec4(static_cast<float>(syphonMode),
+                                     syphonTriplanarScale,
+                                     syphonFlipY ? 1.0f : 0.0f,
+                                     0.0f);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 

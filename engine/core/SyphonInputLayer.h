@@ -37,6 +37,23 @@ public:
     // Tint multiplied with the Syphon sample (vec3). Default white.
     glm::vec3 tint = glm::vec3(1.0f);
 
+    // How the video is mapped onto the structure. For projection-mapping work
+    // the default (Projector) behaves like a real video projector: the image
+    // is projected from the scene camera's POV, independent of the mesh UVs.
+    // This is what you want for buildings where Blender unwraps are partial
+    // or non-existent. UV mode (legacy) needs a proper unwrap on every face
+    // to avoid degenerate-UV "solid color" patches. Triplanar tiles the
+    // image in world space using the surface normal as the blend basis —
+    // useful for textures/patterns rather than narrative video.
+    enum class ProjMode : int {
+        Projector = 0,   // NDC of scene camera (recommended for v1)
+        Triplanar = 1,   // world-pos blended by |N| — UV-independent
+        UV        = 2,   // mesh UV0 — depends on Blender unwrap quality
+    };
+    ProjMode projMode      = ProjMode::Projector;
+    float    triplanarScale = 0.25f;   // tiles per meter, only used by Triplanar
+    bool     flipY          = false;   // toggle if the publisher sends upside-down
+
     // Returns the last received Metal texture (may be null if no frame yet).
     MTL::Texture* currentTexture() const;
 

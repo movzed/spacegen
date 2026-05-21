@@ -28,6 +28,9 @@ void StructureLayer::render(RenderContext& ctx) {
     MTL::Texture*  syphonTex      = nullptr;
     float          syphonMix      = 0.0f;
     glm::vec3      syphonTint(1.0f);
+    int            syphonMode     = 0;       // 0 = Projector
+    float          syphonTriplanar = 0.25f;
+    bool           syphonFlipY    = false;
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -44,16 +47,21 @@ void StructureLayer::render(RenderContext& ctx) {
                 // because s->render() was called earlier in the bus walk; here
                 // we only query the cached current texture.
                 if (!syphonTex) {
-                    syphonTex  = s->currentTexture();
-                    syphonMix  = s->mix * s->opacity;
-                    syphonTint = s->tint;
+                    syphonTex       = s->currentTexture();
+                    syphonMix       = s->mix * s->opacity;
+                    syphonTint      = s->tint;
+                    syphonMode      = static_cast<int>(s->projMode);
+                    syphonTriplanar = s->triplanarScale;
+                    syphonFlipY     = s->flipY;
                 }
             }
         }
     }
     ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs,
                                           ambientColor,
-                                          syphonTex, syphonMix, syphonTint);
+                                          syphonTex, syphonMix, syphonTint,
+                                          syphonMode, syphonTriplanar,
+                                          syphonFlipY);
 }
 
 void StructureLayer::drawInspector() {

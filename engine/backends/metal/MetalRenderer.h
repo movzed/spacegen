@@ -57,7 +57,10 @@ public:
         const glm::vec3& ambientColor,
         MTL::Texture* syphonTex    = nullptr,   // optional live video overlay
         float          syphonMix   = 0.0f,
-        const glm::vec3& syphonTint = glm::vec3(1.0f));
+        const glm::vec3& syphonTint = glm::vec3(1.0f),
+        int            syphonMode  = 0,         // 0=Projector, 1=Triplanar, 2=UV
+        float          syphonTriplanarScale = 0.25f,
+        bool           syphonFlipY = false);
 
     // Public scene matrices (used by Layers when building their uniforms).
     const glm::mat4& projection()      const { return projection_; }
