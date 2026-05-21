@@ -69,6 +69,43 @@ endif()
 add_library(metal-cpp INTERFACE)
 target_include_directories(metal-cpp INTERFACE "${METAL_CPP_DIR}/metal-cpp")
 
+# ---- GLM (header-only math) ----
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG        1.0.1
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(glm)
+
+# ---- nlohmann_json (header-only JSON) ----
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
+# ---- tinygltf (header-only glTF 2.0 loader; we compile its impl in
+#                tinygltf_impl.cpp). Bundles stb_image. ----
+set(TINYGLTF_HEADER_ONLY ON  CACHE INTERNAL "" FORCE)
+set(TINYGLTF_INSTALL     OFF CACHE INTERNAL "" FORCE)
+set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE INTERNAL "" FORCE)
+FetchContent_Declare(
+    tinygltf
+    GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+    GIT_TAG        v2.9.3
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(tinygltf)
+# Some tinygltf tags don't expose a proper target; expose include dir ourselves.
+if(NOT TARGET tinygltf)
+    add_library(tinygltf INTERFACE)
+endif()
+target_include_directories(tinygltf INTERFACE "${tinygltf_SOURCE_DIR}")
+
 # ============================================================
 # Engine executable
 # ============================================================
@@ -76,12 +113,22 @@ target_include_directories(metal-cpp INTERFACE "${METAL_CPP_DIR}/metal-cpp")
 add_executable(spacegen
     main.cpp
     metal_cpp_impl.cpp
+    tinygltf_impl.cpp
     platform_metal_glfw.mm
+    core/Scene.cpp
+    backends/metal/MetalRenderer.cpp
+)
+
+target_include_directories(spacegen PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(spacegen PRIVATE
     glfw
     metal-cpp
+    glm
+    nlohmann_json::nlohmann_json
+    tinygltf
     "-framework Foundation"
     "-framework QuartzCore"
     "-framework Metal"

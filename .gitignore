@@ -21,6 +21,10 @@ __pycache__/
 *.blend1
 *.blend2
 
+# Large test exports (structure.glb can be hundreds of MB)
+examples/*/
+!examples/*.md
+
 # Logs
 *.log
 
