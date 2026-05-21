@@ -2,6 +2,7 @@
 
 #include "../../core/Scene.h"
 
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -139,6 +140,108 @@ struct Uniforms {
     glm::vec4 lightColor;
 };
 
+// ---- Volumetric beam pass ----------------------------------------------
+// Fullscreen triangle (no vertex buffer; uses [[vertex_id]]). Reads NDC from
+// vertex_id, marches a ray from the camera through each pixel and integrates
+// scattering whenever it falls inside a world-space cone.
+
+constexpr const char* kVolumetricBeamMSL = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct BeamUniforms {
+    float4x4 invViewProj;       // unprojects NDC -> world
+    float4   cameraWorldPos;    // .xyz
+    float4   beamOrigin;        // .xyz
+    float4   beamDirIntensity;  // .xyz dir (normalized), .w intensity
+    float4   beamColor;         // .rgb linear
+    float4   beamParams;        // .x cone cos (inner), .y range, .z falloff, .w steps
+};
+
+struct V2F {
+    float4 position [[position]];
+    float2 ndc;
+};
+
+vertex V2F vs_beam(uint vid [[vertex_id]]) {
+    V2F out;
+    // Big triangle: (-1,-1), (3,-1), (-1,3)
+    float2 p;
+    p.x = (vid == 1) ? 3.0 : -1.0;
+    p.y = (vid == 2) ? 3.0 : -1.0;
+    out.position = float4(p, 0.0, 1.0);
+    out.ndc = p;
+    return out;
+}
+
+fragment float4 fs_beam(V2F in [[stage_in]],
+                        constant BeamUniforms& u [[buffer(0)]])
+{
+    // Reconstruct world-space ray for this pixel.
+    // Near plane: NDC z = 0 in Metal. Far plane: NDC z = 1.
+    float4 nearH = u.invViewProj * float4(in.ndc, 0.0, 1.0);
+    float4 farH  = u.invViewProj * float4(in.ndc, 1.0, 1.0);
+    float3 nearW = nearH.xyz / nearH.w;
+    float3 farW  = farH.xyz  / farH.w;
+
+    float3 rayOrigin = nearW;
+    float3 rayDir    = normalize(farW - nearW);
+
+    float3 beamPos   = u.beamOrigin.xyz;
+    float3 beamDir   = normalize(u.beamDirIntensity.xyz);
+    float  beamInt   = u.beamDirIntensity.w;
+    float3 beamCol   = u.beamColor.rgb;
+    float  coneCos   = u.beamParams.x;
+    float  beamRange = u.beamParams.y;
+    float  falloff   = u.beamParams.z;
+    int    steps     = max(int(u.beamParams.w), 4);
+
+    // March from camera near plane out to range.
+    float marchEnd = beamRange * 2.5;  // generous; falloff handles attenuation
+    float dt = marchEnd / float(steps);
+    float3 accum = float3(0.0);
+
+    for (int i = 0; i < steps; i++) {
+        float t  = (float(i) + 0.5) * dt;
+        float3 p = rayOrigin + rayDir * t;
+
+        // Position relative to beam origin
+        float3 d = p - beamPos;
+        float along = dot(d, beamDir);
+        if (along <= 0.0 || along > beamRange) continue;
+
+        float3 perp     = d - along * beamDir;
+        float perpLen   = length(perp);
+
+        // Cone radius at this depth (using tan from cone cos -> half-angle).
+        // tan = sqrt(1 - cos^2) / cos
+        float coneTan   = sqrt(max(1.0 - coneCos * coneCos, 0.0)) / max(coneCos, 1e-4);
+        float coneRad   = along * coneTan;
+        if (perpLen > coneRad) continue;
+
+        // Radial profile (falls off from center to edge)
+        float radial    = pow(saturate(1.0 - perpLen / max(coneRad, 1e-4)), falloff);
+        // Range falloff
+        float rangeFade = saturate(1.0 - along / beamRange);
+        // Soft origin start (avoid clipping right at the beam origin)
+        float originFade = smoothstep(0.0, beamRange * 0.08, along);
+
+        accum += beamCol * (radial * rangeFade * originFade) * (beamInt * dt);
+    }
+
+    return float4(accum, 1.0);
+}
+)MSL";
+
+struct BeamUniformsCpu {
+    glm::mat4 invViewProj;
+    glm::vec4 cameraWorldPos;
+    glm::vec4 beamOrigin;
+    glm::vec4 beamDirIntensity;
+    glm::vec4 beamColor;
+    glm::vec4 beamParams;  // x=coneCos, y=range, z=falloff, w=steps
+};
+
 } // namespace
 
 MetalRenderer::MetalRenderer(MTL::Device* device, MTL::PixelFormat colorFormat)
@@ -148,6 +251,7 @@ MetalRenderer::MetalRenderer(MTL::Device* device, MTL::PixelFormat colorFormat)
         throw std::runtime_error("MetalRenderer: device is null");
     }
     buildPipeline();
+    buildBeamPipeline();
 }
 
 MetalRenderer::~MetalRenderer() {
@@ -156,9 +260,59 @@ MetalRenderer::~MetalRenderer() {
         if (gm.normalBuffer)   gm.normalBuffer->release();
         if (gm.indexBuffer)    gm.indexBuffer->release();
     }
-    if (pipeline_)   pipeline_->release();
-    if (depthState_) depthState_->release();
+    if (pipeline_)     pipeline_->release();
+    if (beamPipeline_) beamPipeline_->release();
+    if (depthState_)   depthState_->release();
     releaseDepthTexture();
+}
+
+void MetalRenderer::buildBeamPipeline() {
+    NS::Error* err = nullptr;
+    NS::String* src = NS::String::string(kVolumetricBeamMSL,
+                                          NS::UTF8StringEncoding);
+    MTL::CompileOptions* opts = MTL::CompileOptions::alloc()->init();
+    MTL::Library* lib = device_->newLibrary(src, opts, &err);
+    opts->release();
+    if (!lib) {
+        std::string msg = "Beam MSL compile failed: ";
+        if (err) msg += err->localizedDescription()->utf8String();
+        throw std::runtime_error(msg);
+    }
+    MTL::Function* vsFn = lib->newFunction(
+        NS::String::string("vs_beam", NS::UTF8StringEncoding));
+    MTL::Function* fsFn = lib->newFunction(
+        NS::String::string("fs_beam", NS::UTF8StringEncoding));
+
+    MTL::RenderPipelineDescriptor* pd =
+        MTL::RenderPipelineDescriptor::alloc()->init();
+    pd->setVertexFunction(vsFn);
+    pd->setFragmentFunction(fsFn);
+    pd->setVertexDescriptor(nullptr); // fullscreen triangle, no vbo
+    auto* colorAtt = pd->colorAttachments()->object(0);
+    colorAtt->setPixelFormat(colorFormat_);
+    // Additive blending: dst = src + dst (color), alpha stays 1.
+    colorAtt->setBlendingEnabled(true);
+    colorAtt->setRgbBlendOperation(MTL::BlendOperationAdd);
+    colorAtt->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+    colorAtt->setDestinationRGBBlendFactor(MTL::BlendFactorOne);
+    colorAtt->setAlphaBlendOperation(MTL::BlendOperationAdd);
+    colorAtt->setSourceAlphaBlendFactor(MTL::BlendFactorZero);
+    colorAtt->setDestinationAlphaBlendFactor(MTL::BlendFactorOne);
+    // No depth attachment for the beam pass: we DON'T want depth-test or
+    // depth-write here. The pass is purely additive overlay.
+    pd->setDepthAttachmentPixelFormat(MTL::PixelFormatInvalid);
+
+    beamPipeline_ = device_->newRenderPipelineState(pd, &err);
+    pd->release();
+    vsFn->release();
+    fsFn->release();
+    lib->release();
+
+    if (!beamPipeline_) {
+        std::string msg = "Beam RenderPipelineState build failed: ";
+        if (err) msg += err->localizedDescription()->utf8String();
+        throw std::runtime_error(msg);
+    }
 }
 
 void MetalRenderer::releaseDepthTexture() {
@@ -382,6 +536,42 @@ void MetalRenderer::renderFrame(MTL::CommandBuffer* cmdBuf,
     }
 
     enc->endEncoding();
+
+    // ---- Beam pass (additive overlay on the same color target) ----
+    if (beamEnabled && beamPipeline_) {
+        MTL::RenderPassDescriptor* brpd =
+            MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* bcol = brpd->colorAttachments()->object(0);
+        bcol->setTexture(colorTarget);
+        bcol->setLoadAction(MTL::LoadActionLoad);
+        bcol->setStoreAction(MTL::StoreActionStore);
+        // No depth attachment: beam pass is purely additive overlay.
+
+        MTL::RenderCommandEncoder* be = cmdBuf->renderCommandEncoder(brpd);
+        if (be) {
+            be->setRenderPipelineState(beamPipeline_);
+
+            BeamUniformsCpu bu;
+            bu.invViewProj      = glm::inverse(projection_ * view_);
+            bu.cameraWorldPos   = glm::vec4(cameraWorldPos_, 1.0f);
+            bu.beamOrigin       = glm::vec4(beamOrigin, 0.0f);
+            bu.beamDirIntensity = glm::vec4(glm::normalize(beamDirection),
+                                             beamIntensity);
+            bu.beamColor        = glm::vec4(beamColor, 0.0f);
+            float coneRad       = beamConeDeg * 3.14159265f / 180.0f;
+            float coneCos       = std::cos(coneRad);
+            bu.beamParams       = glm::vec4(coneCos, beamRange,
+                                             beamFalloff,
+                                             static_cast<float>(beamSteps));
+
+            be->setVertexBytes(&bu, sizeof(bu), 0);
+            be->setFragmentBytes(&bu, sizeof(bu), 0);
+            be->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                                static_cast<NS::UInteger>(0),
+                                static_cast<NS::UInteger>(3));
+            be->endEncoding();
+        }
+    }
 }
 
 size_t MetalRenderer::totalTriangles() const {

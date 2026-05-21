@@ -161,6 +161,28 @@ void drawInspector(spacegen::MetalRenderer& renderer, bool* open) {
                            &renderer.lightIntensity, 0.0f, 10.0f);
     }
 
+    if (ImGui::CollapsingHeader("Volumetric beam",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Enabled##beam",       &renderer.beamEnabled);
+        ImGui::DragFloat3("Origin##beam",       &renderer.beamOrigin[0],
+                          0.05f, -10.0f, 10.0f);
+        ImGui::SliderFloat3("Direction##beam",  &renderer.beamDirection[0],
+                            -1.0f, 1.0f);
+        ImGui::ColorEdit3("Color##beam",        &renderer.beamColor[0],
+                          ImGuiColorEditFlags_PickerHueWheel
+                          | ImGuiColorEditFlags_Float);
+        ImGui::SliderFloat("Intensity##beam",   &renderer.beamIntensity,
+                           0.0f, 5.0f);
+        ImGui::SliderFloat("Range (m)##beam",   &renderer.beamRange,
+                           0.5f, 40.0f);
+        ImGui::SliderFloat("Cone (deg)##beam",  &renderer.beamConeDeg,
+                           1.0f, 60.0f);
+        ImGui::SliderFloat("Falloff##beam",     &renderer.beamFalloff,
+                           0.5f, 6.0f);
+        ImGui::SliderInt  ("Steps##beam",       &renderer.beamSteps,
+                           8, 128);
+    }
+
     ImGui::End();
 }
 

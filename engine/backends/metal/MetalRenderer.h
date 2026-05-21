@@ -73,17 +73,37 @@ private:
     glm::mat4                  view_            = glm::mat4(1.0f);
     glm::vec3                  cameraWorldPos_  = glm::vec3(0.0f);
 
-    // M2-C1: single hardcoded light, exposed publicly so main.cpp can poke
-    // direction/color/intensity per frame. M2-C2 will move this through the
-    // parameter graph + ImGui binding.
+    // Beam pipeline state (separate from structure pipeline).
+    MTL::RenderPipelineState*  beamPipeline_    = nullptr;
+
+    void buildBeamPipeline();
+
+    // M2-C1+: hardcoded params, exposed publicly so the Inspector can poke
+    // them per frame. M3+ moves them through the parameter graph.
 public:
-    glm::vec3                  lightDirection   = glm::vec3(0.4f, -0.6f, -0.6f);
-    glm::vec3                  lightColor       = glm::vec3(1.0f, 0.96f, 0.92f);
-    float                      lightIntensity   = 1.6f;
+    // Structure material
     glm::vec3                  baseColor        = glm::vec3(0.72f);
     float                      roughness        = 0.55f;
     float                      metallic         = 0.0f;
     float                      ambient          = 0.04f;
+
+    // Directional light
+    glm::vec3                  lightDirection   = glm::vec3(0.4f, -0.6f, -0.6f);
+    glm::vec3                  lightColor       = glm::vec3(1.0f, 0.96f, 0.92f);
+    float                      lightIntensity   = 1.6f;
+
+    // M3-A: Volumetric beam (first generator beyond the structure).
+    // World-space cone with raymarched scattering, additively blended on
+    // top of the structure pass.
+    bool                       beamEnabled      = true;
+    glm::vec3                  beamOrigin       = glm::vec3(0.0f, 3.0f, 4.0f);
+    glm::vec3                  beamDirection    = glm::vec3(0.0f, -0.8f, -0.6f);
+    glm::vec3                  beamColor        = glm::vec3(0.30f, 0.55f, 1.00f);
+    float                      beamIntensity    = 1.2f;
+    float                      beamRange        = 14.0f;     // meters
+    float                      beamConeDeg      = 14.0f;     // half-angle
+    float                      beamFalloff      = 1.8f;      // radial sharpness
+    int                        beamSteps        = 32;        // raymarch samples
 };
 
 } // namespace spacegen
