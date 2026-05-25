@@ -109,6 +109,13 @@ struct Scene {
     Bus                         bus;
     ModulatorBank               modulators;
 
+    // Aggregate world-space bounds + centroid across all loaded meshes
+    // (after applying each mesh's `transform`). Used by the renderer for
+    // shader-side parametric Syphon mappings (cylindrical / spherical).
+    glm::vec3               bboxMin  = glm::vec3(0.0f);
+    glm::vec3               bboxMax  = glm::vec3(0.0f);
+    glm::vec3               centroid = glm::vec3(0.0f);
+
     // Loads `scene.json` from `folderPath`, then optionally `structure.glb`
     // referenced by the manifest. Throws std::runtime_error on hard failure
     // (missing scene.json, unknown schema version, malformed JSON, glTF load

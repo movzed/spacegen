@@ -58,9 +58,15 @@ public:
         MTL::Texture* syphonTex    = nullptr,   // optional live video overlay
         float          syphonMix   = 0.0f,
         const glm::vec3& syphonTint = glm::vec3(1.0f),
-        int            syphonMode  = 0,         // 0=Projector, 1=Triplanar, 2=UV
+        int            syphonMode  = 0,         // 0..5, see SyphonInputLayer::ProjMode
         float          syphonTriplanarScale = 0.25f,
-        bool           syphonFlipY = false);
+        bool           syphonFlipY = false,
+        int            syphonCylAxis = 0,       // 0=X, 1=Y, 2=Z
+        float          syphonWrapU = 1.0f,
+        float          syphonWrapV = 1.0f,
+        const glm::vec3& sceneBboxMin = glm::vec3(0.0f),
+        const glm::vec3& sceneBboxMax = glm::vec3(1.0f),
+        const glm::vec3& sceneCentroid = glm::vec3(0.0f));
 
     // Public scene matrices (used by Layers when building their uniforms).
     const glm::mat4& projection()      const { return projection_; }

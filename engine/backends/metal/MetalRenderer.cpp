@@ -74,7 +74,11 @@ struct Uniforms {
     float4    matMR;                // .x metallicFactor, .y roughnessFactor
     float4    fx;                   // .x displaceAmount, .y displaceScale, .z twistAmount
     float4    syphonMixTint;        // .x mix (0..1), .yzw tint RGB
-    float4    syphonParams;         // .x mode (0 proj, 1 triplanar, 2 uv), .y triplanarScale, .z flipY
+    float4    syphonParams;         // .x mode (0..5), .y triplanarScale, .z flipY, .w cylAxis
+    float4    syphonWrap;           // .xy wrapU/wrapV, .zw reserved
+    float4    syphonBboxMin;        // .xyz scene world-bbox min
+    float4    syphonBboxMax;        // .xyz scene world-bbox max
+    float4    syphonCenter;         // .xyz scene centroid
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
@@ -202,9 +206,21 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     //                  to Projector otherwise. Hybrid: unwrapped mask keeps
     //                  its 3D feel, flat / non-unwrapped faces still receive
     //                  the projection instead of collapsing to a solid color.
+    //   4 Cylindrical — wrap UV around a world axis. U = atan2(angle around
+    //                   axis) normalized, V = position along axis normalized
+    //                   into [0,1]. Continuous across the structure, no seam
+    //                   except at the back of the wrap. Best for elongated
+    //                   meshes (stages, walls, columns).
+    //   5 Spherical  — equirectangular wrap from the scene centroid. U from
+    //                   longitude, V from latitude. Continuous in all
+    //                   directions except a single pole — best for compact /
+    //                   roughly-spherical meshes.
     int    syphonModeI = int(u.syphonParams.x + 0.5);
     float  tplScale    = u.syphonParams.y;
     bool   syphonFlipY = u.syphonParams.z > 0.5;
+    int    cylAxis     = int(u.syphonParams.w + 0.5);
+    float  wrapU       = u.syphonWrap.x;
+    float  wrapV       = u.syphonWrap.y;
 
     // For Auto mode: gradient of UV1 in screen space. Vanishingly small
     // means every vertex of this primitive sampled the same UV1 → no real
@@ -224,11 +240,53 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     // detection above.
     bool autoUseUV = (syphonModeI == 3) && uvHasGradient;
     bool useUV     = (syphonModeI == 2) || autoUseUV;
-    bool useTriplanar = (syphonModeI == 1);
-    bool useProjector = (syphonModeI == 0)
-                      || (syphonModeI == 3 && !uvHasGradient);
+    bool useTriplanar  = (syphonModeI == 1);
+    bool useProjector  = (syphonModeI == 0)
+                       || (syphonModeI == 3 && !uvHasGradient);
+    bool useCylindrical = (syphonModeI == 4);
+    bool useSpherical   = (syphonModeI == 5);
 
-    if (useTriplanar) {
+    if (useCylindrical) {
+        // ---- Cylindrical wrap around scene bbox ----
+        // The axis chosen (cylAxis) becomes V (along the cylinder); the
+        // other two world axes form the polar coordinate around it.
+        constexpr float TAU = 6.28318530718;
+        float3 wp = in.worldPos;
+        float3 mn = u.syphonBboxMin.xyz;
+        float3 mx = u.syphonBboxMax.xyz;
+        float3 ce = u.syphonCenter.xyz;
+        float  pa, pb, pc, pcMin, pcMax;
+        if (cylAxis == 1) {
+            pa = wp.z - ce.z;  pb = wp.x - ce.x;
+            pc = wp.y;         pcMin = mn.y;   pcMax = mx.y;
+        } else if (cylAxis == 2) {
+            pa = wp.x - ce.x;  pb = wp.y - ce.y;
+            pc = wp.z;         pcMin = mn.z;   pcMax = mx.z;
+        } else { // 0 = X
+            pa = wp.y - ce.y;  pb = wp.z - ce.z;
+            pc = wp.x;         pcMin = mn.x;   pcMax = mx.x;
+        }
+        float angle = atan2(pb, pa);                  // -PI..+PI
+        float uu    = (angle / TAU + 0.5) * wrapU;    // 0..1 then * tiles
+        float span  = max(pcMax - pcMin, 1e-3);
+        float vv    = ((pc - pcMin) / span) * wrapV;
+        if (syphonFlipY) vv = 1.0 - vv;
+        // Use fract for nice tiling when wrapU/wrapV > 1.
+        float2 uv = float2(fract(uu), fract(vv));
+        syphonSample = syphonMap.sample(smp, uv).rgb;
+    } else if (useSpherical) {
+        // ---- Spherical equirectangular ----
+        constexpr float TAU = 6.28318530718;
+        constexpr float PI  = 3.14159265359;
+        float3 d = normalize(in.worldPos - u.syphonCenter.xyz);
+        float  longi = atan2(d.y, d.x);              // -PI..+PI around Z
+        float  lat   = asin(clamp(d.z, -1.0, 1.0));  // -PI/2..+PI/2
+        float  uu = (longi / TAU + 0.5) * wrapU;
+        float  vv = (lat / PI   + 0.5) * wrapV;
+        if (syphonFlipY) vv = 1.0 - vv;
+        float2 uv = float2(fract(uu), fract(vv));
+        syphonSample = syphonMap.sample(smp, uv).rgb;
+    } else if (useTriplanar) {
         // ---- Triplanar (world position) ----
         float3 absN = abs(N);
         float  s    = max(absN.x + absN.y + absN.z, 1e-4);
@@ -380,7 +438,11 @@ struct Uniforms {
     glm::vec4 matMR;             // .x metallicFactor, .y roughnessFactor
     glm::vec4 fx;                // .x displace, .y displaceScale, .z twist
     glm::vec4 syphonMixTint;     // .x mix, .yzw tint
-    glm::vec4 syphonParams;      // .x mode, .y triplanarScale, .z flipY
+    glm::vec4 syphonParams;      // .x mode, .y triplanarScale, .z flipY, .w cylAxis
+    glm::vec4 syphonWrap;        // .xy wrapU/wrapV
+    glm::vec4 syphonBboxMin;     // .xyz
+    glm::vec4 syphonBboxMax;     // .xyz
+    glm::vec4 syphonCenter;      // .xyz
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
@@ -752,7 +814,13 @@ void MetalRenderer::renderStructureMeshes(
     const glm::vec3& syphonTint,
     int            syphonMode,
     float          syphonTriplanarScale,
-    bool           syphonFlipY)
+    bool           syphonFlipY,
+    int            syphonCylAxis,
+    float          syphonWrapU,
+    float          syphonWrapV,
+    const glm::vec3& sceneBboxMin,
+    const glm::vec3& sceneBboxMax,
+    const glm::vec3& sceneCentroid)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -878,7 +946,11 @@ void MetalRenderer::renderStructureMeshes(
         u.syphonParams  = glm::vec4(static_cast<float>(syphonMode),
                                      syphonTriplanarScale,
                                      syphonFlipY ? 1.0f : 0.0f,
-                                     0.0f);
+                                     static_cast<float>(syphonCylAxis));
+        u.syphonWrap    = glm::vec4(syphonWrapU, syphonWrapV, 0.0f, 0.0f);
+        u.syphonBboxMin = glm::vec4(sceneBboxMin, 0.0f);
+        u.syphonBboxMax = glm::vec4(sceneBboxMax, 0.0f);
+        u.syphonCenter  = glm::vec4(sceneCentroid, 0.0f);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 

@@ -97,6 +97,7 @@ private:
     bool             showLayers_       = true;
     bool             showInspector_    = true;
     bool             showModulators_   = true;
+    bool             showUvAnalysis_   = true;
     bool             showDemo_         = false;
 
     // Currently selected layer (by id) — drives the Inspector contents.

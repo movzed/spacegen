@@ -139,11 +139,13 @@ void SyphonInputLayer::drawInspector() {
     static const char* kModeNames[] = {
         "Projector (from camera POV)",
         "Triplanar (world-space tile)",
-        "UV (mesh unwrap)",
+        "UV (mesh unwrap, TEXCOORD_1)",
         "Auto (UV where valid, Projector elsewhere)",
+        "Cylindrical (wrap around axis)",
+        "Spherical (wrap around centroid)",
     };
     int modeIdx = static_cast<int>(projMode);
-    if (ImGui::Combo("##symode", &modeIdx, kModeNames, 4)) {
+    if (ImGui::Combo("##symode", &modeIdx, kModeNames, 6)) {
         projMode = static_cast<ProjMode>(modeIdx);
     }
     if (projMode == ProjMode::Projector) {
@@ -154,13 +156,25 @@ void SyphonInputLayer::drawInspector() {
                             0.01f, 4.0f, "%.3f");
         ImGui::TextDisabled("Tiles in world space, blended by normal.");
     } else if (projMode == ProjMode::UV) {
-        ImGui::TextDisabled("Uses mesh UV0. Needs a complete unwrap");
-        ImGui::TextDisabled("or non-unwrapped faces show solid color.");
-    } else {
-        ImGui::TextDisabled("Detects per-fragment whether UV0 carries");
+        ImGui::TextDisabled("Uses mesh UV1 (SyphonUV layer from glTF).");
+        ImGui::TextDisabled("Needs a complete unwrap or non-unwrapped");
+        ImGui::TextDisabled("faces show solid color.");
+    } else if (projMode == ProjMode::Auto) {
+        ImGui::TextDisabled("Detects per-fragment whether UV1 carries");
         ImGui::TextDisabled("real unwrap data; on faces with collapsed");
         ImGui::TextDisabled("UVs the engine falls back to Projector so");
         ImGui::TextDisabled("they no longer render as solid color.");
+    } else if (projMode == ProjMode::Cylindrical) {
+        static const char* kAxisNames[] = { "X (long axis)", "Y", "Z" };
+        ImGui::Combo("Wrap axis##syax", &cylindricalAxis, kAxisNames, 3);
+        ImGui::SliderFloat("Wrap U (around)##syu",   &wrapU, 0.25f, 8.0f, "%.2f");
+        ImGui::SliderFloat("Wrap V (along)##syv",    &wrapV, 0.25f, 8.0f, "%.2f");
+        ImGui::TextDisabled("Continuous wrap: video appears to live on");
+        ImGui::TextDisabled("the geometry, flowing as you orbit the mesh.");
+    } else if (projMode == ProjMode::Spherical) {
+        ImGui::SliderFloat("Wrap U (long.)##syu",  &wrapU, 0.25f, 8.0f, "%.2f");
+        ImGui::SliderFloat("Wrap V (lat.)##syv",   &wrapV, 0.25f, 8.0f, "%.2f");
+        ImGui::TextDisabled("Equirectangular wrap from the scene centroid.");
     }
     ImGui::Checkbox("Flip Y##syflip", &flipY);
 

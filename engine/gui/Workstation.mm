@@ -21,9 +21,12 @@
 #include "../core/DirectionalLightLayer.h"
 #include "../core/AmbientLightLayer.h"
 #include "../core/SyphonInputLayer.h"
+#include "../core/UvAtlas.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <cstdio>
 
 namespace spacegen::gui {
@@ -35,6 +38,7 @@ constexpr const char* kStatsWindowName       = "Stats";
 constexpr const char* kLayersWindowName      = "Layers";
 constexpr const char* kModulatorsWindowName  = "Modulators";
 constexpr const char* kInspectorWindowName   = "Inspector";
+constexpr const char* kUvAnalysisWindowName  = "UV Analysis";
 
 void styleSpaceGen() {
     ImGui::StyleColorsDark();
@@ -79,6 +83,7 @@ void buildDefaultLayout(ImGuiID dockspace_id) {
     ImGui::DockBuilderDockWindow(kStatsWindowName,       dockLeft);
     ImGui::DockBuilderDockWindow(kLayersWindowName,      dockLeftBottom);
     ImGui::DockBuilderDockWindow(kModulatorsWindowName,  dockLeftBottom);
+    ImGui::DockBuilderDockWindow(kUvAnalysisWindowName,  dockLeftBottom);
     ImGui::DockBuilderDockWindow(kInspectorWindowName,   dockRight);
     ImGui::DockBuilderDockWindow(kCompositionWindowName, dockCenter);
     ImGui::DockBuilderFinish(dockspace_id);
@@ -86,7 +91,8 @@ void buildDefaultLayout(ImGuiID dockspace_id) {
 
 void drawMainMenuBar(bool& showStats, bool& showLayers,
                      bool& showModulators,
-                     bool& showInspector, bool& showDemo) {
+                     bool& showInspector, bool& showDemo,
+                     bool& showUvAnalysis) {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             ImGui::MenuItem("New scene...",   nullptr, false, false);
@@ -102,6 +108,7 @@ void drawMainMenuBar(bool& showStats, bool& showLayers,
             ImGui::MenuItem(kLayersWindowName,     nullptr, &showLayers);
             ImGui::MenuItem(kModulatorsWindowName, nullptr, &showModulators);
             ImGui::MenuItem(kInspectorWindowName,  nullptr, &showInspector);
+            ImGui::MenuItem(kUvAnalysisWindowName, nullptr, &showUvAnalysis);
             ImGui::Separator();
             ImGui::MenuItem("ImGui Demo", nullptr, &showDemo);
             ImGui::EndMenu();
@@ -319,6 +326,194 @@ void drawModulators(spacegen::Scene& scene, bool* open) {
     ImGui::End();
 }
 
+// ---- UV Analysis panel ----------------------------------------------------
+// Per-mesh UV diagnostics + ability to regenerate the SyphonUV layer with
+// xatlas (industry-standard automatic atlas generator). The regeneration is
+// blocking (the UI freezes for the duration of xatlas's run; expect 30s to
+// several minutes on a multi-million-triangle mesh). The result is cached
+// to disk as uv1_atlas.bin next to scene.json. On the next launch, the
+// engine loads that cache automatically.
+//
+// We intentionally do NOT swap GPU buffers at runtime — that would require
+// rebuilding the index/vertex buffers mid-frame, and xatlas can change the
+// vertex count (it splits verts at chart seams). The user restarts the
+// binary to apply.
+
+// Persistent state of the panel between frames (computed-once-and-cached
+// UV coverage stats + last regeneration result).
+struct UvAnalysisState {
+    bool        coverageComputed = false;
+    int         totalTris        = 0;
+    int         uv0DegenTris     = 0;
+    int         uv1DegenTris     = 0;
+    bool        regenInProgress  = false;
+    bool        regenLastOk      = false;
+    std::string regenLastMsg;
+    int         lastChartCount   = 0;
+    int         lastAtlasW       = 0;
+    int         lastAtlasH       = 0;
+    double      lastRegenSec     = 0.0;
+};
+
+static UvAnalysisState gUvState;
+
+// Walk every triangle of `m` and compute how many have UV-degenerate triangles
+// in uv0 and uv1. A degenerate triangle is one whose three vertices share the
+// same UV coordinates within `eps` — i.e. the face was never unwrapped.
+static void recomputeUvCoverage(const spacegen::MeshData& m, UvAnalysisState& s) {
+    s.coverageComputed = true;
+    s.totalTris    = static_cast<int>(m.indices.size() / 3);
+    s.uv0DegenTris = 0;
+    s.uv1DegenTris = 0;
+    if (s.totalTris == 0) return;
+
+    const bool haveUv0 = !m.uvs.empty()  && m.uvs.size()  == m.positions.size();
+    const bool haveUv1 = !m.uvs1.empty() && m.uvs1.size() == m.positions.size();
+    const float eps = 1e-6f;
+
+    auto isDegen = [eps](const std::vector<glm::vec2>& uvs,
+                          uint32_t a, uint32_t b, uint32_t c) {
+        if (a >= uvs.size() || b >= uvs.size() || c >= uvs.size()) return true;
+        const glm::vec2& va = uvs[a];
+        const glm::vec2& vb = uvs[b];
+        const glm::vec2& vc = uvs[c];
+        float du = std::max({va.x, vb.x, vc.x}) - std::min({va.x, vb.x, vc.x});
+        float dv = std::max({va.y, vb.y, vc.y}) - std::min({va.y, vb.y, vc.y});
+        return (du + dv) < eps;
+    };
+
+    for (size_t i = 0; i + 2 < m.indices.size(); i += 3) {
+        uint32_t a = m.indices[i + 0];
+        uint32_t b = m.indices[i + 1];
+        uint32_t c = m.indices[i + 2];
+        if (haveUv0 && isDegen(m.uvs,  a, b, c)) ++s.uv0DegenTris;
+        if (haveUv1 && isDegen(m.uvs1, a, b, c)) ++s.uv1DegenTris;
+    }
+    if (!haveUv0) s.uv0DegenTris = s.totalTris;
+    if (!haveUv1) s.uv1DegenTris = s.totalTris;
+}
+
+void drawUvAnalysisPanel(spacegen::Scene& scene, bool* open) {
+    if (!ImGui::Begin(kUvAnalysisWindowName, open)) { ImGui::End(); return; }
+
+    if (scene.meshes.empty()) {
+        ImGui::TextDisabled("No meshes loaded.");
+        ImGui::End();
+        return;
+    }
+    spacegen::MeshData& m = scene.meshes[0];
+
+    // Header
+    ImGui::Text("Mesh: %s", m.name.c_str());
+    ImGui::Text("Verts: %zu   Tris: %zu",
+                 m.positions.size(), m.indices.size() / 3);
+
+    // Stats: button to compute (potentially slow on 7M-tri meshes), or auto
+    // on first show.
+    if (!gUvState.coverageComputed) {
+        recomputeUvCoverage(m, gUvState);
+    }
+    ImGui::Separator();
+    ImGui::TextDisabled("UV coverage (per-triangle degeneracy)");
+    auto bar = [](const char* label, int degen, int total) {
+        float frac = total > 0
+            ? 1.0f - static_cast<float>(degen) / static_cast<float>(total)
+            : 0.0f;
+        char overlay[64];
+        std::snprintf(overlay, sizeof(overlay), "%s: %.1f%% valid",
+                       label, frac * 100.0f);
+        ImVec4 col = frac > 0.95f
+            ? ImVec4(0.30f, 0.85f, 0.40f, 1.0f)
+            : (frac > 0.5f
+                ? ImVec4(0.95f, 0.85f, 0.30f, 1.0f)
+                : ImVec4(0.95f, 0.40f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
+        ImGui::ProgressBar(frac, ImVec2(-FLT_MIN, 0), overlay);
+        ImGui::PopStyleColor();
+    };
+    bar("UV0 (materials)",      gUvState.uv0DegenTris, gUvState.totalTris);
+    bar("UV1 (SyphonUV)",       gUvState.uv1DegenTris, gUvState.totalTris);
+    if (ImGui::SmallButton("Recompute coverage")) {
+        recomputeUvCoverage(m, gUvState);
+    }
+
+    // Cache file status
+    ImGui::Separator();
+    std::filesystem::path cachePath =
+        std::filesystem::path(scene.folderPath) / "uv1_atlas.bin";
+    bool cacheExists = std::filesystem::exists(cachePath);
+    ImGui::TextDisabled("Cache: %s",
+        cacheExists ? cachePath.string().c_str()
+                    : "(none yet — generate to create)");
+    if (cacheExists) {
+        auto sizeBytes = std::filesystem::file_size(cachePath);
+        ImGui::TextDisabled("       %.1f MB on disk", sizeBytes / (1024.0 * 1024.0));
+    }
+
+    // xatlas regenerate
+    ImGui::Separator();
+    ImGui::TextDisabled("Regenerate SyphonUV with xatlas");
+    ImGui::TextWrapped("xatlas (industry-standard atlas generator used by "
+                        "Unity / UE) detects charts of similar-curvature "
+                        "faces and unwraps each with LSCM. Expensive: "
+                        "~30s-2min on this mesh. Result is saved to disk; "
+                        "restart the app to apply.");
+
+    if (ImGui::Button(gUvState.regenInProgress
+                       ? "Running xatlas..."
+                       : "Generate UV atlas with xatlas",
+                       ImVec2(-FLT_MIN, 36))) {
+        if (!gUvState.regenInProgress) {
+            gUvState.regenInProgress = true;
+            gUvState.regenLastMsg    = "";
+
+            // Run synchronously. xatlas owns the only thread. UI freezes
+            // for the duration — the button label above already warns.
+            auto t0 = std::chrono::steady_clock::now();
+            spacegen::UvAtlasOptions opts;
+            spacegen::UvAtlasResult res = spacegen::generateAtlas(m, opts,
+                nullptr, nullptr);
+            auto t1 = std::chrono::steady_clock::now();
+            gUvState.lastRegenSec =
+                std::chrono::duration<double>(t1 - t0).count();
+
+            if (res.ok) {
+                uint64_t fp = spacegen::meshFingerprint(m);
+                bool saved = spacegen::saveAtlasCache(cachePath.string(),
+                                                       fp, res);
+                gUvState.regenLastOk    = saved;
+                gUvState.lastChartCount = res.chartCount;
+                gUvState.lastAtlasW     = res.atlasWidth;
+                gUvState.lastAtlasH     = res.atlasHeight;
+                gUvState.regenLastMsg   = saved
+                    ? "Cache saved. Restart the app to apply the new UVs."
+                    : "Atlas generated but writing cache failed.";
+            } else {
+                gUvState.regenLastOk  = false;
+                gUvState.regenLastMsg = std::string("xatlas failed: ")
+                                       + res.error;
+            }
+            gUvState.regenInProgress = false;
+        }
+    }
+    if (!gUvState.regenLastMsg.empty()) {
+        ImVec4 col = gUvState.regenLastOk
+            ? ImVec4(0.30f, 0.85f, 0.40f, 1.0f)
+            : ImVec4(0.95f, 0.40f, 0.30f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextWrapped("%s", gUvState.regenLastMsg.c_str());
+        ImGui::PopStyleColor();
+        if (gUvState.regenLastOk) {
+            ImGui::TextDisabled("Charts: %d   Atlas: %dx%d   Time: %.1fs",
+                                 gUvState.lastChartCount,
+                                 gUvState.lastAtlasW, gUvState.lastAtlasH,
+                                 gUvState.lastRegenSec);
+        }
+    }
+
+    ImGui::End();
+}
+
 // Inspector: shows the selected layer's drawInspector(). If none selected,
 // helpful empty state.
 void drawInspector(spacegen::Scene& scene,
@@ -455,11 +650,12 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
     }
 
     drawMainMenuBar(showStats_, showLayers_, showModulators_,
-                     showInspector_, showDemo_);
+                     showInspector_, showDemo_, showUvAnalysis_);
     if (showStats_)      drawStatsPanel(scene, renderer,
                                         currentStats_, &showStats_);
     if (showLayers_)     drawLayerRack(scene, selectedLayerId_, &showLayers_);
     if (showModulators_) drawModulators(scene, &showModulators_);
+    if (showUvAnalysis_) drawUvAnalysisPanel(scene, &showUvAnalysis_);
     if (showInspector_)  drawInspector(scene, selectedLayerId_, &showInspector_);
     if (showDemo_)       ImGui::ShowDemoWindow(&showDemo_);
 

@@ -46,14 +46,26 @@ public:
     // image in world space using the surface normal as the blend basis —
     // useful for textures/patterns rather than narrative video.
     enum class ProjMode : int {
-        Projector = 0,   // NDC of scene camera (recommended for v1)
-        Triplanar = 1,   // world-pos blended by |N| — UV-independent
-        UV        = 2,   // mesh UV0 — depends on Blender unwrap quality
-        Auto      = 3,   // UV where the unwrap is valid, Projector elsewhere
+        Projector   = 0,   // NDC of scene camera
+        Triplanar   = 1,   // world-pos blended by |N| — UV-independent
+        UV          = 2,   // mesh UV1 — depends on Blender unwrap quality
+        Auto        = 3,   // UV where the unwrap is valid, Projector elsewhere
+        Cylindrical = 4,   // wrap around scene bbox axis (continuous, "alive")
+        Spherical   = 5,   // wrap around scene centroid (continuous, "alive")
     };
-    ProjMode projMode      = ProjMode::Auto;
+    ProjMode projMode      = ProjMode::Cylindrical;
     float    triplanarScale = 0.25f;   // tiles per meter, only used by Triplanar
     bool     flipY          = false;   // toggle if the publisher sends upside-down
+
+    // For Cylindrical: which world axis the cylinder wraps around.
+    // 0 = X (good for an X-elongated stage), 1 = Y, 2 = Z.
+    int      cylindricalAxis = 0;
+    // Tiles along the wrap axis (U direction). 1 = video wraps once around
+    // the geometry. Increase to repeat the video around it.
+    float    wrapU = 1.0f;
+    // Tiles along the longitudinal axis (V direction). 1 = video spans
+    // the full length of the structure once.
+    float    wrapV = 1.0f;
 
     // Returns the last received Metal texture (may be null if no frame yet).
     MTL::Texture* currentTexture() const;

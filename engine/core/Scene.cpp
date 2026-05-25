@@ -1,5 +1,7 @@
 #include "Scene.h"
 
+#include "UvAtlas.h"
+
 #include <nlohmann/json.hpp>
 #include <tiny_gltf.h>
 
@@ -11,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace spacegen {
@@ -543,6 +546,70 @@ Scene Scene::loadFromFolder(const std::string& folderPath) {
             std::fflush(stdout);
         }
     }
+    // ============================================================
+    // Optional xatlas regeneration of SyphonUV.
+    //
+    // If the scene folder contains uv1_atlas.bin, load it and replace the
+    // mesh's positions/normals/uvs/uvs1/indices with the xatlas-regenerated
+    // version. xatlas may split vertices at chart seams, so this is a
+    // full mesh swap — but the surface (positions + topology projected to
+    // 3D) is identical to the input.
+    //
+    // The cache is invalidated by mesh fingerprint (FNV-1a over positions
+    // + indices). To force a regen, delete the file. The engine doesn't
+    // run xatlas at load time automatically — that's an explicit operator
+    // action from the UV Analysis panel (writes the file when done).
+    // ============================================================
+    {
+        std::filesystem::path cachePath =
+            std::filesystem::path(folderPath) / "uv1_atlas.bin";
+        if (std::filesystem::exists(cachePath) && !scene.meshes.empty()) {
+            uint64_t fp = meshFingerprint(scene.meshes[0]);
+            UvAtlasResult atlas;
+            if (loadAtlasCache(cachePath.string(), fp, atlas)) {
+                MeshData& m = scene.meshes[0];
+                std::printf("[Scene] xatlas cache loaded from %s: "
+                             "%zu → %zu verts, %zu indices, %d charts, atlas %dx%d\n",
+                             cachePath.string().c_str(),
+                             m.positions.size(), atlas.positions.size(),
+                             atlas.indices.size(), atlas.chartCount,
+                             atlas.atlasWidth, atlas.atlasHeight);
+                m.positions = std::move(atlas.positions);
+                m.normals   = std::move(atlas.normals);
+                m.uvs       = std::move(atlas.uvs0);
+                m.uvs1      = std::move(atlas.uvs1);
+                m.indices   = std::move(atlas.indices);
+            } else {
+                std::printf("[Scene] xatlas cache exists but couldn't load "
+                             "(stale or corrupt). Ignoring; mesh keeps glTF UVs.\n");
+            }
+        }
+    }
+
+    // Aggregate world-space bbox + centroid across all loaded meshes.
+    // We apply each mesh's `transform` to its local positions on the fly
+    // rather than re-baking them; transforms are usually identity for the
+    // SpaceGen Blender export but we don't want to assume it.
+    if (!scene.meshes.empty()) {
+        glm::vec3 mn( std::numeric_limits<float>::max());
+        glm::vec3 mx(-std::numeric_limits<float>::max());
+        for (const auto& m : scene.meshes) {
+            for (const auto& p : m.positions) {
+                glm::vec4 w = m.transform * glm::vec4(p, 1.0f);
+                mn = glm::min(mn, glm::vec3(w));
+                mx = glm::max(mx, glm::vec3(w));
+            }
+        }
+        scene.bboxMin  = mn;
+        scene.bboxMax  = mx;
+        scene.centroid = (mn + mx) * 0.5f;
+        std::printf("[Scene] World bbox: (%.2f, %.2f, %.2f) -> (%.2f, %.2f, %.2f), "
+                     "centroid (%.2f, %.2f, %.2f), dims (%.2f, %.2f, %.2f)\n",
+                     mn.x, mn.y, mn.z, mx.x, mx.y, mx.z,
+                     scene.centroid.x, scene.centroid.y, scene.centroid.z,
+                     mx.x - mn.x, mx.y - mn.y, mx.z - mn.z);
+    }
+
     std::printf("[Scene] loadFromFolder returning. %zu meshes in Scene.\n",
                  scene.meshes.size());
     std::fflush(stdout);

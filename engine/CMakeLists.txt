@@ -106,6 +106,24 @@ if(NOT TARGET tinygltf)
 endif()
 target_include_directories(tinygltf INTERFACE "${tinygltf_SOURCE_DIR}")
 
+# ---- xatlas (industry-standard automatic UV atlas generator). Used to
+#      synthesize a SyphonUV layer for the SyphonInputLayer when the
+#      Blender export has degenerate or partial UVs. C++ source, BSD-licensed.
+#      Single .h + .cpp; we add it manually as a static lib target. ----
+FetchContent_Declare(
+    xatlas
+    GIT_REPOSITORY https://github.com/jpcy/xatlas.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(xatlas)
+add_library(xatlas STATIC
+    ${xatlas_SOURCE_DIR}/source/xatlas/xatlas.cpp
+)
+target_include_directories(xatlas PUBLIC
+    ${xatlas_SOURCE_DIR}/source/xatlas
+)
+
 # ---- Dear ImGui (docking branch). Compiled into the spacegen binary
 #      directly; no library target. Uses GLFW + Metal backends. ----
 FetchContent_Declare(
@@ -141,6 +159,7 @@ add_executable(spacegen
     core/DirectionalLightLayer.cpp
     core/AmbientLightLayer.cpp
     core/SyphonInputLayer.mm
+    core/UvAtlas.cpp
     backends/metal/MetalRenderer.cpp
     gui/Workstation.mm
     ${IMGUI_SOURCES}
@@ -158,6 +177,7 @@ target_link_libraries(spacegen PRIVATE
     glm
     nlohmann_json::nlohmann_json
     tinygltf
+    xatlas
     "-framework Foundation"
     "-framework QuartzCore"
     "-framework Metal"

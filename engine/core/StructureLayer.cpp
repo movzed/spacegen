@@ -31,6 +31,9 @@ void StructureLayer::render(RenderContext& ctx) {
     int            syphonMode     = 0;       // 0 = Projector
     float          syphonTriplanar = 0.25f;
     bool           syphonFlipY    = false;
+    int            syphonCylAxis  = 0;
+    float          syphonWrapU    = 1.0f;
+    float          syphonWrapV    = 1.0f;
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -53,15 +56,26 @@ void StructureLayer::render(RenderContext& ctx) {
                     syphonMode      = static_cast<int>(s->projMode);
                     syphonTriplanar = s->triplanarScale;
                     syphonFlipY     = s->flipY;
+                    syphonCylAxis   = s->cylindricalAxis;
+                    syphonWrapU     = s->wrapU;
+                    syphonWrapV     = s->wrapV;
                 }
             }
         }
+    }
+    glm::vec3 bboxMin(0.0f), bboxMax(1.0f), centroid(0.0f);
+    if (ctx.scene) {
+        bboxMin  = ctx.scene->bboxMin;
+        bboxMax  = ctx.scene->bboxMax;
+        centroid = ctx.scene->centroid;
     }
     ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs,
                                           ambientColor,
                                           syphonTex, syphonMix, syphonTint,
                                           syphonMode, syphonTriplanar,
-                                          syphonFlipY);
+                                          syphonFlipY,
+                                          syphonCylAxis, syphonWrapU, syphonWrapV,
+                                          bboxMin, bboxMax, centroid);
 }
 
 void StructureLayer::drawInspector() {
