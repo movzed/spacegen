@@ -175,6 +175,36 @@ void processPrimitive(const tinygltf::Model& model,
         }
     }
 
+    // TEXCOORD_1 attribute (secondary UV set, used by SyphonInputLayer to
+    // project live video onto faces whose primary UVs are degenerate /
+    // missing). Same extraction shape as TEXCOORD_0. Optional — absence
+    // means the engine will fall back to UV0 or another mapping mode.
+    auto uv1It = prim.attributes.find("TEXCOORD_1");
+    if (uv1It != prim.attributes.end()) {
+        const auto& uvAcc = model.accessors[uv1It->second];
+        const auto& uvView = model.bufferViews[uvAcc.bufferView];
+        const auto& uvBuf  = model.buffers[uvView.buffer];
+        const auto* uvBytes = uvBuf.data.data()
+            + uvView.byteOffset + uvAcc.byteOffset;
+        const size_t uvStride = uvView.byteStride > 0
+            ? uvView.byteStride
+            : sizeof(float) * 2;
+        out.uvs1.resize(uvAcc.count);
+        if (uvStride == sizeof(float) * 2
+            && uvAcc.count == posAccessor.count) {
+            std::memcpy(out.uvs1.data(), uvBytes,
+                        sizeof(float) * 2 * uvAcc.count);
+        } else {
+            for (size_t i = 0; i < uvAcc.count; ++i) {
+                const float* p = reinterpret_cast<const float*>(uvBytes + i * uvStride);
+                out.uvs1[i] = glm::vec2(p[0], p[1]);
+            }
+        }
+        std::cerr << "[Scene] Mesh '" << out.name
+                  << "' has TEXCOORD_1 (" << uvAcc.count
+                  << " uvs) — using as SyphonUV.\n";
+    }
+
     // TANGENT attribute (for normal mapping). Optional.
     auto tanIt = prim.attributes.find("TANGENT");
     if (tanIt != prim.attributes.end()) {

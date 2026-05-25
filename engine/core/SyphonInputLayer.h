@@ -49,8 +49,9 @@ public:
         Projector = 0,   // NDC of scene camera (recommended for v1)
         Triplanar = 1,   // world-pos blended by |N| — UV-independent
         UV        = 2,   // mesh UV0 — depends on Blender unwrap quality
+        Auto      = 3,   // UV where the unwrap is valid, Projector elsewhere
     };
-    ProjMode projMode      = ProjMode::Projector;
+    ProjMode projMode      = ProjMode::Auto;
     float    triplanarScale = 0.25f;   // tiles per meter, only used by Triplanar
     bool     flipY          = false;   // toggle if the publisher sends upside-down
 

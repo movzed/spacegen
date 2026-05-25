@@ -140,9 +140,10 @@ void SyphonInputLayer::drawInspector() {
         "Projector (from camera POV)",
         "Triplanar (world-space tile)",
         "UV (mesh unwrap)",
+        "Auto (UV where valid, Projector elsewhere)",
     };
     int modeIdx = static_cast<int>(projMode);
-    if (ImGui::Combo("##symode", &modeIdx, kModeNames, 3)) {
+    if (ImGui::Combo("##symode", &modeIdx, kModeNames, 4)) {
         projMode = static_cast<ProjMode>(modeIdx);
     }
     if (projMode == ProjMode::Projector) {
@@ -152,9 +153,14 @@ void SyphonInputLayer::drawInspector() {
         ImGui::SliderFloat("Tile / meter##sytp", &triplanarScale,
                             0.01f, 4.0f, "%.3f");
         ImGui::TextDisabled("Tiles in world space, blended by normal.");
-    } else {
+    } else if (projMode == ProjMode::UV) {
         ImGui::TextDisabled("Uses mesh UV0. Needs a complete unwrap");
         ImGui::TextDisabled("or non-unwrapped faces show solid color.");
+    } else {
+        ImGui::TextDisabled("Detects per-fragment whether UV0 carries");
+        ImGui::TextDisabled("real unwrap data; on faces with collapsed");
+        ImGui::TextDisabled("UVs the engine falls back to Projector so");
+        ImGui::TextDisabled("they no longer render as solid color.");
     }
     ImGui::Checkbox("Flip Y##syflip", &flipY);
 

@@ -35,7 +35,8 @@ constant int   MAX_DIRS   = 4;
 struct VertexIn {
     float3 position [[attribute(0)]];
     float3 normal   [[attribute(1)]];
-    float2 uv       [[attribute(2)]];
+    float2 uv       [[attribute(2)]];   // UV0 — materials
+    float2 uv1      [[attribute(3)]];   // UV1 — Syphon overlay
 };
 
 struct VertexOut {
@@ -43,6 +44,7 @@ struct VertexOut {
     float3 worldPos;
     float3 worldNormal;
     float2 uv;
+    float2 uv1;
     float4 clipPos;   // pre-perspective-divide, used for Syphon Projector mode
 };
 
@@ -113,7 +115,8 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
     out.clipPos  = out.position;
     out.worldPos = world.xyz;
     out.worldNormal = (u.model * float4(in.normal, 0.0)).xyz;
-    out.uv = in.uv;
+    out.uv  = in.uv;
+    out.uv1 = in.uv1;
     return out;
 }
 
@@ -194,12 +197,38 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     //                  Independent of mesh UVs.
     //   2 UV        — mesh UV0. Only correct if the mesh has a complete
     //                  unwrap; non-unwrapped faces show solid color.
+    //   3 Auto      — sample by UV0 when |dfdx(uv)| + |dfdy(uv)| > eps
+    //                  (face has a real unwrap, gradient nonzero); fall back
+    //                  to Projector otherwise. Hybrid: unwrapped mask keeps
+    //                  its 3D feel, flat / non-unwrapped faces still receive
+    //                  the projection instead of collapsing to a solid color.
     int    syphonModeI = int(u.syphonParams.x + 0.5);
     float  tplScale    = u.syphonParams.y;
     bool   syphonFlipY = u.syphonParams.z > 0.5;
 
+    // For Auto mode: gradient of UV1 in screen space. Vanishingly small
+    // means every vertex of this primitive sampled the same UV1 → no real
+    // unwrap on the SyphonUV layer for this face.
+    bool   uvHasGradient = false;
+    if (syphonModeI == 3) {
+        float2 uvDx = dfdx(in.uv1);
+        float2 uvDy = dfdy(in.uv1);
+        float  uvGrad = abs(uvDx.x) + abs(uvDx.y)
+                      + abs(uvDy.x) + abs(uvDy.y);
+        uvHasGradient = uvGrad > 1e-6;
+    }
+
     float3 syphonSample = float3(0.0);
-    if (syphonModeI == 1) {
+
+    // Picks UV0 vs Projector for the Auto mode based on the per-fragment
+    // detection above.
+    bool autoUseUV = (syphonModeI == 3) && uvHasGradient;
+    bool useUV     = (syphonModeI == 2) || autoUseUV;
+    bool useTriplanar = (syphonModeI == 1);
+    bool useProjector = (syphonModeI == 0)
+                      || (syphonModeI == 3 && !uvHasGradient);
+
+    if (useTriplanar) {
         // ---- Triplanar (world position) ----
         float3 absN = abs(N);
         float  s    = max(absN.x + absN.y + absN.z, 1e-4);
@@ -211,13 +240,16 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
         syphonSample = syphonMap.sample(smp, uvX).rgb * bw.x
                      + syphonMap.sample(smp, uvY).rgb * bw.y
                      + syphonMap.sample(smp, uvZ).rgb * bw.z;
-    } else if (syphonModeI == 2) {
-        // ---- Mesh UV0 (legacy) ----
-        float2 uv = in.uv;
+    } else if (useUV) {
+        // ---- Mesh UV1 (SyphonUV) ----
+        // Sampled from the dedicated TEXCOORD_1 layer authored for the
+        // Syphon overlay, NOT the materials UV0. This is what makes the
+        // video survive on faces whose materials UVs were degenerate.
+        float2 uv = in.uv1;
         if (syphonFlipY) uv.y = 1.0 - uv.y;
         syphonSample = syphonMap.sample(smp, uv).rgb;
-    } else {
-        // ---- Projector (default) ----
+    } else if (useProjector) {
+        // ---- Projector ----
         // Perspective divide of the rendering camera's clip pos gives us
         // NDC; mapping [-1,1] → [0,1] gives the same coordinates the camera
         // would draw to the screen, so the Syphon image lands on every
@@ -374,6 +406,7 @@ MetalRenderer::~MetalRenderer() {
         if (gm.positionBuffer) gm.positionBuffer->release();
         if (gm.normalBuffer)   gm.normalBuffer->release();
         if (gm.uvBuffer)       gm.uvBuffer->release();
+        if (gm.uv1Buffer)      gm.uv1Buffer->release();
         if (gm.indexBuffer)    gm.indexBuffer->release();
     }
     releaseTexturePool();
@@ -481,7 +514,8 @@ void MetalRenderer::buildPipeline() {
     // Vertex descriptor:
     //   attribute(0) = position (float3) in buffer(0)
     //   attribute(1) = normal   (float3) in buffer(2)   <- buffer(1) is uniforms
-    //   attribute(2) = uv       (float2) in buffer(3)
+    //   attribute(2) = uv0      (float2) in buffer(3)   (materials)
+    //   attribute(3) = uv1      (float2) in buffer(4)   (Syphon overlay)
     MTL::VertexDescriptor* vd = MTL::VertexDescriptor::alloc()->init();
     auto* attr0 = vd->attributes()->object(0);
     attr0->setFormat(MTL::VertexFormatFloat3);
@@ -495,6 +529,10 @@ void MetalRenderer::buildPipeline() {
     attr2->setFormat(MTL::VertexFormatFloat2);
     attr2->setOffset(0);
     attr2->setBufferIndex(3);
+    auto* attr3 = vd->attributes()->object(3);
+    attr3->setFormat(MTL::VertexFormatFloat2);
+    attr3->setOffset(0);
+    attr3->setBufferIndex(4);
     auto* layout0 = vd->layouts()->object(0);
     layout0->setStride(sizeof(float) * 3);
     layout0->setStepFunction(MTL::VertexStepFunctionPerVertex);
@@ -504,6 +542,9 @@ void MetalRenderer::buildPipeline() {
     auto* layout3 = vd->layouts()->object(3);
     layout3->setStride(sizeof(float) * 2);
     layout3->setStepFunction(MTL::VertexStepFunctionPerVertex);
+    auto* layout4 = vd->layouts()->object(4);
+    layout4->setStride(sizeof(float) * 2);
+    layout4->setStepFunction(MTL::VertexStepFunctionPerVertex);
 
     MTL::RenderPipelineDescriptor* pd =
         MTL::RenderPipelineDescriptor::alloc()->init();
@@ -541,6 +582,7 @@ void MetalRenderer::loadScene(const Scene& scene) {
         if (gm.positionBuffer) gm.positionBuffer->release();
         if (gm.normalBuffer)   gm.normalBuffer->release();
         if (gm.uvBuffer)       gm.uvBuffer->release();
+        if (gm.uv1Buffer)      gm.uv1Buffer->release();
         if (gm.indexBuffer)    gm.indexBuffer->release();
     }
     gpuMeshes_.clear();
@@ -633,6 +675,26 @@ void MetalRenderer::loadScene(const Scene& scene) {
             std::vector<glm::vec2> fakeUVs(m.positions.size(),
                                             glm::vec2(0.0f, 0.0f));
             gm.uvBuffer = device_->newBuffer(
+                fakeUVs.data(), fakeUVs.size() * sizeof(glm::vec2),
+                MTL::ResourceStorageModeShared);
+        }
+
+        // UV1 buffer — dedicated to Syphon overlay. When the export carries
+        // a TEXCOORD_1 we use that; otherwise we mirror UV0 so the shader's
+        // attribute(3) stays bound and the Syphon mapping degrades to the
+        // legacy single-UV behavior on older scenes.
+        if (!m.uvs1.empty()) {
+            const size_t uvBytes = m.uvs1.size() * sizeof(glm::vec2);
+            gm.uv1Buffer = device_->newBuffer(
+                m.uvs1.data(), uvBytes, MTL::ResourceStorageModeShared);
+        } else if (!m.uvs.empty()) {
+            const size_t uvBytes = m.uvs.size() * sizeof(glm::vec2);
+            gm.uv1Buffer = device_->newBuffer(
+                m.uvs.data(), uvBytes, MTL::ResourceStorageModeShared);
+        } else {
+            std::vector<glm::vec2> fakeUVs(m.positions.size(),
+                                            glm::vec2(0.0f, 0.0f));
+            gm.uv1Buffer = device_->newBuffer(
                 fakeUVs.data(), fakeUVs.size() * sizeof(glm::vec2),
                 MTL::ResourceStorageModeShared);
         }
@@ -823,6 +885,7 @@ void MetalRenderer::renderStructureMeshes(
         enc->setVertexBuffer(gm.positionBuffer, 0, 0);
         enc->setVertexBuffer(gm.normalBuffer,   0, 2);
         enc->setVertexBuffer(gm.uvBuffer,       0, 3);
+        enc->setVertexBuffer(gm.uv1Buffer,      0, 4);
         enc->setVertexBytes(&u, sizeof(u), 1);
         enc->setFragmentBytes(&u, sizeof(u), 0);
 

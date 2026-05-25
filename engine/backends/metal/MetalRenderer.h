@@ -84,7 +84,8 @@ private:
     struct GpuMesh {
         MTL::Buffer* positionBuffer = nullptr;   // float3 positions
         MTL::Buffer* normalBuffer   = nullptr;   // float3 normals (may be null)
-        MTL::Buffer* uvBuffer       = nullptr;   // float2 UV0 (may be null)
+        MTL::Buffer* uvBuffer       = nullptr;   // float2 UV0 — materials
+        MTL::Buffer* uv1Buffer      = nullptr;   // float2 UV1 — Syphon overlay
         MTL::Buffer* indexBuffer    = nullptr;   // uint32 indices
         uint32_t     indexCount     = 0;
         glm::mat4    transform      = glm::mat4(1.0f);

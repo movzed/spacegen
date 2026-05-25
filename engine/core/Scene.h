@@ -63,7 +63,8 @@ struct MeshData {
     std::string             name;
     std::vector<glm::vec3>  positions;
     std::vector<glm::vec3>  normals;     // empty if glTF primitive had no NORMAL attribute
-    std::vector<glm::vec2>  uvs;         // empty if no TEXCOORD_0
+    std::vector<glm::vec2>  uvs;         // empty if no TEXCOORD_0 (materials)
+    std::vector<glm::vec2>  uvs1;        // empty if no TEXCOORD_1 (Syphon / overlay)
     std::vector<glm::vec3>  tangents;    // empty if no TANGENT attribute (for normal mapping)
     std::vector<uint32_t>   indices;
     glm::mat4               transform   = glm::mat4(1.0f);
