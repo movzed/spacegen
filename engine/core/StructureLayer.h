@@ -34,6 +34,16 @@ public:
     //                    compositing in Resolume on top of Blender plates.
     bool      emitLightsOnly = false;
 
+    // Stretch heatmap diagnostic. When enabled, the structure renders as a
+    // viridis-like heatmap of per-fragment UV distortion instead of the
+    // normal material / Syphon composition. Driven by the UV Analysis panel.
+    //   stretchMetric: 0 = stretch ratio (ideal 1.0), 1 = symmetric Dirichlet
+    //                  energy density (ideal 4.0).
+    //   stretchUV:     0 = measure UV0 (PRT_UVW), 1 = measure UV1 (atlas).
+    bool      showStretchHeatmap = false;
+    int       stretchMetric      = 0;
+    int       stretchUV          = 1;
+
     // ---- 3D mesh effects (vertex displacement) ----
     // displaceAmount: meters of outward displacement along the vertex normal,
     //   modulated by hash-noise. 0 = no effect. Operator can animate via

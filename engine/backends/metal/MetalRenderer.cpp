@@ -68,7 +68,9 @@ struct Uniforms {
     float4    baseColorRoughness;   // .rgb operator tint, .a operator roughness multiplier
     float4    metallicCounts;       // .x metallic operator, .z spotCount, .w dirCount
     float4    ambientColor;         // .rgb ambient fill, .a unused
-    float4    modeFlags;            // .x emitLightsOnly (0/1), others reserved
+    float4    modeFlags;            // .x emitLightsOnly, .y heatmapEnabled,
+                                     // .z heatmapMetric (0=ratio,1=symDir),
+                                     // .w heatmapUV (0=uv0, 1=uv1)
     float4    matBaseColor;         // .rgba material baseColorFactor (texture multiplier)
     float4    matEmissive;          // .rgb material emissiveFactor
     float4    matMR;                // .x metallicFactor, .y roughnessFactor
@@ -176,6 +178,56 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
 {
     float3 N = normalize(in.worldNormal);
     float3 V = normalize(u.cameraWorldPos.xyz - in.worldPos);
+
+    // ---- Tier 2: Stretch heatmap diagnostic ----------------------------
+    // When enabled, the structure renders as a viridis-like heatmap of per-
+    // fragment UV distortion. We derive the singular values σ₁, σ₂ of the
+    // Jacobian (UV → world) from screen-space derivatives — no precomputed
+    // tables needed. Two metrics are supported (per modeFlags.z):
+    //   0: stretch ratio   = max(σ₁/σ₂, σ₂/σ₁)        ideal 1.0
+    //   1: symmetric Dir.  = σ₁² + σ₂² + σ₁⁻² + σ₂⁻²  ideal 4.0
+    // modeFlags.w selects which UV layer to measure (0=uv0, 1=uv1).
+    // Returns early bypassing lighting so the operator sees a flat diagnostic
+    // overlay — easier to reason about than a lit version.
+    if (u.modeFlags.y > 0.5) {
+        int    metric = int(u.modeFlags.z + 0.5);
+        int    uvSel  = int(u.modeFlags.w + 0.5);
+        float2 selUv  = (uvSel == 1) ? in.uv1 : in.uv;
+        float2 dUx = dfdx(selUv);
+        float2 dUy = dfdy(selUv);
+        float3 dWx = dfdx(in.worldPos);
+        float3 dWy = dfdy(in.worldPos);
+        float  det = dUx.x * dUy.y - dUx.y * dUy.x;
+        float3 heat = float3(1.0, 0.0, 0.0);   // degenerate UV → pure red
+        if (abs(det) > 1e-12) {
+            float invDet = 1.0 / det;
+            float3 J_u = ( dUy.y * dWx - dUx.y * dWy) * invDet;
+            float3 J_v = (-dUy.x * dWx + dUx.x * dWy) * invDet;
+            float a = dot(J_u, J_u);
+            float b = dot(J_u, J_v);
+            float c = dot(J_v, J_v);
+            float tr   = a + c;
+            float diff = (a - c) * 0.5;
+            float disc = sqrt(max(diff*diff + b*b, 0.0));
+            float l1 = max(tr * 0.5 + disc, 1e-12);
+            float l2 = max(tr * 0.5 - disc, 1e-12);
+            float s1 = sqrt(l1), s2 = sqrt(l2);
+            float distortion = (metric == 1)
+                ? (l1 + l2 + 1.0/l1 + 1.0/l2)
+                : max(s1/max(s2, 1e-6), s2/max(s1, 1e-6));
+            float ideal = (metric == 1) ? 4.0 : 1.0;
+            float t = saturate((distortion - ideal) / 4.0);
+            heat = mix(mix(mix(
+                float3(1.00, 1.00, 1.00),
+                float3(0.20, 0.85, 0.95),
+                saturate(t / 0.25)),
+                float3(0.30, 0.85, 0.30),
+                saturate((t - 0.25) / 0.25)),
+                float3(0.95, 0.30, 0.20),
+                saturate((t - 0.50) / 0.50));
+        }
+        return float4(heat, 1.0);
+    }
 
     // Sample material textures (default-bound to 1x1 fallbacks when material
     // has no texture for that channel).
@@ -691,7 +743,10 @@ void MetalRenderer::renderStructureMeshes(
     MTL::Texture* syphonTex,
     float          syphonMix,
     const glm::vec3& syphonTint,
-    bool           syphonFlipY)
+    bool           syphonFlipY,
+    bool           showHeatmap,
+    int            heatmapMetric,
+    int            heatmapUV)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -797,7 +852,9 @@ void MetalRenderer::renderStructureMeshes(
                                           static_cast<float>(dirCount));
         u.ambientColor       = glm::vec4(ambientColor, 0.0f);
         u.modeFlags          = glm::vec4(layer.emitLightsOnly ? 1.0f : 0.0f,
-                                          0.0f, 0.0f, 0.0f);
+                                          showHeatmap         ? 1.0f : 0.0f,
+                                          static_cast<float>(heatmapMetric),
+                                          static_cast<float>(heatmapUV));
         u.matBaseColor       = mat.baseColorFactor;
         u.matEmissive        = glm::vec4(mat.emissiveFactor, 0.0f);
         u.matMR              = glm::vec4(mat.metallicFactor,

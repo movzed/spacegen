@@ -53,7 +53,9 @@ void StructureLayer::render(RenderContext& ctx) {
     ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs,
                                           ambientColor,
                                           syphonTex, syphonMix, syphonTint,
-                                          syphonFlipY);
+                                          syphonFlipY,
+                                          showStretchHeatmap,
+                                          stretchMetric, stretchUV);
 }
 
 void StructureLayer::drawInspector() {

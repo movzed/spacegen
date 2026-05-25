@@ -562,6 +562,56 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
         }
     }
 
+    // ---- Tier 2: Stretch heatmap diagnostic ----
+    ImGui::Separator();
+    // Find the StructureLayer in the bus to mutate its heatmap flags.
+    spacegen::StructureLayer* slayer = nullptr;
+    for (auto& l : scene.bus.layers) {
+        if (auto* sl = dynamic_cast<spacegen::StructureLayer*>(l.get())) {
+            slayer = sl; break;
+        }
+    }
+    if (slayer) {
+        ImGui::TextDisabled("Stretch heatmap diagnostic");
+        ImGui::Checkbox("Show stretch heatmap##sh", &slayer->showStretchHeatmap);
+        if (slayer->showStretchHeatmap) {
+            static const char* kMetricNames[] = {
+                "Stretch ratio (ideal 1.0)",
+                "Symmetric Dirichlet energy (ideal 4.0)",
+            };
+            ImGui::Combo("Metric##shm", &slayer->stretchMetric,
+                          kMetricNames, 2);
+            static const char* kUVNames[] = {
+                "UV0 (Blender PRT_UVW)",
+                "UV1 (xatlas atlas)",
+            };
+            ImGui::Combo("Measure##shu", &slayer->stretchUV,
+                          kUVNames, 2);
+            // Legend strip: white → cyan → green → red gradient
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2  p0 = ImGui::GetCursorScreenPos();
+            float   w  = ImGui::GetContentRegionAvail().x - 8.0f;
+            float   h  = 14.0f;
+            const ImU32 cols[] = {
+                IM_COL32(255, 255, 255, 255),
+                IM_COL32( 51, 217, 242, 255),
+                IM_COL32( 77, 217,  77, 255),
+                IM_COL32(242,  77,  51, 255),
+            };
+            float seg = w / 3.0f;
+            for (int i = 0; i < 3; ++i) {
+                dl->AddRectFilledMultiColor(
+                    ImVec2(p0.x + i * seg,       p0.y),
+                    ImVec2(p0.x + (i + 1) * seg, p0.y + h),
+                    cols[i], cols[i + 1], cols[i + 1], cols[i]);
+            }
+            ImGui::Dummy(ImVec2(w, h));
+            ImGui::TextDisabled("white = ideal     cyan ~ minor     "
+                                 "green ~ moderate     red = broken");
+            ImGui::TextDisabled("(Lighting bypassed in heatmap mode.)");
+        }
+    }
+
     // ---- xatlas regenerate ----
     ImGui::Separator();
     ImGui::TextDisabled("Regenerate SyphonUV with xatlas");

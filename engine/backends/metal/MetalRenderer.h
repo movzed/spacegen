@@ -58,7 +58,11 @@ public:
         MTL::Texture* syphonTex    = nullptr,   // optional live video overlay
         float          syphonMix   = 0.0f,
         const glm::vec3& syphonTint = glm::vec3(1.0f),
-        bool           syphonFlipY = false);
+        bool           syphonFlipY = false,
+        // Tier 2: stretch heatmap diagnostic
+        bool           showHeatmap = false,
+        int            heatmapMetric = 0,
+        int            heatmapUV     = 1);
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.
