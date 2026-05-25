@@ -22,6 +22,7 @@
 #include "../core/AmbientLightLayer.h"
 #include "../core/SyphonInputLayer.h"
 #include "../core/UvAtlas.h"
+#include "../core/UvAtlasGeogram.h"
 #include "../core/UvOptimize.h"
 #include "../backends/metal/MetalRenderer.h"
 
@@ -404,6 +405,11 @@ static UvAnalysisState gUvState;
 static bool  gUvSharpPreCut   = true;
 static float gUvSharpAngleDeg = 35.0f;
 
+// Tier 4 — atlas engine selector. 0 = xatlas (default), 1 = geogram
+// (Spectral LSCM + Tetris). Geogram option only useful when the engine
+// was built with -DSPACEGEN_ENABLE_GEOGRAM=ON.
+static int   gUvAtlasEngine = 0;
+
 // Tier 3 — SpaceGen Optimize (SLIM-based projection-aware refinement).
 static bool  gUvOptimizeRefine     = true;
 static int   gUvOptimizeMaxIter    = 12;
@@ -630,6 +636,25 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                         "boundaries onto geometric creases — invisible "
                         "in projection — followed by big-chart packing.");
 
+    // Tier-4 controls: atlas engine selector
+    {
+        static const char* kEngineNames[] = {
+            "xatlas (default)",
+            "geogram (Spectral LSCM + Tetris)",
+        };
+        ImGui::Combo("Atlas engine##eng", &gUvAtlasEngine, kEngineNames, 2);
+        if (gUvAtlasEngine == 1 && !spacegen::geogramAvailable()) {
+            ImVec4 warn(0.95f, 0.40f, 0.30f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, warn);
+            ImGui::TextWrapped("Geogram not compiled in this build. "
+                                "Rebuild with -DSPACEGEN_ENABLE_GEOGRAM=ON.");
+            ImGui::PopStyleColor();
+        } else if (gUvAtlasEngine == 1) {
+            ImGui::TextDisabled("Bruno Lévy's geogram: Spectral LSCM (no");
+            ImGui::TextDisabled("pin bias) + Tetris packing. ~50K LOC, BSD-3.");
+        }
+    }
+
     // Tier-1 controls: Sharp Edges pre-cut
     ImGui::Checkbox("Sharp Edges pre-cut (Tier 1)##sharp", &gUvSharpPreCut);
     if (gUvSharpPreCut) {
@@ -696,9 +721,10 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
             float refineExp  = gUvOptimizeVisExp;
             float refineFloor = gUvOptimizeVisFloor;
             bool  refineProj = gUvOptimizeProjAware;
+            int   atlasEngine = gUvAtlasEngine;
 
             gUvState.worker = std::make_unique<std::thread>(
-                [meshPtr, cacheStr, viewDir,
+                [meshPtr, cacheStr, viewDir, atlasEngine,
                  doRefine, refineIter, refineExp, refineFloor, refineProj]() {
                     // Top-tier VJ mapping options. Defaults in xatlas are
                     // tuned for LIGHTMAPS (many small charts, tight
@@ -733,9 +759,13 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                         working = spacegen::preCutOnSharpEdges(
                             working, opts.sharpEdgeAngleDeg);
                     }
+                    // Dispatch to selected backend.
                     auto res = std::make_unique<spacegen::UvAtlasResult>(
-                        spacegen::generateAtlas(working, opts,
-                                                uvWorkerProgress, &gUvState));
+                        atlasEngine == 1
+                            ? spacegen::generateAtlasGeogram(working, opts,
+                                  uvWorkerProgress, &gUvState)
+                            : spacegen::generateAtlas(working, opts,
+                                  uvWorkerProgress, &gUvState));
                     // ---- Tier 3: SpaceGen Optimize refinement ----
                     // After xatlas returns a valid atlas, refine each chart
                     // with SLIM + projection-aware weighting. The refined

@@ -106,6 +106,33 @@ if(NOT TARGET tinygltf)
 endif()
 target_include_directories(tinygltf INTERFACE "${tinygltf_SOURCE_DIR}")
 
+# ---- Optional alternative UV atlas backend (Tier 4).
+#      Off by default. Enable with: cmake -DSPACEGEN_ENABLE_GEOGRAM=ON ..
+#      Uses Bruno Lévy's geogram (BSD-3, ~50K LOC, Spectral LSCM + Tetris
+#      packing). Builds add ~3-5 min on M1 Max; left optional so the
+#      default build path stays lean.
+option(SPACEGEN_ENABLE_GEOGRAM
+       "Build the geogram-based UV atlas backend (Tier 4)" OFF)
+if(SPACEGEN_ENABLE_GEOGRAM)
+    set(GEOGRAM_WITH_GRAPHICS    OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_LUA         OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_HLBFGS      OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_TETGEN      OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_TRIANGLE    OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_EXPLORAGRAM OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        geogram
+        GIT_REPOSITORY https://github.com/BrunoLevy/geogram.git
+        GIT_TAG        v1.9.1
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(geogram)
+    add_compile_definitions(SPACEGEN_HAVE_GEOGRAM=1)
+    message(STATUS "spacegen: Geogram (Tier 4) ENABLED")
+else()
+    message(STATUS "spacegen: Geogram (Tier 4) disabled (default)")
+endif()
+
 # ---- Eigen 3.4 (sparse linear algebra for SpaceGen Optimize / SLIM).
 #      Header-only, MPL2 (compatible). Used by core/UvOptimize.cpp for the
 #      symmetric Dirichlet proximal step (SimplicialLDLT sparse Cholesky). ----
@@ -174,6 +201,7 @@ add_executable(spacegen
     core/AmbientLightLayer.cpp
     core/SyphonInputLayer.mm
     core/UvAtlas.cpp
+    core/UvAtlasGeogram.cpp
     core/UvOptimize.cpp
     backends/metal/MetalRenderer.cpp
     gui/Workstation.mm
@@ -194,6 +222,7 @@ target_link_libraries(spacegen PRIVATE
     tinygltf
     xatlas
     Eigen3::Eigen
+    $<$<BOOL:${SPACEGEN_ENABLE_GEOGRAM}>:geogram>
     "-framework Foundation"
     "-framework QuartzCore"
     "-framework Metal"
