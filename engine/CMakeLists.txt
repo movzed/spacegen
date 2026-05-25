@@ -106,6 +106,20 @@ if(NOT TARGET tinygltf)
 endif()
 target_include_directories(tinygltf INTERFACE "${tinygltf_SOURCE_DIR}")
 
+# ---- Eigen 3.4 (sparse linear algebra for SpaceGen Optimize / SLIM).
+#      Header-only, MPL2 (compatible). Used by core/UvOptimize.cpp for the
+#      symmetric Dirichlet proximal step (SimplicialLDLT sparse Cholesky). ----
+FetchContent_Declare(
+    eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG        3.4.0
+    GIT_SHALLOW    TRUE
+)
+set(EIGEN_BUILD_DOC     OFF CACHE BOOL "" FORCE)
+set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING       OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(eigen)
+
 # ---- xatlas (industry-standard automatic UV atlas generator). Used to
 #      synthesize a SyphonUV layer for the SyphonInputLayer when the
 #      Blender export has degenerate or partial UVs. C++ source, BSD-licensed.
@@ -160,6 +174,7 @@ add_executable(spacegen
     core/AmbientLightLayer.cpp
     core/SyphonInputLayer.mm
     core/UvAtlas.cpp
+    core/UvOptimize.cpp
     backends/metal/MetalRenderer.cpp
     gui/Workstation.mm
     ${IMGUI_SOURCES}
@@ -178,6 +193,7 @@ target_link_libraries(spacegen PRIVATE
     nlohmann_json::nlohmann_json
     tinygltf
     xatlas
+    Eigen3::Eigen
     "-framework Foundation"
     "-framework QuartzCore"
     "-framework Metal"

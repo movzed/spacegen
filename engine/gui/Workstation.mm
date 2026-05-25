@@ -22,6 +22,7 @@
 #include "../core/AmbientLightLayer.h"
 #include "../core/SyphonInputLayer.h"
 #include "../core/UvAtlas.h"
+#include "../core/UvOptimize.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
@@ -403,6 +404,13 @@ static UvAnalysisState gUvState;
 static bool  gUvSharpPreCut   = true;
 static float gUvSharpAngleDeg = 35.0f;
 
+// Tier 3 — SpaceGen Optimize (SLIM-based projection-aware refinement).
+static bool  gUvOptimizeRefine     = true;
+static int   gUvOptimizeMaxIter    = 12;
+static float gUvOptimizeVisExp     = 1.5f;
+static float gUvOptimizeVisFloor   = 0.10f;
+static bool  gUvOptimizeProjAware  = true;
+
 // xatlas progress trampoline. Runs on the worker thread; writes to atomics
 // that the main thread reads each frame. Returns false when the operator
 // has clicked Cancel — xatlas then aborts the current phase.
@@ -415,6 +423,8 @@ static bool uvWorkerProgress(int pct, const char* stageName, void* user) {
         else if (std::strstr(stageName, "Detecting")) stageId = 2;
         else if (std::strstr(stageName, "Packing"))   stageId = 3;
         else if (std::strstr(stageName, "Building"))  stageId = 4;
+        else if (std::strstr(stageName, "Refining"))  stageId = 6;
+        else if (std::strstr(stageName, "Extracting") || std::strstr(stageName, "Preparing")) stageId = 6;
     }
     s->stageId.store(stageId);
     s->progressPct.store(pct);
@@ -621,7 +631,7 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                         "in projection — followed by big-chart packing.");
 
     // Tier-1 controls: Sharp Edges pre-cut
-    ImGui::Checkbox("Sharp Edges pre-cut##sharp", &gUvSharpPreCut);
+    ImGui::Checkbox("Sharp Edges pre-cut (Tier 1)##sharp", &gUvSharpPreCut);
     if (gUvSharpPreCut) {
         ImGui::SliderFloat("Dihedral threshold (°)##ang",
                             &gUvSharpAngleDeg, 5.0f, 90.0f, "%.1f°");
@@ -629,6 +639,27 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
         ImGui::TextDisabled("chart boundaries. Lower = more seams on creases.");
     } else {
         ImGui::TextDisabled("Off: xatlas picks seams freely (may cut mid-surface).");
+    }
+
+    // Tier-3 controls: SpaceGen Optimize (SLIM refinement)
+    ImGui::Separator();
+    ImGui::Checkbox("SpaceGen Optimize SLIM refinement (Tier 3)##refine",
+                     &gUvOptimizeRefine);
+    if (gUvOptimizeRefine) {
+        ImGui::SliderInt("Iterations##it", &gUvOptimizeMaxIter, 1, 40);
+        ImGui::Checkbox("Projection-aware weighting##paw",
+                         &gUvOptimizeProjAware);
+        if (gUvOptimizeProjAware) {
+            ImGui::SliderFloat("View weight exponent##exp",
+                                &gUvOptimizeVisExp, 0.5f, 4.0f, "%.2f");
+            ImGui::SliderFloat("Back-face floor##floor",
+                                &gUvOptimizeVisFloor, 0.0f, 1.0f, "%.2f");
+            ImGui::TextDisabled("Faces facing the camera get higher SLIM");
+            ImGui::TextDisabled("budget; grazing facets accept more stretch.");
+        }
+        ImGui::TextDisabled("Based on Rabinovich et al. SIGGRAPH 2017 +");
+        ImGui::TextDisabled("our original projection-aware weighting.");
+        ImGui::TextDisabled("Runs after xatlas. Adds ~30s on dense meshes.");
     }
 
     // Decide what to render based on the worker status.
@@ -655,9 +686,20 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
 
             const spacegen::MeshData* meshPtr = &m;
             std::string cacheStr = cachePath.string();
+            // Capture view direction from the scene's camera at click time.
+            // Camera-forward = -Z column of the camera-to-world matrix.
+            glm::vec3 viewDir = -glm::vec3(scene.camera.world[2]);
+            // Capture optimize options at click time so toggling sliders
+            // during a run doesn't affect the in-flight worker.
+            bool  doRefine   = gUvOptimizeRefine;
+            int   refineIter = gUvOptimizeMaxIter;
+            float refineExp  = gUvOptimizeVisExp;
+            float refineFloor = gUvOptimizeVisFloor;
+            bool  refineProj = gUvOptimizeProjAware;
 
             gUvState.worker = std::make_unique<std::thread>(
-                [meshPtr, cacheStr]() {
+                [meshPtr, cacheStr, viewDir,
+                 doRefine, refineIter, refineExp, refineFloor, refineProj]() {
                     // Top-tier VJ mapping options. Defaults in xatlas are
                     // tuned for LIGHTMAPS (many small charts, tight
                     // packing) — wrong for live video. We:
@@ -694,6 +736,38 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                     auto res = std::make_unique<spacegen::UvAtlasResult>(
                         spacegen::generateAtlas(working, opts,
                                                 uvWorkerProgress, &gUvState));
+                    // ---- Tier 3: SpaceGen Optimize refinement ----
+                    // After xatlas returns a valid atlas, refine each chart
+                    // with SLIM + projection-aware weighting. The refined
+                    // uvs1 stays packed because boundary verts stay anchored.
+                    if (res->ok && doRefine && !gUvState.shouldCancel.load()) {
+                        gUvState.stageId.store(6);          // "Refining (SLIM)"
+                        gUvState.progressPct.store(0);
+                        // Stitch xatlas output into a temporary MeshData so
+                        // optimiseUVs has the post-atlas positions+indices.
+                        spacegen::MeshData refined;
+                        refined.name        = meshPtr->name;
+                        refined.transform   = meshPtr->transform;
+                        refined.materialIdx = meshPtr->materialIdx;
+                        refined.positions   = res->positions;
+                        refined.normals     = res->normals;
+                        refined.uvs         = res->uvs0;
+                        refined.uvs1        = res->uvs1;
+                        refined.indices     = res->indices;
+
+                        spacegen::UvOptimizeOptions oopts;
+                        oopts.maxIterations    = refineIter;
+                        oopts.visExponent      = refineExp;
+                        oopts.visFloor         = refineFloor;
+                        oopts.projectionAware  = refineProj;
+                        oopts.viewDir          = viewDir;
+
+                        auto oRes = spacegen::optimiseUVs(refined, oopts,
+                            uvWorkerProgress, &gUvState);
+                        if (oRes.ok) {
+                            res->uvs1 = std::move(oRes.refinedUVs);
+                        }
+                    }
                     auto t1 = std::chrono::steady_clock::now();
                     double secs =
                         std::chrono::duration<double>(t1 - t0).count();
@@ -752,9 +826,10 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
             "Packing atlas (brute force)",
             "Building output mesh",
             "Saving cache to disk",
+            "SpaceGen Optimize (SLIM refining)",
         };
         int stage = gUvState.stageId.load();
-        if (stage < 0 || stage > 5) stage = 0;
+        if (stage < 0 || stage > 6) stage = 0;
         int pct = gUvState.progressPct.load();
 
         double startTs = gUvState.startTimeSec.load();
@@ -764,7 +839,7 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
         double elapsed = nowTs - startTs;
 
         ImGui::TextUnformatted("Running xatlas on worker thread...");
-        ImGui::TextDisabled("Stage %d/5: %s", stage, stageNames[stage]);
+        ImGui::TextDisabled("Stage %d/6: %s", stage, stageNames[stage]);
 
         char overlay[96];
         std::snprintf(overlay, sizeof(overlay), "%d%%  (%.1fs)",
