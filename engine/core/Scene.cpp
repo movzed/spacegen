@@ -579,6 +579,7 @@ Scene Scene::loadFromFolder(const std::string& folderPath) {
                 m.uvs       = std::move(atlas.uvs0);
                 m.uvs1      = std::move(atlas.uvs1);
                 m.indices   = std::move(atlas.indices);
+                scene.atlasApplied = true;
             } else {
                 std::printf("[Scene] xatlas cache exists but couldn't load "
                              "(stale or corrupt). Ignoring; mesh keeps glTF UVs.\n");

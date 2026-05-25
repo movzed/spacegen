@@ -25,15 +25,10 @@ void StructureLayer::render(RenderContext& ctx) {
     std::vector<const BeamLayer*>             spots;
     std::vector<const DirectionalLightLayer*> dirs;
     glm::vec3 ambientColor(0.0f);
-    MTL::Texture*  syphonTex      = nullptr;
-    float          syphonMix      = 0.0f;
+    MTL::Texture*  syphonTex   = nullptr;
+    float          syphonMix   = 0.0f;
     glm::vec3      syphonTint(1.0f);
-    int            syphonMode     = 0;       // 0 = Projector
-    float          syphonTriplanar = 0.25f;
-    bool           syphonFlipY    = false;
-    int            syphonCylAxis  = 0;
-    float          syphonWrapU    = 1.0f;
-    float          syphonWrapV    = 1.0f;
+    bool           syphonFlipY = false;
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -46,36 +41,19 @@ void StructureLayer::render(RenderContext& ctx) {
             } else if (auto* a = dynamic_cast<const AmbientLightLayer*>(l.get())) {
                 ambientColor += a->color * (a->intensity * a->opacity);
             } else if (auto* s = dynamic_cast<SyphonInputLayer*>(l.get())) {
-                // First enabled Syphon input wins. We mutate via a const_cast
-                // because s->render() was called earlier in the bus walk; here
-                // we only query the cached current texture.
                 if (!syphonTex) {
-                    syphonTex       = s->currentTexture();
-                    syphonMix       = s->mix * s->opacity;
-                    syphonTint      = s->tint;
-                    syphonMode      = static_cast<int>(s->projMode);
-                    syphonTriplanar = s->triplanarScale;
-                    syphonFlipY     = s->flipY;
-                    syphonCylAxis   = s->cylindricalAxis;
-                    syphonWrapU     = s->wrapU;
-                    syphonWrapV     = s->wrapV;
+                    syphonTex   = s->currentTexture();
+                    syphonMix   = s->mix * s->opacity;
+                    syphonTint  = s->tint;
+                    syphonFlipY = s->flipY;
                 }
             }
         }
     }
-    glm::vec3 bboxMin(0.0f), bboxMax(1.0f), centroid(0.0f);
-    if (ctx.scene) {
-        bboxMin  = ctx.scene->bboxMin;
-        bboxMax  = ctx.scene->bboxMax;
-        centroid = ctx.scene->centroid;
-    }
     ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs,
                                           ambientColor,
                                           syphonTex, syphonMix, syphonTint,
-                                          syphonMode, syphonTriplanar,
-                                          syphonFlipY,
-                                          syphonCylAxis, syphonWrapU, syphonWrapV,
-                                          bboxMin, bboxMax, centroid);
+                                          syphonFlipY);
 }
 
 void StructureLayer::drawInspector() {

@@ -36,36 +36,24 @@ public:
     float mix = 1.0f;
     // Tint multiplied with the Syphon sample (vec3). Default white.
     glm::vec3 tint = glm::vec3(1.0f);
+    // Toggle if the publisher sends upside-down frames.
+    bool      flipY = false;
 
-    // How the video is mapped onto the structure. For projection-mapping work
-    // the default (Projector) behaves like a real video projector: the image
-    // is projected from the scene camera's POV, independent of the mesh UVs.
-    // This is what you want for buildings where Blender unwraps are partial
-    // or non-existent. UV mode (legacy) needs a proper unwrap on every face
-    // to avoid degenerate-UV "solid color" patches. Triplanar tiles the
-    // image in world space using the surface normal as the blend basis —
-    // useful for textures/patterns rather than narrative video.
-    enum class ProjMode : int {
-        Projector   = 0,   // NDC of scene camera
-        Triplanar   = 1,   // world-pos blended by |N| — UV-independent
-        UV          = 2,   // mesh UV1 — depends on Blender unwrap quality
-        Auto        = 3,   // UV where the unwrap is valid, Projector elsewhere
-        Cylindrical = 4,   // wrap around scene bbox axis (continuous, "alive")
-        Spherical   = 5,   // wrap around scene centroid (continuous, "alive")
-    };
-    ProjMode projMode      = ProjMode::Cylindrical;
-    float    triplanarScale = 0.25f;   // tiles per meter, only used by Triplanar
-    bool     flipY          = false;   // toggle if the publisher sends upside-down
-
-    // For Cylindrical: which world axis the cylinder wraps around.
-    // 0 = X (good for an X-elongated stage), 1 = Y, 2 = Z.
-    int      cylindricalAxis = 0;
-    // Tiles along the wrap axis (U direction). 1 = video wraps once around
-    // the geometry. Increase to repeat the video around it.
-    float    wrapU = 1.0f;
-    // Tiles along the longitudinal axis (V direction). 1 = video spans
-    // the full length of the structure once.
-    float    wrapV = 1.0f;
+    // The Syphon video is ALWAYS sampled by the mesh's UVs, with a single
+    // per-fragment hybrid rule:
+    //
+    //   - Where the original Blender unwrap (UV0 / PRT_UVW) carries real
+    //     data (the screen-space gradient of uv is nonzero on that face),
+    //     the shader samples by UV0. This preserves the artist's intent on
+    //     the unwrapped mask.
+    //
+    //   - Where UV0 is degenerate (all 3 verts of the triangle collapsed
+    //     to the same UV point — no unwrap), the shader falls back to UV1
+    //     (the xatlas-generated atlas). The atlas is tuned for FEW LARGE
+    //     charts so the video flows continuously across the gap with
+    //     minimal stretching.
+    //
+    // No mode toggle. The decision is automatic per-fragment.
 
     // Returns the last received Metal texture (may be null if no frame yet).
     MTL::Texture* currentTexture() const;

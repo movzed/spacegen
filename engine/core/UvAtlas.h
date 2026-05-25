@@ -59,14 +59,36 @@ struct UvAtlasOptions {
                                          // doesn't bleed from neighbor charts
     bool  blockAlign          = false;
     bool  bruteForcePack      = false;  // slower, better packing density
+
+    // ---- Pre-cut on sharp edges (RizomUV "Sharp Edges" algorithm) ----
+    // Before charting, split the mesh at edges where the dihedral angle
+    // between adjacent face normals exceeds `sharpEdgeAngleDeg`. xatlas
+    // then sees these edges as topological discontinuities and ALWAYS
+    // places chart boundaries there. Result: seams land on geometric
+    // creases (invisible in projection) instead of mid-surface.
+    bool  preCutSharpEdges    = true;
+    float sharpEdgeAngleDeg   = 35.0f;  // threshold in degrees, 0-180
 };
+
+// Pre-cut a mesh on edges sharper than `angleDeg`. For each manifold edge
+// whose two adjacent triangles have normals differing by more than the
+// threshold, the mesh is "split" by duplicating vertices on one side so
+// the two triangles no longer share that edge in the index buffer.
+//
+// Output preserves positions/normals/uvs (duplicated as needed) and
+// indices, but vertex count grows by ~2 × (number of sharp edges).
+MeshData preCutOnSharpEdges(const MeshData& mesh, float angleDeg);
 
 // Run xatlas on a mesh. Single-mesh: SpaceGen scenes have one structure mesh
 // in the v1 schema. Returns a fully rebuilt mesh in the result.
 //
-// `progressCb` is optional — called with (stagePct, stageName) during run.
-// Use it to drive an ImGui progress bar. May be empty.
-using ProgressFn = void(*)(int progressPct, const char* stageName, void* user);
+// `progressCb` is optional — called with (stagePct, stageName, user) during
+// the xatlas run. Return `true` to continue, `false` to cancel; xatlas
+// honors cancellation between phases. Use it to drive an ImGui progress
+// bar and a cancel button. Called FROM THE THREAD that runs generateAtlas,
+// so if you run xatlas on a worker thread, the callback runs there too —
+// use atomics for any state shared with the UI thread.
+using ProgressFn = bool(*)(int progressPct, const char* stageName, void* user);
 UvAtlasResult generateAtlas(const MeshData& mesh,
                              const UvAtlasOptions& opts = {},
                              ProgressFn progressCb = nullptr,

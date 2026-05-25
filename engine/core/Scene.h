@@ -110,11 +110,16 @@ struct Scene {
     ModulatorBank               modulators;
 
     // Aggregate world-space bounds + centroid across all loaded meshes
-    // (after applying each mesh's `transform`). Used by the renderer for
-    // shader-side parametric Syphon mappings (cylindrical / spherical).
+    // (after applying each mesh's `transform`).
     glm::vec3               bboxMin  = glm::vec3(0.0f);
     glm::vec3               bboxMax  = glm::vec3(0.0f);
     glm::vec3               centroid = glm::vec3(0.0f);
+
+    // True when the xatlas-generated UV atlas (uv1_atlas.bin) is currently
+    // bound to the mesh's TEXCOORD_1 / uvs1. Set by Scene::loadFromFolder
+    // when the cache is read on startup, and by the UV Analysis panel's
+    // "Apply atlas UVs now" hot-reload action.
+    bool                    atlasApplied = false;
 
     // Loads `scene.json` from `folderPath`, then optionally `structure.glb`
     // referenced by the manifest. Throws std::runtime_error on hard failure

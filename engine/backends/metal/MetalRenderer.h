@@ -58,15 +58,13 @@ public:
         MTL::Texture* syphonTex    = nullptr,   // optional live video overlay
         float          syphonMix   = 0.0f,
         const glm::vec3& syphonTint = glm::vec3(1.0f),
-        int            syphonMode  = 0,         // 0..5, see SyphonInputLayer::ProjMode
-        float          syphonTriplanarScale = 0.25f,
-        bool           syphonFlipY = false,
-        int            syphonCylAxis = 0,       // 0=X, 1=Y, 2=Z
-        float          syphonWrapU = 1.0f,
-        float          syphonWrapV = 1.0f,
-        const glm::vec3& sceneBboxMin = glm::vec3(0.0f),
-        const glm::vec3& sceneBboxMax = glm::vec3(1.0f),
-        const glm::vec3& sceneCentroid = glm::vec3(0.0f));
+        bool           syphonFlipY = false);
+
+    // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
+    // Analysis panel to apply a freshly generated atlas without restart.
+    // The new MeshData replaces positions/normals/uvs/uvs1/indices for
+    // mesh `meshIdx`. Returns true on success.
+    bool reloadMesh(size_t meshIdx, const MeshData& newMesh);
 
     // Public scene matrices (used by Layers when building their uniforms).
     const glm::mat4& projection()      const { return projection_; }

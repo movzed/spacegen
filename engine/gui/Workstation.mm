@@ -25,8 +25,12 @@
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
+#include <memory>
+#include <thread>
 #include <cstdio>
 
 namespace spacegen::gui {
@@ -339,23 +343,83 @@ void drawModulators(spacegen::Scene& scene, bool* open) {
 // vertex count (it splits verts at chart seams). The user restarts the
 // binary to apply.
 
-// Persistent state of the panel between frames (computed-once-and-cached
-// UV coverage stats + last regeneration result).
+// Persistent state of the panel between frames.
+//
+// xatlas runs on a worker thread so the UI stays responsive. The worker
+// communicates with the main thread through atomics (progress %, stage,
+// done flag, cancel request). Once the worker reports done, the main
+// thread joins, copies the result, persists the cache, and resets.
+//
+// All atomics are owned by this struct and live for the lifetime of the
+// Workstation; we never delete them while a worker holds a pointer.
 struct UvAnalysisState {
+    // ---- One-shot UV coverage stats ----
     bool        coverageComputed = false;
     int         totalTris        = 0;
     int         uv0DegenTris     = 0;
     int         uv1DegenTris     = 0;
-    bool        regenInProgress  = false;
-    bool        regenLastOk      = false;
-    std::string regenLastMsg;
-    int         lastChartCount   = 0;
-    int         lastAtlasW       = 0;
-    int         lastAtlasH       = 0;
-    double      lastRegenSec     = 0.0;
+
+    // ---- xatlas worker state ----
+    enum class Status : int { Idle = 0, Running = 1, Done = 2 };
+    std::atomic<int>    status{static_cast<int>(Status::Idle)};
+    std::atomic<int>    progressPct{0};
+    std::atomic<int>    stageId{0};    // 0 idle, 1 add, 2 charts, 3 pack, 4 build, 5 save
+    std::atomic<bool>   shouldCancel{false};
+    std::atomic<double> startTimeSec{0.0};
+
+    std::unique_ptr<std::thread>            worker;
+    std::unique_ptr<spacegen::UvAtlasResult> result;   // produced by worker
+
+    // ---- Last-run status (rendered post-completion) ----
+    bool        lastOk          = false;
+    std::string lastMsg;
+    int         lastChartCount  = 0;
+    int         lastAtlasW      = 0;
+    int         lastAtlasH      = 0;
+    double      lastRegenSec    = 0.0;
+
+    // Cleanly stop and join any running worker. Called when the panel /
+    // app shuts down so we don't leave a detached thread behind.
+    void joinWorker() {
+        if (worker) {
+            shouldCancel.store(true);
+            if (worker->joinable()) worker->join();
+            worker.reset();
+        }
+        status.store(static_cast<int>(Status::Idle));
+        progressPct.store(0);
+        stageId.store(0);
+        shouldCancel.store(false);
+    }
+
+    ~UvAnalysisState() { joinWorker(); }
 };
 
 static UvAnalysisState gUvState;
+
+// Pre-cut control state, captured by the worker thread at button-click time.
+// Kept here (not in UvAnalysisState) because they are pure inputs that the
+// panel reads/writes, not part of the worker's lifecycle state machine.
+static bool  gUvSharpPreCut   = true;
+static float gUvSharpAngleDeg = 35.0f;
+
+// xatlas progress trampoline. Runs on the worker thread; writes to atomics
+// that the main thread reads each frame. Returns false when the operator
+// has clicked Cancel — xatlas then aborts the current phase.
+static bool uvWorkerProgress(int pct, const char* stageName, void* user) {
+    auto* s = static_cast<UvAnalysisState*>(user);
+    if (!s) return true;
+    int stageId = 0;
+    if (stageName) {
+        if (std::strstr(stageName, "Validating"))   stageId = 1;
+        else if (std::strstr(stageName, "Detecting")) stageId = 2;
+        else if (std::strstr(stageName, "Packing"))   stageId = 3;
+        else if (std::strstr(stageName, "Building"))  stageId = 4;
+    }
+    s->stageId.store(stageId);
+    s->progressPct.store(pct);
+    return !s->shouldCancel.load();
+}
 
 // Walk every triangle of `m` and compute how many have UV-degenerate triangles
 // in uv0 and uv1. A degenerate triangle is one whose three vertices share the
@@ -393,7 +457,9 @@ static void recomputeUvCoverage(const spacegen::MeshData& m, UvAnalysisState& s)
     if (!haveUv1) s.uv1DegenTris = s.totalTris;
 }
 
-void drawUvAnalysisPanel(spacegen::Scene& scene, bool* open) {
+void drawUvAnalysisPanel(spacegen::Scene& scene,
+                          spacegen::MetalRenderer& renderer,
+                          bool* open) {
     if (!ImGui::Begin(kUvAnalysisWindowName, open)) { ImGui::End(); return; }
 
     if (scene.meshes.empty()) {
@@ -437,7 +503,20 @@ void drawUvAnalysisPanel(spacegen::Scene& scene, bool* open) {
         recomputeUvCoverage(m, gUvState);
     }
 
-    // Cache file status
+    // ---- Active UV layer indicator ----
+    ImGui::Separator();
+    ImVec4 activeCol = scene.atlasApplied
+        ? ImVec4(0.30f, 0.85f, 0.40f, 1.0f)
+        : ImVec4(0.50f, 0.75f, 0.95f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, activeCol);
+    ImGui::Text("Atlas applied: %s",
+        scene.atlasApplied ? "YES (UV1 = xatlas)"
+                            : "NO  (UV1 = same as UV0)");
+    ImGui::PopStyleColor();
+    ImGui::TextDisabled("In SyphonInputLayer, 'Use generated atlas UVs'");
+    ImGui::TextDisabled("samples UV1 — meaningful only when YES above.");
+
+    // ---- Cache file status ----
     ImGui::Separator();
     std::filesystem::path cachePath =
         std::filesystem::path(scene.folderPath) / "uv1_atlas.bin";
@@ -448,67 +527,248 @@ void drawUvAnalysisPanel(spacegen::Scene& scene, bool* open) {
     if (cacheExists) {
         auto sizeBytes = std::filesystem::file_size(cachePath);
         ImGui::TextDisabled("       %.1f MB on disk", sizeBytes / (1024.0 * 1024.0));
+
+        // Hot-reload: load the cache and swap the GPU mesh in place.
+        // Avoids the restart loop the operator had to do before.
+        ImGui::BeginDisabled(scene.atlasApplied);
+        if (ImGui::Button("Apply atlas UVs now (hot-reload, no restart)",
+                           ImVec2(-FLT_MIN, 32))) {
+            uint64_t fp = spacegen::meshFingerprint(m);
+            spacegen::UvAtlasResult cached;
+            if (spacegen::loadAtlasCache(cachePath.string(), fp, cached)) {
+                m.positions = std::move(cached.positions);
+                m.normals   = std::move(cached.normals);
+                m.uvs       = std::move(cached.uvs0);
+                m.uvs1      = std::move(cached.uvs1);
+                m.indices   = std::move(cached.indices);
+                if (renderer.reloadMesh(0, m)) {
+                    scene.atlasApplied = true;
+                    recomputeUvCoverage(m, gUvState);
+                    gUvState.lastOk  = true;
+                    gUvState.lastMsg = "Atlas hot-loaded. UV1 now points to xatlas.";
+                } else {
+                    gUvState.lastOk  = false;
+                    gUvState.lastMsg = "Atlas loaded from disk but GPU upload failed.";
+                }
+            } else {
+                gUvState.lastOk  = false;
+                gUvState.lastMsg = "Cache exists but couldn't be loaded "
+                                    "(fingerprint mismatch or corrupt file).";
+            }
+        }
+        ImGui::EndDisabled();
+        if (scene.atlasApplied) {
+            ImGui::TextDisabled("Atlas already active in memory.");
+        }
     }
 
-    // xatlas regenerate
+    // ---- xatlas regenerate ----
     ImGui::Separator();
     ImGui::TextDisabled("Regenerate SyphonUV with xatlas");
-    ImGui::TextWrapped("xatlas (industry-standard atlas generator used by "
-                        "Unity / UE) detects charts of similar-curvature "
-                        "faces and unwraps each with LSCM. Expensive: "
-                        "~30s-2min on this mesh. Result is saved to disk; "
-                        "restart the app to apply.");
+    ImGui::TextWrapped("xatlas with Tier-1 enhancements: dihedral pre-cut "
+                        "(RizomUV Sharp Edges algorithm) forces chart "
+                        "boundaries onto geometric creases — invisible "
+                        "in projection — followed by big-chart packing.");
 
-    if (ImGui::Button(gUvState.regenInProgress
-                       ? "Running xatlas..."
-                       : "Generate UV atlas with xatlas",
-                       ImVec2(-FLT_MIN, 36))) {
-        if (!gUvState.regenInProgress) {
-            gUvState.regenInProgress = true;
-            gUvState.regenLastMsg    = "";
-
-            // Run synchronously. xatlas owns the only thread. UI freezes
-            // for the duration — the button label above already warns.
-            auto t0 = std::chrono::steady_clock::now();
-            spacegen::UvAtlasOptions opts;
-            spacegen::UvAtlasResult res = spacegen::generateAtlas(m, opts,
-                nullptr, nullptr);
-            auto t1 = std::chrono::steady_clock::now();
-            gUvState.lastRegenSec =
-                std::chrono::duration<double>(t1 - t0).count();
-
-            if (res.ok) {
-                uint64_t fp = spacegen::meshFingerprint(m);
-                bool saved = spacegen::saveAtlasCache(cachePath.string(),
-                                                       fp, res);
-                gUvState.regenLastOk    = saved;
-                gUvState.lastChartCount = res.chartCount;
-                gUvState.lastAtlasW     = res.atlasWidth;
-                gUvState.lastAtlasH     = res.atlasHeight;
-                gUvState.regenLastMsg   = saved
-                    ? "Cache saved. Restart the app to apply the new UVs."
-                    : "Atlas generated but writing cache failed.";
-            } else {
-                gUvState.regenLastOk  = false;
-                gUvState.regenLastMsg = std::string("xatlas failed: ")
-                                       + res.error;
-            }
-            gUvState.regenInProgress = false;
-        }
+    // Tier-1 controls: Sharp Edges pre-cut
+    ImGui::Checkbox("Sharp Edges pre-cut##sharp", &gUvSharpPreCut);
+    if (gUvSharpPreCut) {
+        ImGui::SliderFloat("Dihedral threshold (°)##ang",
+                            &gUvSharpAngleDeg, 5.0f, 90.0f, "%.1f°");
+        ImGui::TextDisabled("Edges with dihedral > threshold become forced");
+        ImGui::TextDisabled("chart boundaries. Lower = more seams on creases.");
+    } else {
+        ImGui::TextDisabled("Off: xatlas picks seams freely (may cut mid-surface).");
     }
-    if (!gUvState.regenLastMsg.empty()) {
-        ImVec4 col = gUvState.regenLastOk
-            ? ImVec4(0.30f, 0.85f, 0.40f, 1.0f)
-            : ImVec4(0.95f, 0.40f, 0.30f, 1.0f);
-        ImGui::PushStyleColor(ImGuiCol_Text, col);
-        ImGui::TextWrapped("%s", gUvState.regenLastMsg.c_str());
-        ImGui::PopStyleColor();
-        if (gUvState.regenLastOk) {
-            ImGui::TextDisabled("Charts: %d   Atlas: %dx%d   Time: %.1fs",
-                                 gUvState.lastChartCount,
-                                 gUvState.lastAtlasW, gUvState.lastAtlasH,
-                                 gUvState.lastRegenSec);
+
+    // Decide what to render based on the worker status.
+    int curStatus = gUvState.status.load();
+    using S = UvAnalysisState::Status;
+
+    if (curStatus == static_cast<int>(S::Idle)) {
+        // ---- Idle: offer the Generate button. ----
+        if (ImGui::Button("Generate UV atlas with xatlas",
+                           ImVec2(-FLT_MIN, 36))) {
+            // Capture all needed inputs by value into the worker. We pass
+            // the MeshData by const reference because Scene outlives the
+            // worker (Scene is owned by main()'s stack and we join the
+            // worker before shutdown).
+            gUvState.status.store(static_cast<int>(S::Running));
+            gUvState.progressPct.store(0);
+            gUvState.stageId.store(0);
+            gUvState.shouldCancel.store(false);
+            gUvState.startTimeSec.store(
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()
+                ).count());
+            gUvState.result.reset();
+
+            const spacegen::MeshData* meshPtr = &m;
+            std::string cacheStr = cachePath.string();
+
+            gUvState.worker = std::make_unique<std::thread>(
+                [meshPtr, cacheStr]() {
+                    // Top-tier VJ mapping options. Defaults in xatlas are
+                    // tuned for LIGHTMAPS (many small charts, tight
+                    // packing) — wrong for live video. We:
+                    //   1. Pre-cut the mesh on sharp geometric edges
+                    //      (RizomUV Sharp Edges algorithm). xatlas then
+                    //      lands every chart boundary on a natural crease
+                    //      of the geometry, invisible in projection.
+                    //   2. Bias xatlas towards FEW LARGE charts so the
+                    //      video flows continuously across coplanar
+                    //      regions. normalDeviationW high, roundness/
+                    //      straightness = 0.
+                    spacegen::UvAtlasOptions opts;
+                    opts.maxAtlasSize       = 4096;
+                    opts.bruteForcePack     = true;
+                    opts.bilinearPadding    = true;
+                    opts.normalDeviationW   = 10.0f;
+                    opts.roundnessW         = 0.0f;
+                    opts.straightnessW      = 0.0f;
+                    opts.normalSeamW        = 1.0f;
+                    opts.textureSeamW       = 0.0f;
+                    opts.preCutSharpEdges   = gUvSharpPreCut;
+                    opts.sharpEdgeAngleDeg  = gUvSharpAngleDeg;
+
+                    auto t0 = std::chrono::steady_clock::now();
+                    // Sharp-edge pre-pass on a local copy of the mesh.
+                    // Result is consumed by xatlas without touching the
+                    // GPU-resident mesh until the worker finishes.
+                    spacegen::MeshData working = *meshPtr;
+                    if (opts.preCutSharpEdges) {
+                        gUvState.stageId.store(0);
+                        working = spacegen::preCutOnSharpEdges(
+                            working, opts.sharpEdgeAngleDeg);
+                    }
+                    auto res = std::make_unique<spacegen::UvAtlasResult>(
+                        spacegen::generateAtlas(working, opts,
+                                                uvWorkerProgress, &gUvState));
+                    auto t1 = std::chrono::steady_clock::now();
+                    double secs =
+                        std::chrono::duration<double>(t1 - t0).count();
+                    gUvState.lastRegenSec = secs;
+
+                    // Persist if successful. This is the long write of the
+                    // cache file; we keep it on the worker thread too so
+                    // the main UI never blocks.
+                    if (res->ok && !gUvState.shouldCancel.load()) {
+                        gUvState.stageId.store(5);
+                        gUvState.progressPct.store(0);
+                        uint64_t fp = spacegen::meshFingerprint(*meshPtr);
+                        bool saved = spacegen::saveAtlasCache(cacheStr, fp, *res);
+                        gUvState.lastChartCount = res->chartCount;
+                        gUvState.lastAtlasW     = res->atlasWidth;
+                        gUvState.lastAtlasH     = res->atlasHeight;
+                        gUvState.lastOk         = saved;
+                        gUvState.lastMsg        = saved
+                            ? "Cache saved. Restart the app to apply the new UVs."
+                            : "Atlas generated but writing cache failed.";
+                        gUvState.progressPct.store(100);
+                    } else if (gUvState.shouldCancel.load()) {
+                        gUvState.lastOk  = false;
+                        gUvState.lastMsg = "Cancelled by operator.";
+                    } else {
+                        gUvState.lastOk  = false;
+                        gUvState.lastMsg = std::string("xatlas failed: ")
+                                          + res->error;
+                    }
+                    gUvState.result = std::move(res);
+                    gUvState.status.store(static_cast<int>(S::Done));
+                });
         }
+
+        // Show the previous run's result, if any.
+        if (!gUvState.lastMsg.empty()) {
+            ImVec4 col = gUvState.lastOk
+                ? ImVec4(0.30f, 0.85f, 0.40f, 1.0f)
+                : ImVec4(0.95f, 0.40f, 0.30f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            ImGui::TextWrapped("%s", gUvState.lastMsg.c_str());
+            ImGui::PopStyleColor();
+            if (gUvState.lastOk) {
+                ImGui::TextDisabled("Charts: %d   Atlas: %dx%d   Time: %.1fs",
+                                     gUvState.lastChartCount,
+                                     gUvState.lastAtlasW, gUvState.lastAtlasH,
+                                     gUvState.lastRegenSec);
+            }
+        }
+    } else if (curStatus == static_cast<int>(S::Running)) {
+        // ---- Running: live progress bar + cancel ----
+        const char* stageNames[] = {
+            "Initializing...",
+            "Validating geometry",
+            "Detecting charts",
+            "Packing atlas (brute force)",
+            "Building output mesh",
+            "Saving cache to disk",
+        };
+        int stage = gUvState.stageId.load();
+        if (stage < 0 || stage > 5) stage = 0;
+        int pct = gUvState.progressPct.load();
+
+        double startTs = gUvState.startTimeSec.load();
+        double nowTs   = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+        double elapsed = nowTs - startTs;
+
+        ImGui::TextUnformatted("Running xatlas on worker thread...");
+        ImGui::TextDisabled("Stage %d/5: %s", stage, stageNames[stage]);
+
+        char overlay[96];
+        std::snprintf(overlay, sizeof(overlay), "%d%%  (%.1fs)",
+                       pct, elapsed);
+        ImGui::ProgressBar(pct / 100.0f, ImVec2(-FLT_MIN, 0), overlay);
+
+        // Sub-progress hint for the stages without an internal pct
+        // (xatlas reports per-phase, not global, so the bar resets per
+        // stage — make that clear).
+        ImGui::TextDisabled("xatlas reports progress per-stage; the bar");
+        ImGui::TextDisabled("resets between phases. Total run typically");
+        ImGui::TextDisabled("dominated by 'Detecting charts' on dense meshes.");
+
+        if (ImGui::Button("Cancel", ImVec2(-FLT_MIN, 28))) {
+            gUvState.shouldCancel.store(true);
+        }
+        if (gUvState.shouldCancel.load()) {
+            ImGui::TextDisabled("Cancellation requested — waiting for");
+            ImGui::TextDisabled("xatlas to reach a safe boundary...");
+        }
+    } else if (curStatus == static_cast<int>(S::Done)) {
+        // ---- Done: join, then auto-hot-load the result so the operator
+        // sees the new UVs immediately, no restart, no extra click. ----
+        if (gUvState.worker && gUvState.worker->joinable()) {
+            gUvState.worker->join();
+        }
+        gUvState.worker.reset();
+
+        if (gUvState.result && gUvState.result->ok && gUvState.lastOk) {
+            // Hot-swap mesh in place using the freshly generated result.
+            spacegen::UvAtlasResult& r = *gUvState.result;
+            m.positions = std::move(r.positions);
+            m.normals   = std::move(r.normals);
+            m.uvs       = std::move(r.uvs0);
+            m.uvs1      = std::move(r.uvs1);
+            m.indices   = std::move(r.indices);
+            if (renderer.reloadMesh(0, m)) {
+                scene.atlasApplied = true;
+                gUvState.lastMsg = "Atlas generated AND applied. UV1 is now "
+                                    "the xatlas conformal mapping — switch "
+                                    "the Syphon layer's 'Use atlas' toggle "
+                                    "to see it.";
+            } else {
+                gUvState.lastMsg += " (GPU upload failed; cache is on disk.)";
+                gUvState.lastOk = false;
+            }
+            recomputeUvCoverage(m, gUvState);
+        }
+        gUvState.result.reset();
+
+        gUvState.status.store(static_cast<int>(S::Idle));
+        gUvState.progressPct.store(0);
+        gUvState.stageId.store(0);
+        gUvState.shouldCancel.store(false);
     }
 
     ImGui::End();
@@ -570,6 +830,10 @@ Workstation::Workstation(GLFWwindow* window,
 }
 
 Workstation::~Workstation() {
+    // Stop any running xatlas worker BEFORE the Scene's MeshData goes out
+    // of scope in main(). The worker captures a pointer to the mesh; if
+    // we let it run past Scene destruction, the dangling pointer is UB.
+    gUvState.joinWorker();
     releaseOffscreen();
     ImGui_ImplMetal_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -655,7 +919,7 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
                                         currentStats_, &showStats_);
     if (showLayers_)     drawLayerRack(scene, selectedLayerId_, &showLayers_);
     if (showModulators_) drawModulators(scene, &showModulators_);
-    if (showUvAnalysis_) drawUvAnalysisPanel(scene, &showUvAnalysis_);
+    if (showUvAnalysis_) drawUvAnalysisPanel(scene, renderer, &showUvAnalysis_);
     if (showInspector_)  drawInspector(scene, selectedLayerId_, &showInspector_);
     if (showDemo_)       ImGui::ShowDemoWindow(&showDemo_);
 
