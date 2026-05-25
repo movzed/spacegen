@@ -403,7 +403,14 @@ static UvAnalysisState gUvState;
 // Kept here (not in UvAnalysisState) because they are pure inputs that the
 // panel reads/writes, not part of the worker's lifecycle state machine.
 static bool  gUvSharpPreCut   = true;
-static float gUvSharpAngleDeg = 35.0f;
+static float gUvSharpAngleDeg = 50.0f;     // 50° default → fewer cuts, faster
+
+// Quality vs speed knobs for the xatlas chart phase.
+//   gUvBigCharts    = bias for fewer, larger charts (better for live video)
+//   gUvBruteForcePack = retry-many-rotations packing. ~5-10× slower on
+//                       dense meshes; rarely worth it.
+static bool  gUvBigCharts        = true;
+static bool  gUvBruteForcePack   = false;
 
 // Tier 4 — atlas engine selector. 0 = xatlas (default), 1 = geogram
 // (Spectral LSCM + Tetris). Geogram option only useful when the engine
@@ -661,9 +668,26 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
         ImGui::SliderFloat("Dihedral threshold (°)##ang",
                             &gUvSharpAngleDeg, 5.0f, 90.0f, "%.1f°");
         ImGui::TextDisabled("Edges with dihedral > threshold become forced");
-        ImGui::TextDisabled("chart boundaries. Lower = more seams on creases.");
+        ImGui::TextDisabled("chart boundaries. Lower = more seams; higher");
+        ImGui::TextDisabled("= less mesh splitting (faster xatlas).");
     } else {
         ImGui::TextDisabled("Off: xatlas picks seams freely (may cut mid-surface).");
+    }
+
+    // xatlas chart / packing knobs (speed vs quality)
+    ImGui::Checkbox("Big-charts bias (better for video)##big", &gUvBigCharts);
+    if (gUvBigCharts) {
+        ImGui::TextDisabled("normalDeviationW=10, roundness/straightness=0");
+    }
+    ImGui::Checkbox("Brute-force packing (SLOW)##bfp", &gUvBruteForcePack);
+    if (gUvBruteForcePack) {
+        ImVec4 warn(0.95f, 0.85f, 0.30f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, warn);
+        ImGui::TextWrapped("WARNING: brute-force packing tries many "
+                            "rotations per chart. On dense meshes "
+                            "(>1M tris) this can multiply total time by "
+                            "5-10×. Off is fine for projection mapping.");
+        ImGui::PopStyleColor();
     }
 
     // Tier-3 controls: SpaceGen Optimize (SLIM refinement)
@@ -726,26 +750,23 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
             gUvState.worker = std::make_unique<std::thread>(
                 [meshPtr, cacheStr, viewDir, atlasEngine,
                  doRefine, refineIter, refineExp, refineFloor, refineProj]() {
-                    // Top-tier VJ mapping options. Defaults in xatlas are
-                    // tuned for LIGHTMAPS (many small charts, tight
-                    // packing) — wrong for live video. We:
-                    //   1. Pre-cut the mesh on sharp geometric edges
-                    //      (RizomUV Sharp Edges algorithm). xatlas then
-                    //      lands every chart boundary on a natural crease
-                    //      of the geometry, invisible in projection.
-                    //   2. Bias xatlas towards FEW LARGE charts so the
-                    //      video flows continuously across coplanar
-                    //      regions. normalDeviationW high, roundness/
-                    //      straightness = 0.
+                    // VJ mapping options. xatlas defaults are tuned for
+                    // LIGHTMAPS — wrong for live video. We bias towards
+                    // FEW LARGE charts so video flows continuously, BUT
+                    // we keep packing cheap because operators don't care
+                    // about 95% vs 90% atlas utilisation — they care
+                    // about wall-clock time. bruteForcePack=true is a
+                    // 5-10× slowdown on dense meshes; off by default,
+                    // toggle in the panel if you really want it.
                     spacegen::UvAtlasOptions opts;
                     opts.maxAtlasSize       = 4096;
-                    opts.bruteForcePack     = true;
+                    opts.bruteForcePack     = gUvBruteForcePack;
                     opts.bilinearPadding    = true;
-                    opts.normalDeviationW   = 10.0f;
-                    opts.roundnessW         = 0.0f;
-                    opts.straightnessW      = 0.0f;
-                    opts.normalSeamW        = 1.0f;
-                    opts.textureSeamW       = 0.0f;
+                    opts.normalDeviationW   = gUvBigCharts ? 10.0f : 2.0f;
+                    opts.roundnessW         = gUvBigCharts ? 0.0f  : 0.01f;
+                    opts.straightnessW      = gUvBigCharts ? 0.0f  : 6.0f;
+                    opts.normalSeamW        = gUvBigCharts ? 1.0f  : 4.0f;
+                    opts.textureSeamW       = gUvBigCharts ? 0.0f  : 0.5f;
                     opts.preCutSharpEdges   = gUvSharpPreCut;
                     opts.sharpEdgeAngleDeg  = gUvSharpAngleDeg;
 
