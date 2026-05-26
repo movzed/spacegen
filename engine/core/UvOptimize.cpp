@@ -375,6 +375,33 @@ UvOptimizeResult optimiseUVs(const MeshData& mesh,
         return res;
     }
 
+    // Hard cap on chart count. SLIM allocates Eigen LDLT workspace per
+    // chart; 200k+ tiny charts on an over-cut mesh have OOM'd a 32 GB box.
+    // Sort charts by triangle count descending and refine the top N. The
+    // remaining (small) charts keep their xatlas output, which is already
+    // decent on near-planar geometry.
+    if ((int)charts.size() > opts.maxChartsRefined) {
+        std::sort(charts.begin(), charts.end(),
+            [](const UvOptimizeChart& a, const UvOptimizeChart& b) {
+                return a.F.rows() > b.F.rows();
+            });
+        int dropped = (int)charts.size() - opts.maxChartsRefined;
+        charts.resize(opts.maxChartsRefined);
+        res.chartsSkipped += dropped;
+        std::fprintf(stderr,
+            "[UvOptimize] Chart count %d exceeds cap %d — refining top %d "
+            "by triangle count, leaving %d charts at xatlas-only quality.\n",
+            (int)charts.size() + dropped, opts.maxChartsRefined,
+            opts.maxChartsRefined, dropped);
+    }
+
+    std::fprintf(stderr, "[UvOptimize] SLIM starting on %zu charts "
+                          "(min=%d tris, parallel=%d threads)...\n",
+                          charts.size(), opts.minChartTriangleCount,
+                          (opts.maxWorkerThreads > 0
+                            ? opts.maxWorkerThreads
+                            : (int)std::max(1u, std::thread::hardware_concurrency() - 1)));
+
     // ---- 3. Per-chart SLIM, parallel.
     if (cb) cb(15, "Refining charts (SLIM iter)", user);
     int nThreads = opts.maxWorkerThreads > 0

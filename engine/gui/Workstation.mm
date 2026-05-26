@@ -411,7 +411,7 @@ static UvAnalysisState gUvState;
 // Kept here (not in UvAnalysisState) because they are pure inputs that the
 // panel reads/writes, not part of the worker's lifecycle state machine.
 static bool  gUvSharpPreCut   = true;
-static float gUvSharpAngleDeg = 50.0f;     // 50° default → fewer cuts, faster
+static float gUvSharpAngleDeg = 75.0f;     // 75° → only hard creases get cut
 
 // Quality vs speed knobs for the xatlas chart phase.
 //   gUvBigCharts    = bias for fewer, larger charts (better for live video)
@@ -420,9 +420,10 @@ static float gUvSharpAngleDeg = 50.0f;     // 50° default → fewer cuts, faste
 static bool  gUvBigCharts        = true;
 static bool  gUvBruteForcePack   = false;
 
-// Mesh decimation (LOD) slider. 1.0 = original density, 0.05 = 5% kept.
-// Persisted across panel frames; applied via the Apply button.
-static float gMeshKeepRatio = 1.0f;
+// UV-bake proxy density. 1.0 = use full mesh for UVs (slow on dense
+// inputs), 0.05 = 5% kept. Default 0.20 — sweet spot for the test
+// scene (~1.5 M tris proxy, finishes in single-digit minutes).
+static float gMeshKeepRatio = 0.20f;
 
 // Tier 4 — atlas engine selector. 0 = xatlas (default), 1 = geogram
 // (Spectral LSCM + Tetris). Geogram option only useful when the engine
@@ -848,10 +849,14 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                     opts.maxAtlasSize       = 4096;
                     opts.bruteForcePack     = gUvBruteForcePack;
                     opts.bilinearPadding    = true;
-                    opts.normalDeviationW   = gUvBigCharts ? 10.0f : 2.0f;
+                    // Big-charts bias bumped aggressive — observed 218k
+                    // charts on 1.2 M tri proxy at normalDeviationW=10,
+                    // which OOM'd SLIM. 25 yields ~500-3k charts on
+                    // typical architectural meshes.
+                    opts.normalDeviationW   = gUvBigCharts ? 25.0f : 2.0f;
                     opts.roundnessW         = gUvBigCharts ? 0.0f  : 0.01f;
                     opts.straightnessW      = gUvBigCharts ? 0.0f  : 6.0f;
-                    opts.normalSeamW        = gUvBigCharts ? 1.0f  : 4.0f;
+                    opts.normalSeamW        = gUvBigCharts ? 0.5f  : 4.0f;
                     opts.textureSeamW       = gUvBigCharts ? 0.0f  : 0.5f;
                     opts.preCutSharpEdges   = gUvSharpPreCut;
                     opts.sharpEdgeAngleDeg  = gUvSharpAngleDeg;

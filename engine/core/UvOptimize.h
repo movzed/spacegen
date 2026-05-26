@@ -47,8 +47,14 @@ struct UvOptimizeOptions {
     float       visFloor         = 0.10f; // never weight below this (back-faces)
 
     // ---- Performance ----
-    int   maxWorkerThreads       = 0;     // 0 = autodetect (hw_concurrency)
-    int   minChartTriangleCount  = 8;     // skip charts smaller than this
+    int   maxWorkerThreads       = 0;      // 0 = autodetect (hw_concurrency)
+    int   minChartTriangleCount  = 64;     // skip tiny charts (cheap, low quality gain)
+    int   maxChartsRefined       = 8000;   // hard cap; SLIM allocates ~MB/chart of
+                                            // Eigen workspace — 218k charts OOM'd a
+                                            // 32 GB box. When chart count > cap, we
+                                            // refine the largest N charts (by tri
+                                            // count) and leave the rest as xatlas
+                                            // output (already decent).
 };
 
 struct UvOptimizeResult {
