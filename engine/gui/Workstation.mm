@@ -371,6 +371,11 @@ struct UvAnalysisState {
     std::atomic<bool>   shouldCancel{false};
     std::atomic<double> startTimeSec{0.0};
     std::atomic<double> phaseStartSec{0.0};  // reset on every phase change
+    // ETA recent-rate anchor — advances every 5% of progress so the
+    // computed rate (and the ETA) reflects RECENT pace, not lifetime
+    // average. Without this the ETA grows unbounded on N²-cost phases.
+    std::atomic<double> rateAnchorTime{0.0};
+    std::atomic<int>    rateAnchorPct{0};
 
     std::unique_ptr<std::thread>            worker;
     std::unique_ptr<spacegen::UvAtlasResult> result;   // produced by worker
@@ -449,13 +454,25 @@ static bool uvWorkerProgress(int pct, const char* stageName, void* user) {
         else if (std::strstr(stageName, "Refining"))  stageId = 6;
         else if (std::strstr(stageName, "Extracting") || std::strstr(stageName, "Preparing")) stageId = 6;
     }
+    double now = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     int prevStage = s->lastStageSeen.load();
     if (stageId != prevStage) {
-        // Phase changed → re-anchor the per-phase ETA timer.
-        double now = std::chrono::duration<double>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        // Phase changed → re-anchor BOTH the phase timer and the recent-
+        // rate anchor at the new phase's t=0, pct=0.
         s->phaseStartSec.store(now);
+        s->rateAnchorTime.store(now);
+        s->rateAnchorPct.store(0);
         s->lastStageSeen.store(stageId);
+    } else {
+        // Same phase. Advance the recent-rate anchor whenever we've made
+        // ≥5% of progress since the last anchor — keeps the rate estimate
+        // based on the LAST 5% rather than the lifetime average.
+        int anchorPct = s->rateAnchorPct.load();
+        if (pct - anchorPct >= 5) {
+            s->rateAnchorTime.store(now);
+            s->rateAnchorPct.store(pct);
+        }
     }
     s->stageId.store(stageId);
     s->progressPct.store(pct);
@@ -1028,23 +1045,49 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                                                   std::floor(secs / 3600.0),
                                                   std::floor(std::fmod(secs, 3600.0) / 60.0));
         };
+        // Compute ETA using two estimators and take the more conservative:
+        //   1. "Lifetime" rate    — (100-pct)/pct × phase_elapsed
+        //   2. "Recent" rate      — based on the rolling 5% anchor; reflects
+        //                            current pace, honest for N²-cost phases
+        // We display the recent-rate ETA as primary (more honest), and a
+        // trend indicator (↑ growing / ↓ shrinking / ≈ stable) comparing to
+        // the lifetime average. Total ETA uses recent rate scaled by the
+        // empirical per-phase weights below.
         if (pct >= 2 && phaseElapsed > 0.5) {
-            double pctD        = static_cast<double>(std::max(pct, 1));
-            double phaseEtaSec = (100.0 - pctD) / pctD * phaseElapsed;
-            // Total ETA = remaining of this phase + sum of remaining-phase
-            // weights × this-phase's full-duration extrapolation.
-            double thisPhaseFull = 100.0 / pctD * phaseElapsed;
+            double pctD = static_cast<double>(std::max(pct, 1));
+            double lifetimeEta = (100.0 - pctD) / pctD * phaseElapsed;
+
+            double anchorT   = gUvState.rateAnchorTime.load();
+            int    anchorP   = gUvState.rateAnchorPct.load();
+            double recentElapsed = nowTs - anchorT;
+            double recentDelta   = static_cast<double>(pct - anchorP);
+            double recentEta;
+            if (recentDelta >= 0.5 && recentElapsed > 0.5) {
+                recentEta = recentElapsed * (100.0 - pctD) / recentDelta;
+            } else {
+                recentEta = lifetimeEta;   // not enough recent data yet
+            }
+            // Cap absurd values that come from near-zero rate samples.
+            recentEta = std::min(recentEta, lifetimeEta * 6.0);
+
+            const char* trend;
+            if      (recentEta > lifetimeEta * 1.20) trend = " ^ (slowing)";
+            else if (recentEta < lifetimeEta * 0.80) trend = " v (speeding up)";
+            else                                      trend = " (steady)";
+
+            // Total ETA built from the empirical per-stage weights.
+            double thisPhaseFull = phaseElapsed + recentEta;
             double remainingW = 0.0;
             for (int s2 = stage + 1; s2 < 7; ++s2) remainingW += STAGE_WEIGHT[s2];
             double thisW = STAGE_WEIGHT[stage];
-            double totalEta = phaseEtaSec;
+            double totalEta = recentEta;
             if (thisW > 0.0) totalEta += (remainingW / thisW) * thisPhaseFull;
 
             char etaPhase[32], etaTotal[32];
-            formatDuration(phaseEtaSec, etaPhase, sizeof(etaPhase));
-            formatDuration(totalEta,    etaTotal, sizeof(etaTotal));
-            ImGui::Text("ETA this phase: %s   |   total ETA: ~%s",
-                         etaPhase, etaTotal);
+            formatDuration(recentEta, etaPhase, sizeof(etaPhase));
+            formatDuration(totalEta,  etaTotal, sizeof(etaTotal));
+            ImGui::Text("ETA this phase: %s%s", etaPhase, trend);
+            ImGui::Text("Total ETA:      ~%s",  etaTotal);
         } else {
             ImGui::TextDisabled("ETA: estimating...");
         }
