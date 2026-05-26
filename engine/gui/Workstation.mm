@@ -21,6 +21,7 @@
 #include "../core/DirectionalLightLayer.h"
 #include "../core/AmbientLightLayer.h"
 #include "../core/SyphonInputLayer.h"
+#include "../core/MeshDecimate.h"
 #include "../core/UvAtlas.h"
 #include "../core/UvAtlasGeogram.h"
 #include "../core/UvOptimize.h"
@@ -414,6 +415,10 @@ static float gUvSharpAngleDeg = 50.0f;     // 50° default → fewer cuts, faste
 static bool  gUvBigCharts        = true;
 static bool  gUvBruteForcePack   = false;
 
+// Mesh decimation (LOD) slider. 1.0 = original density, 0.05 = 5% kept.
+// Persisted across panel frames; applied via the Apply button.
+static float gMeshKeepRatio = 1.0f;
+
 // Tier 4 — atlas engine selector. 0 = xatlas (default), 1 = geogram
 // (Spectral LSCM + Tetris). Geogram option only useful when the engine
 // was built with -DSPACEGEN_ENABLE_GEOGRAM=ON.
@@ -655,6 +660,92 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                         "(RizomUV Sharp Edges algorithm) forces chart "
                         "boundaries onto geometric creases — invisible "
                         "in projection — followed by big-chart packing.");
+
+    // ---- Mesh decimation (LOD) ----
+    // Predicts xatlas+SLIM time from triangle count so the operator can
+    // pick density vs runtime BEFORE clicking Generate. The Apply button
+    // runs meshoptimizer::simplifyWithAttributes (UV-aware, preserves the
+    // mask unwrap) and hot-reloads the GPU mesh in place — no restart.
+    {
+        ImGui::Separator();
+        ImGui::TextDisabled("Mesh density (LOD)");
+        int origTris = static_cast<int>(m.indices.size() / 3);
+        ImGui::SliderFloat("Keep ratio##dec", &gMeshKeepRatio, 0.05f, 1.0f,
+                            "%.2f");
+        int targetTris = static_cast<int>(
+            std::max(1, static_cast<int>(origTris * gMeshKeepRatio)));
+        double estSec = spacegen::estimateAtlasTimeSeconds(targetTris);
+        char etaStr[48];
+        if (estSec < 60.0) {
+            std::snprintf(etaStr, sizeof(etaStr), "%.0fs", estSec);
+        } else if (estSec < 3600.0) {
+            std::snprintf(etaStr, sizeof(etaStr), "%.0fm %02.0fs",
+                           std::floor(estSec / 60.0),
+                           std::fmod(estSec, 60.0));
+        } else {
+            std::snprintf(etaStr, sizeof(etaStr), "%.1fh",
+                           estSec / 3600.0);
+        }
+        ImGui::Text("After decimate: %s tris",
+                     [&]{
+                         static char buf[24];
+                         if (targetTris >= 1000000)
+                             std::snprintf(buf, sizeof(buf), "%.2fM",
+                                            targetTris / 1.0e6);
+                         else if (targetTris >= 1000)
+                             std::snprintf(buf, sizeof(buf), "%.0fk",
+                                            targetTris / 1000.0);
+                         else
+                             std::snprintf(buf, sizeof(buf), "%d", targetTris);
+                         return buf;
+                     }());
+
+        // Colour the ETA red above 30 min, yellow 5-30 min, green under 5.
+        ImVec4 etaCol = estSec > 1800.0
+            ? ImVec4(0.95f, 0.40f, 0.30f, 1.0f)
+            : (estSec > 300.0
+                ? ImVec4(0.95f, 0.85f, 0.30f, 1.0f)
+                : ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, etaCol);
+        ImGui::Text("Estimated atlas time: ~%s", etaStr);
+        ImGui::PopStyleColor();
+        ImGui::TextDisabled("(extrapolated; xatlas time grows ~ N^2 in tris)");
+
+        bool canApply = (gMeshKeepRatio < 0.999f) &&
+                        (gUvState.status.load() ==
+                         static_cast<int>(UvAnalysisState::Status::Idle));
+        ImGui::BeginDisabled(!canApply);
+        if (ImGui::Button("Apply decimation (hot-reload, no restart)##decapp",
+                           ImVec2(-FLT_MIN, 28))) {
+            spacegen::DecimateResult dr =
+                spacegen::decimateMesh(m, gMeshKeepRatio);
+            if (dr.ok) {
+                scene.atlasApplied = false;
+                if (renderer.reloadMesh(0, m)) {
+                    gUvState.coverageComputed = false;     // recompute stats
+                    gUvState.lastOk  = true;
+                    char msg[160];
+                    std::snprintf(msg, sizeof(msg),
+                        "Decimated %d → %d tris in %.2fs. Click Generate "
+                        "to build a fresh atlas.",
+                        dr.trianglesBefore, dr.trianglesAfter, dr.elapsedSec);
+                    gUvState.lastMsg = msg;
+                } else {
+                    gUvState.lastOk  = false;
+                    gUvState.lastMsg = "Decimate OK but GPU reload failed.";
+                }
+            } else {
+                gUvState.lastOk  = false;
+                gUvState.lastMsg = "Decimate failed: " + dr.error;
+            }
+            // Reset slider visually to the new "100%" since we mutated.
+            gMeshKeepRatio = 1.0f;
+        }
+        ImGui::EndDisabled();
+        if (!canApply && gMeshKeepRatio < 0.999f) {
+            ImGui::TextDisabled("(Apply disabled while atlas worker is running.)");
+        }
+    }
 
     // Tier-4 controls: atlas engine selector
     {

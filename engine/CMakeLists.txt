@@ -106,6 +106,18 @@ if(NOT TARGET tinygltf)
 endif()
 target_include_directories(tinygltf INTERFACE "${tinygltf_SOURCE_DIR}")
 
+# ---- meshoptimizer (Arseny Kapoulkine / zeux). Single-header-ish MIT.
+#      Used by core/MeshDecimate.cpp to provide a runtime LOD slider in
+#      the UV Analysis panel — the operator picks mesh density vs xatlas
+#      time tradeoff directly in the app, no Blender round-trip. ----
+FetchContent_Declare(
+    meshoptimizer
+    GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+    GIT_TAG        v0.20
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(meshoptimizer)
+
 # ---- Optional alternative UV atlas backend (Tier 4).
 #      Off by default. Enable with: cmake -DSPACEGEN_ENABLE_GEOGRAM=ON ..
 #      Uses Bruno Lévy's geogram (BSD-3, ~50K LOC, Spectral LSCM + Tetris
@@ -239,6 +251,7 @@ add_executable(spacegen
     core/DirectionalLightLayer.cpp
     core/AmbientLightLayer.cpp
     core/SyphonInputLayer.mm
+    core/MeshDecimate.cpp
     core/UvAtlas.cpp
     core/UvAtlasGeogram.cpp
     core/UvOptimize.cpp
@@ -260,6 +273,7 @@ target_link_libraries(spacegen PRIVATE
     nlohmann_json::nlohmann_json
     tinygltf
     xatlas
+    meshoptimizer
     Eigen3::Eigen
     $<$<BOOL:${SPACEGEN_ENABLE_GEOGRAM}>:geogram>
     "-framework Foundation"
