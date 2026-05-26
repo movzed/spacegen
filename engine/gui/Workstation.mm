@@ -365,9 +365,11 @@ struct UvAnalysisState {
     enum class Status : int { Idle = 0, Running = 1, Done = 2 };
     std::atomic<int>    status{static_cast<int>(Status::Idle)};
     std::atomic<int>    progressPct{0};
-    std::atomic<int>    stageId{0};    // 0 idle, 1 add, 2 charts, 3 pack, 4 build, 5 save
+    std::atomic<int>    stageId{0};    // 0 idle, 1 add, 2 charts, 3 pack, 4 build, 5 save, 6 slim
+    std::atomic<int>    lastStageSeen{0};   // for detecting phase transitions
     std::atomic<bool>   shouldCancel{false};
     std::atomic<double> startTimeSec{0.0};
+    std::atomic<double> phaseStartSec{0.0};  // reset on every phase change
 
     std::unique_ptr<std::thread>            worker;
     std::unique_ptr<spacegen::UvAtlasResult> result;   // produced by worker
@@ -427,6 +429,9 @@ static bool  gUvOptimizeProjAware  = true;
 // xatlas progress trampoline. Runs on the worker thread; writes to atomics
 // that the main thread reads each frame. Returns false when the operator
 // has clicked Cancel — xatlas then aborts the current phase.
+//
+// Resets phaseStartSec atomically whenever the phase id changes so the
+// panel's per-phase ETA computation is anchored at the right t0.
 static bool uvWorkerProgress(int pct, const char* stageName, void* user) {
     auto* s = static_cast<UvAnalysisState*>(user);
     if (!s) return true;
@@ -438,6 +443,14 @@ static bool uvWorkerProgress(int pct, const char* stageName, void* user) {
         else if (std::strstr(stageName, "Building"))  stageId = 4;
         else if (std::strstr(stageName, "Refining"))  stageId = 6;
         else if (std::strstr(stageName, "Extracting") || std::strstr(stageName, "Preparing")) stageId = 6;
+    }
+    int prevStage = s->lastStageSeen.load();
+    if (stageId != prevStage) {
+        // Phase changed → re-anchor the per-phase ETA timer.
+        double now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        s->phaseStartSec.store(now);
+        s->lastStageSeen.store(stageId);
     }
     s->stageId.store(stageId);
     s->progressPct.store(pct);
@@ -883,11 +896,13 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
         if (stage < 0 || stage > 6) stage = 0;
         int pct = gUvState.progressPct.load();
 
-        double startTs = gUvState.startTimeSec.load();
-        double nowTs   = std::chrono::duration<double>(
+        double startTs  = gUvState.startTimeSec.load();
+        double phaseTs  = gUvState.phaseStartSec.load();
+        double nowTs    = std::chrono::duration<double>(
             std::chrono::steady_clock::now().time_since_epoch()
         ).count();
-        double elapsed = nowTs - startTs;
+        double elapsed       = nowTs - startTs;
+        double phaseElapsed  = nowTs - phaseTs;
 
         ImGui::TextUnformatted("Running xatlas on worker thread...");
         ImGui::TextDisabled("Stage %d/6: %s", stage, stageNames[stage]);
@@ -897,12 +912,57 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                        pct, elapsed);
         ImGui::ProgressBar(pct / 100.0f, ImVec2(-FLT_MIN, 0), overlay);
 
+        // ---- ETA computation ----
+        // Per-phase ETA: linear extrapolation of the current phase's
+        // remaining work using its own internal progress percentage.
+        // Below 2% we suppress the number — too noisy. Above we display
+        // both the current-phase ETA and a coarse total-run ETA built
+        // from typical phase weights observed empirically on dense
+        // architectural meshes (Detecting charts ≈ 0.85 of total).
+        constexpr double STAGE_WEIGHT[7] = {
+            0.00,   // 0 idle
+            0.02,   // 1 Validating
+            0.85,   // 2 Detecting charts (dominates)
+            0.05,   // 3 Packing (with bruteForce off, much smaller)
+            0.03,   // 4 Building output
+            0.02,   // 5 Saving cache
+            0.10,   // 6 SpaceGen Optimize SLIM
+        };
+        auto formatDuration = [](double secs, char* buf, size_t n) {
+            if (secs < 60.0)        std::snprintf(buf, n, "%.0fs", secs);
+            else if (secs < 3600.0) std::snprintf(buf, n, "%.0fm %02.0fs",
+                                                  std::floor(secs / 60.0),
+                                                  std::fmod(secs, 60.0));
+            else                    std::snprintf(buf, n, "%.0fh %02.0fm",
+                                                  std::floor(secs / 3600.0),
+                                                  std::floor(std::fmod(secs, 3600.0) / 60.0));
+        };
+        if (pct >= 2 && phaseElapsed > 0.5) {
+            double pctD        = static_cast<double>(std::max(pct, 1));
+            double phaseEtaSec = (100.0 - pctD) / pctD * phaseElapsed;
+            // Total ETA = remaining of this phase + sum of remaining-phase
+            // weights × this-phase's full-duration extrapolation.
+            double thisPhaseFull = 100.0 / pctD * phaseElapsed;
+            double remainingW = 0.0;
+            for (int s2 = stage + 1; s2 < 7; ++s2) remainingW += STAGE_WEIGHT[s2];
+            double thisW = STAGE_WEIGHT[stage];
+            double totalEta = phaseEtaSec;
+            if (thisW > 0.0) totalEta += (remainingW / thisW) * thisPhaseFull;
+
+            char etaPhase[32], etaTotal[32];
+            formatDuration(phaseEtaSec, etaPhase, sizeof(etaPhase));
+            formatDuration(totalEta,    etaTotal, sizeof(etaTotal));
+            ImGui::Text("ETA this phase: %s   |   total ETA: ~%s",
+                         etaPhase, etaTotal);
+        } else {
+            ImGui::TextDisabled("ETA: estimating...");
+        }
+
         // Sub-progress hint for the stages without an internal pct
         // (xatlas reports per-phase, not global, so the bar resets per
         // stage — make that clear).
-        ImGui::TextDisabled("xatlas reports progress per-stage; the bar");
-        ImGui::TextDisabled("resets between phases. Total run typically");
-        ImGui::TextDisabled("dominated by 'Detecting charts' on dense meshes.");
+        ImGui::TextDisabled("Total ETA is approximate; 'Detecting charts'");
+        ImGui::TextDisabled("dominates dense-mesh runs.");
 
         if (ImGui::Button("Cancel", ImVec2(-FLT_MIN, 28))) {
             gUvState.shouldCancel.store(true);

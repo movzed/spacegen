@@ -114,38 +114,77 @@ target_include_directories(tinygltf INTERFACE "${tinygltf_SOURCE_DIR}")
 option(SPACEGEN_ENABLE_GEOGRAM
        "Build the geogram-based UV atlas backend (Tier 4)" OFF)
 if(SPACEGEN_ENABLE_GEOGRAM)
-    set(GEOGRAM_WITH_GRAPHICS    OFF CACHE BOOL "" FORCE)
-    set(GEOGRAM_WITH_LUA         OFF CACHE BOOL "" FORCE)
-    set(GEOGRAM_WITH_HLBFGS      OFF CACHE BOOL "" FORCE)
-    set(GEOGRAM_WITH_TETGEN      OFF CACHE BOOL "" FORCE)
-    set(GEOGRAM_WITH_TRIANGLE    OFF CACHE BOOL "" FORCE)
-    set(GEOGRAM_WITH_EXPLORAGRAM OFF CACHE BOOL "" FORCE)
+    # Heavy submodules off — we only need the parameterization API.
+    set(GEOGRAM_WITH_GRAPHICS      OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_LUA           OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_HLBFGS        OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_TETGEN        OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_TRIANGLE      OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_EXPLORAGRAM   OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_VORPALINE     OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_LIB_ONLY           ON  CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_GARGANTUA     OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_TBB           OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_WITH_FPG           OFF CACHE BOOL "" FORCE)
+    set(GEOGRAM_USE_SYSTEM_GLFW3   OFF CACHE BOOL "" FORCE)
+    set(VORPALINE_PLATFORM
+        "Darwin-clang-dynamic" CACHE STRING "" FORCE)
     FetchContent_Declare(
         geogram
         GIT_REPOSITORY https://github.com/BrunoLevy/geogram.git
         GIT_TAG        v1.9.1
         GIT_SHALLOW    TRUE
     )
-    FetchContent_MakeAvailable(geogram)
+    FetchContent_GetProperties(geogram)
+    if(NOT geogram_POPULATED)
+        FetchContent_Populate(geogram)
+        # Patch geogram's third_party CMakeLists to drop PoissonRecon:
+        # we don't use Poisson surface reconstruction (it's for point
+        # clouds), and the bundled PoissonRecon sources fail to compile
+        # on recent Apple clang due to deprecated APIs.
+        set(_geo_tp_cmake
+            "${geogram_SOURCE_DIR}/src/lib/geogram/third_party/CMakeLists.txt")
+        if(EXISTS "${_geo_tp_cmake}")
+            file(READ "${_geo_tp_cmake}" _tp)
+            string(REPLACE
+                "aux_source_directories(SOURCES \"Source Files\\\\PoissonRecon\" PoissonRecon)"
+                "# PoissonRecon disabled by spacegen (not needed, clang incompatible)"
+                _tp "${_tp}")
+            file(WRITE "${_geo_tp_cmake}" "${_tp}")
+        endif()
+        add_subdirectory(${geogram_SOURCE_DIR} ${geogram_BINARY_DIR})
+    endif()
     add_compile_definitions(SPACEGEN_HAVE_GEOGRAM=1)
-    message(STATUS "spacegen: Geogram (Tier 4) ENABLED")
+    message(STATUS "spacegen: Geogram (Tier 4) ENABLED (PoissonRecon stripped)")
 else()
     message(STATUS "spacegen: Geogram (Tier 4) disabled (default)")
 endif()
 
 # ---- Eigen 3.4 (sparse linear algebra for SpaceGen Optimize / SLIM).
 #      Header-only, MPL2 (compatible). Used by core/UvOptimize.cpp for the
-#      symmetric Dirichlet proximal step (SimplicialLDLT sparse Cholesky). ----
+#      symmetric Dirichlet proximal step (SimplicialLDLT sparse Cholesky).
+#
+#      We populate the source without add_subdirectory so Eigen's CMakeLists
+#      doesn't run at all — that avoids the `uninstall` target clash with
+#      geogram (both libraries unconditionally define one when their own
+#      CMakeLists is processed). Since Eigen is purely header-only, all we
+#      need is the include directory exposed via an INTERFACE library that
+#      we alias to the canonical Eigen3::Eigen name our code uses. ----
 FetchContent_Declare(
     eigen
     GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
     GIT_TAG        3.4.0
     GIT_SHALLOW    TRUE
 )
-set(EIGEN_BUILD_DOC     OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING       OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(eigen)
+FetchContent_GetProperties(eigen)
+if(NOT eigen_POPULATED)
+    FetchContent_Populate(eigen)
+endif()
+add_library(eigen_headers INTERFACE)
+target_include_directories(eigen_headers INTERFACE ${eigen_SOURCE_DIR})
+if(NOT TARGET Eigen3::Eigen)
+    add_library(Eigen3::Eigen ALIAS eigen_headers)
+endif()
 
 # ---- xatlas (industry-standard automatic UV atlas generator). Used to
 #      synthesize a SyphonUV layer for the SyphonInputLayer when the
