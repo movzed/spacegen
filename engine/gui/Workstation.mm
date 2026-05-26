@@ -678,90 +678,54 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                         "boundaries onto geometric creases — invisible "
                         "in projection — followed by big-chart packing.");
 
-    // ---- Mesh decimation (LOD) ----
-    // Predicts xatlas+SLIM time from triangle count so the operator can
-    // pick density vs runtime BEFORE clicking Generate. The Apply button
-    // runs meshoptimizer::simplifyWithAttributes (UV-aware, preserves the
-    // mask unwrap) and hot-reloads the GPU mesh in place — no restart.
+    // ---- UV-bake proxy density ----
+    // The dense mesh is ALWAYS rendered (lights, beams, silhouette use
+    // full detail). The slider here only controls how aggressively the
+    // mesh is decimated INTERNALLY for the xatlas+SLIM bake. After the
+    // bake finishes, the resulting uvs1 is barycentrically transferred
+    // back to the dense mesh — only uvs1 changes; positions/normals/
+    // indices stay full quality. ETA is the pessimistic estimator built
+    // from real production runs.
     {
         ImGui::Separator();
-        ImGui::TextDisabled("Mesh density (LOD)");
+        ImGui::TextDisabled("UV-bake proxy density (rendering uses full mesh)");
         int origTris = static_cast<int>(m.indices.size() / 3);
-        ImGui::SliderFloat("Keep ratio##dec", &gMeshKeepRatio, 0.05f, 1.0f,
+        ImGui::SliderFloat("Proxy ratio##dec", &gMeshKeepRatio, 0.05f, 1.0f,
                             "%.2f");
-        int targetTris = static_cast<int>(
+        int proxyTris = static_cast<int>(
             std::max(1, static_cast<int>(origTris * gMeshKeepRatio)));
-        double estSec = spacegen::estimateAtlasTimeSeconds(targetTris);
-        char etaStr[48];
-        if (estSec < 60.0) {
-            std::snprintf(etaStr, sizeof(etaStr), "%.0fs", estSec);
-        } else if (estSec < 3600.0) {
-            std::snprintf(etaStr, sizeof(etaStr), "%.0fm %02.0fs",
-                           std::floor(estSec / 60.0),
-                           std::fmod(estSec, 60.0));
-        } else {
-            std::snprintf(etaStr, sizeof(etaStr), "%.1fh",
-                           estSec / 3600.0);
-        }
-        ImGui::Text("After decimate: %s tris",
-                     [&]{
-                         static char buf[24];
-                         if (targetTris >= 1000000)
-                             std::snprintf(buf, sizeof(buf), "%.2fM",
-                                            targetTris / 1.0e6);
-                         else if (targetTris >= 1000)
-                             std::snprintf(buf, sizeof(buf), "%.0fk",
-                                            targetTris / 1000.0);
-                         else
-                             std::snprintf(buf, sizeof(buf), "%d", targetTris);
-                         return buf;
-                     }());
+        double etaSec = spacegen::estimateAtlasTimeSeconds(proxyTris);
 
-        // Colour the ETA red above 30 min, yellow 5-30 min, green under 5.
-        ImVec4 etaCol = estSec > 1800.0
+        auto fmt = [](double s, char* buf, size_t n) {
+            if (s < 60.0)        std::snprintf(buf, n, "%.0fs", s);
+            else if (s < 3600.0) std::snprintf(buf, n, "%.0fm",
+                                                std::round(s / 60.0));
+            else                  std::snprintf(buf, n, "%.1fh",
+                                                s / 3600.0);
+        };
+        char etaStr[24];
+        fmt(etaSec, etaStr, sizeof(etaStr));
+
+        auto tris2str = [](int n, char* buf, size_t bs){
+            if      (n >= 1000000) std::snprintf(buf, bs, "%.2fM", n / 1.0e6);
+            else if (n >= 1000)    std::snprintf(buf, bs, "%.0fk", n / 1000.0);
+            else                    std::snprintf(buf, bs, "%d",    n);
+        };
+        char origStr[24], proxyStr[24];
+        tris2str(origTris,  origStr,  sizeof(origStr));
+        tris2str(proxyTris, proxyStr, sizeof(proxyStr));
+        ImGui::Text("Render mesh: %s tris   ←   UV proxy: %s tris",
+                     origStr, proxyStr);
+
+        ImVec4 etaCol = etaSec > 1800.0
             ? ImVec4(0.95f, 0.40f, 0.30f, 1.0f)
-            : (estSec > 300.0
+            : (etaSec > 300.0
                 ? ImVec4(0.95f, 0.85f, 0.30f, 1.0f)
                 : ImVec4(0.30f, 0.85f, 0.40f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_Text, etaCol);
         ImGui::Text("Estimated atlas time: ~%s", etaStr);
         ImGui::PopStyleColor();
-        ImGui::TextDisabled("(extrapolated; xatlas time grows ~ N^2 in tris)");
-
-        bool canApply = (gMeshKeepRatio < 0.999f) &&
-                        (gUvState.status.load() ==
-                         static_cast<int>(UvAnalysisState::Status::Idle));
-        ImGui::BeginDisabled(!canApply);
-        if (ImGui::Button("Apply decimation (hot-reload, no restart)##decapp",
-                           ImVec2(-FLT_MIN, 28))) {
-            spacegen::DecimateResult dr =
-                spacegen::decimateMesh(m, gMeshKeepRatio);
-            if (dr.ok) {
-                scene.atlasApplied = false;
-                if (renderer.reloadMesh(0, m)) {
-                    gUvState.coverageComputed = false;     // recompute stats
-                    gUvState.lastOk  = true;
-                    char msg[160];
-                    std::snprintf(msg, sizeof(msg),
-                        "Decimated %d → %d tris in %.2fs. Click Generate "
-                        "to build a fresh atlas.",
-                        dr.trianglesBefore, dr.trianglesAfter, dr.elapsedSec);
-                    gUvState.lastMsg = msg;
-                } else {
-                    gUvState.lastOk  = false;
-                    gUvState.lastMsg = "Decimate OK but GPU reload failed.";
-                }
-            } else {
-                gUvState.lastOk  = false;
-                gUvState.lastMsg = "Decimate failed: " + dr.error;
-            }
-            // Reset slider visually to the new "100%" since we mutated.
-            gMeshKeepRatio = 1.0f;
-        }
-        ImGui::EndDisabled();
-        if (!canApply && gMeshKeepRatio < 0.999f) {
-            ImGui::TextDisabled("(Apply disabled while atlas worker is running.)");
-        }
+        ImGui::TextDisabled("(empirical: t ∝ N^3.95 + 20%% transfer pass)");
     }
 
     // Tier-4 controls: atlas engine selector
@@ -861,15 +825,16 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
             glm::vec3 viewDir = -glm::vec3(scene.camera.world[2]);
             // Capture optimize options at click time so toggling sliders
             // during a run doesn't affect the in-flight worker.
-            bool  doRefine   = gUvOptimizeRefine;
-            int   refineIter = gUvOptimizeMaxIter;
-            float refineExp  = gUvOptimizeVisExp;
+            bool  doRefine    = gUvOptimizeRefine;
+            int   refineIter  = gUvOptimizeMaxIter;
+            float refineExp   = gUvOptimizeVisExp;
             float refineFloor = gUvOptimizeVisFloor;
-            bool  refineProj = gUvOptimizeProjAware;
+            bool  refineProj  = gUvOptimizeProjAware;
             int   atlasEngine = gUvAtlasEngine;
+            float proxyRatio  = gMeshKeepRatio;
 
             gUvState.worker = std::make_unique<std::thread>(
-                [meshPtr, cacheStr, viewDir, atlasEngine,
+                [meshPtr, cacheStr, viewDir, atlasEngine, proxyRatio,
                  doRefine, refineIter, refineExp, refineFloor, refineProj]() {
                     // VJ mapping options. xatlas defaults are tuned for
                     // LIGHTMAPS — wrong for live video. We bias towards
@@ -892,40 +857,43 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                     opts.sharpEdgeAngleDeg  = gUvSharpAngleDeg;
 
                     auto t0 = std::chrono::steady_clock::now();
-                    // Sharp-edge pre-pass on a local copy of the mesh.
-                    // Result is consumed by xatlas without touching the
-                    // GPU-resident mesh until the worker finishes.
-                    spacegen::MeshData working = *meshPtr;
+                    // ---- UV-bake proxy pipeline ----
+                    // The dense mesh in *meshPtr is NEVER touched during
+                    // the bake. We build a coarser proxy here, run xatlas
+                    // + SLIM on the proxy, then transfer UV1 back to the
+                    // dense mesh via barycentric interpolation. The render
+                    // mesh stays full-density for lighting / shadows /
+                    // silhouette quality.
+                    gUvState.stageId.store(0);
+                    spacegen::MeshData proxy =
+                        spacegen::buildUvBakeProxy(*meshPtr, proxyRatio);
                     if (opts.preCutSharpEdges) {
-                        gUvState.stageId.store(0);
-                        working = spacegen::preCutOnSharpEdges(
-                            working, opts.sharpEdgeAngleDeg);
+                        proxy = spacegen::preCutOnSharpEdges(
+                            proxy, opts.sharpEdgeAngleDeg);
                     }
-                    // Dispatch to selected backend.
+                    // Dispatch to selected backend. Operates on PROXY only.
                     auto res = std::make_unique<spacegen::UvAtlasResult>(
                         atlasEngine == 1
-                            ? spacegen::generateAtlasGeogram(working, opts,
+                            ? spacegen::generateAtlasGeogram(proxy, opts,
                                   uvWorkerProgress, &gUvState)
-                            : spacegen::generateAtlas(working, opts,
+                            : spacegen::generateAtlas(proxy, opts,
                                   uvWorkerProgress, &gUvState));
                     // ---- Tier 3: SpaceGen Optimize refinement ----
-                    // After xatlas returns a valid atlas, refine each chart
-                    // with SLIM + projection-aware weighting. The refined
-                    // uvs1 stays packed because boundary verts stay anchored.
+                    // SLIM refines uvs1 on the PROXY (still proxy-sized).
+                    // Boundary verts anchored so xatlas's packing remains
+                    // valid after refinement.
                     if (res->ok && doRefine && !gUvState.shouldCancel.load()) {
-                        gUvState.stageId.store(6);          // "Refining (SLIM)"
+                        gUvState.stageId.store(6);
                         gUvState.progressPct.store(0);
-                        // Stitch xatlas output into a temporary MeshData so
-                        // optimiseUVs has the post-atlas positions+indices.
-                        spacegen::MeshData refined;
-                        refined.name        = meshPtr->name;
-                        refined.transform   = meshPtr->transform;
-                        refined.materialIdx = meshPtr->materialIdx;
-                        refined.positions   = res->positions;
-                        refined.normals     = res->normals;
-                        refined.uvs         = res->uvs0;
-                        refined.uvs1        = res->uvs1;
-                        refined.indices     = res->indices;
+                        spacegen::MeshData proxyForSlim;
+                        proxyForSlim.name        = "proxy_slim";
+                        proxyForSlim.transform   = meshPtr->transform;
+                        proxyForSlim.materialIdx = meshPtr->materialIdx;
+                        proxyForSlim.positions   = res->positions;
+                        proxyForSlim.normals     = res->normals;
+                        proxyForSlim.uvs         = res->uvs0;
+                        proxyForSlim.uvs1        = res->uvs1;
+                        proxyForSlim.indices     = res->indices;
 
                         spacegen::UvOptimizeOptions oopts;
                         oopts.maxIterations    = refineIter;
@@ -934,12 +902,51 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                         oopts.projectionAware  = refineProj;
                         oopts.viewDir          = viewDir;
 
-                        auto oRes = spacegen::optimiseUVs(refined, oopts,
+                        auto oRes = spacegen::optimiseUVs(proxyForSlim, oopts,
                             uvWorkerProgress, &gUvState);
                         if (oRes.ok) {
                             res->uvs1 = std::move(oRes.refinedUVs);
                         }
                     }
+
+                    // ---- UV1 transfer: proxy → dense (barycentric) ----
+                    // Build the proxy-with-refined-uvs1 MeshData, then
+                    // scatter uvs1 to the dense mesh via nearest-triangle +
+                    // barycentric interpolation. The dense mesh's positions
+                    // / normals / indices stay UNTOUCHED — only uvs1 is
+                    // returned for hot-reload.
+                    if (res->ok && !gUvState.shouldCancel.load()) {
+                        gUvState.stageId.store(6);     // share "refining" stage label
+                        gUvState.progressPct.store(0);
+                        spacegen::MeshData proxyWithUv1;
+                        proxyWithUv1.positions = res->positions;
+                        proxyWithUv1.indices   = res->indices;
+                        proxyWithUv1.uvs1      = res->uvs1;
+
+                        std::vector<glm::vec2> denseUv1;
+                        auto tRes = spacegen::transferUv1FromProxyToDense(
+                            *meshPtr, proxyWithUv1, denseUv1,
+                            [](int pct, void*){
+                                gUvState.progressPct.store(pct);
+                                return !gUvState.shouldCancel.load();
+                            }, &gUvState);
+                        if (tRes.ok) {
+                            // Clear proxy mesh data and put ONLY the
+                            // transferred dense-sized uvs1 in the result.
+                            // The Done branch detects positions.empty() →
+                            // updates only dense.uvs1, leaves positions /
+                            // normals / indices untouched.
+                            res->positions.clear();
+                            res->normals.clear();
+                            res->uvs0.clear();
+                            res->indices.clear();
+                            res->uvs1 = std::move(denseUv1);
+                        } else {
+                            res->ok    = false;
+                            res->error = "UV1 transfer to dense failed: " + tRes.error;
+                        }
+                    }
+
                     auto t1 = std::chrono::steady_clock::now();
                     double secs =
                         std::chrono::duration<double>(t1 - t0).count();
@@ -1115,12 +1122,23 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
 
         if (gUvState.result && gUvState.result->ok && gUvState.lastOk) {
             // Hot-swap mesh in place using the freshly generated result.
+            //
+            // Two paths:
+            //  - Proxy pipeline (default): positions.empty() in the result
+            //    → only dense.uvs1 is updated; render mesh stays full
+            //      detail.
+            //  - Legacy pipeline (ratio == 1.0 + atlas may add verts):
+            //    full mesh swap.
             spacegen::UvAtlasResult& r = *gUvState.result;
-            m.positions = std::move(r.positions);
-            m.normals   = std::move(r.normals);
-            m.uvs       = std::move(r.uvs0);
-            m.uvs1      = std::move(r.uvs1);
-            m.indices   = std::move(r.indices);
+            if (r.positions.empty()) {
+                m.uvs1 = std::move(r.uvs1);
+            } else {
+                m.positions = std::move(r.positions);
+                m.normals   = std::move(r.normals);
+                m.uvs       = std::move(r.uvs0);
+                m.uvs1      = std::move(r.uvs1);
+                m.indices   = std::move(r.indices);
+            }
             if (renderer.reloadMesh(0, m)) {
                 scene.atlasApplied = true;
                 gUvState.lastMsg = "Atlas generated AND applied. UV1 is now "

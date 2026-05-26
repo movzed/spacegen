@@ -36,16 +36,85 @@ struct DecimateResult {
 // `ratio` <= 0.0 → returns error.
 DecimateResult decimateMesh(MeshData& mesh, float ratio);
 
-// Empirical estimate of xatlas + SLIM total wall time on the user's M1
-// Max for a mesh of `triangleCount` triangles, with our current options
-// (Sharp Edges pre-cut at 50°, big-charts bias, bruteForce off, SLIM
-// 12 iter).
+// ============================================================
+// UV-bake-only proxy pipeline (operator-correct architecture)
+// ============================================================
 //
-// Fitted from two anchor points observed in production:
-//   - 0.5 M tris → 30 s
-//   - 7.7 M tris → 9000 s (extrapolated from 51% at 4500s)
-// → t ∝ N^2.08 in millions of triangles. Adds a 20% overhead for
-// SLIM + cache + hot-reload.
+// SpaceGen renders the DENSE mesh — every triangle is needed for
+// silhouette, lighting integration, beam intersection, etc. We never
+// want to throw away geometry for visual reasons. But xatlas + SLIM
+// scale superlinearly with triangle count and choke on >2 M tris.
+//
+// Solution: decimate ONLY for the UV bake. Build a coarser proxy in
+// memory, run xatlas + SLIM on the proxy, then SCATTER the resulting
+// uvs1 back to the dense mesh via barycentric interpolation. The
+// dense mesh in scene.meshes[0] keeps its original positions /
+// normals / indices / uvs untouched — only its uvs1 is overwritten
+// with the transferred values.
+
+// Build a proxy mesh for UV baking. Returns a new MeshData with
+// decimated positions/indices, normals copied through, original uvs
+// preserved (passed to meshopt as attribute for quadric-error term).
+// uvs1 is left empty. The proxy is independent from the source — the
+// caller owns it and feeds it to xatlas/SLIM.
+MeshData buildUvBakeProxy(const MeshData& dense, float ratio);
+
+// Transfer per-vertex uvs1 from a proxy mesh back to a dense mesh.
+//
+// For each dense vertex:
+//   1. Find the closest triangle on the proxy (in 3D world space).
+//   2. Compute the dense vertex's barycentric coordinates on that
+//      triangle's plane (clamped to the triangle).
+//   3. denseOut[i] = bary.a * proxy.uvs1[T.v0] +
+//                    bary.b * proxy.uvs1[T.v1] +
+//                    bary.c * proxy.uvs1[T.v2]
+//
+// `denseOut` is resized to dense.positions.size(). The 3D-space
+// nearest-triangle search uses a uniform spatial grid for O(N) total
+// cost on million-vertex meshes.
+//
+// `progressCb` is optional — called with (0..100) during the dense
+// vertex sweep. Returning false aborts.
+struct TransferResult {
+    bool        ok = false;
+    std::string error;
+    int         denseVerts   = 0;
+    int         proxyTris    = 0;
+    double      elapsedSec   = 0.0;
+};
+
+using TransferProgressFn = bool(*)(int progressPct, void* user);
+
+TransferResult transferUv1FromProxyToDense(
+    const MeshData& dense,
+    const MeshData& proxyWithUv1,
+    std::vector<glm::vec2>& denseOutUv1,
+    TransferProgressFn cb = nullptr,
+    void* user = nullptr);
+
+// Empirical estimate of xatlas + SLIM total wall time on the user's
+// M1 Max for a mesh of `triangleCount` triangles.
+//
+// Xatlas runtime does NOT scale smoothly with N. The dominant factors
+// are mesh quality (zero-area faces, zero-length edges, non-manifold
+// regions) and Sharp-Edge pre-cut boundary count — neither of which
+// is knowable from triangle count alone. So we report a RANGE rather
+// than a misleading point estimate.
+//
+// Calibrated from three observed runs:
+//   - 0.5 M clean tris             → 30 s
+//   - 2.0 M tris (with 30k+ degens)→ 7200 s (2 h, observed)
+//   - 7.7 M raw tris               → ~9000 s @ 51% (extrapolated)
+//
+// `lowSec`  = optimistic case (cleanish mesh, few sharp edges).
+// `highSec` = pessimistic case (degenerate-heavy mesh).
+struct AtlasTimeRange {
+    double lowSec  = 0.0;
+    double highSec = 0.0;
+};
+AtlasTimeRange estimateAtlasTimeRange(int triangleCount);
+
+// Backward-compatible scalar — returns the optimistic estimate.
 double estimateAtlasTimeSeconds(int triangleCount);
 
 } // namespace spacegen
