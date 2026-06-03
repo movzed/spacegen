@@ -26,6 +26,8 @@
 #include "core/StructureLayer.h"
 #include "core/BeamLayer.h"
 #include "core/DirectionalLightLayer.h"
+#include "effects/bloom/BloomEffect.h"
+#include "effects/motion_blur/MotionBlurEffect.h"
 #include "core/AmbientLightLayer.h"
 #include "backends/metal/MetalRenderer.h"
 #include "gui/Workstation.h"
@@ -213,6 +215,19 @@ int main(int argc, char** argv) {
         b->intensity    = 4.0f;
         b->innerDeg     = 12.0f;
         b->outerDeg     = 22.0f;
+    }
+    // ---- Diagnostic auto-add: Bloom + MotionBlur to verify the effect
+    //      bus walks on startup. The operator can disable / remove them
+    //      from the Layer Rack if not wanted.
+    {
+        auto* bl = scene.bus.add<spacegen::BloomEffect>();
+        bl->name      = "Bloom (auto)";
+        bl->threshold = 0.2f;     // catch most of the lit surface
+        bl->intensity = 1.5f;     // visible halo on bright highlights
+    }
+    {
+        auto* mb = scene.bus.add<spacegen::MotionBlurEffect>();
+        mb->name      = "Motion Blur (auto)";
     }
 
     // ImGui Workstation (overlays panels on top of the rendered scene).
