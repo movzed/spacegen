@@ -83,6 +83,36 @@ inline float easeMix(float u, float mix) {
     return glm::mix(u, cosineEased, glm::clamp(mix, 0.0f, 1.0f));
 }
 
+// Discrete easing selector applied to a 0..1 phase. All curves map
+// [0,1]→[0,1] with f(0)=0, f(1)=1 so the period seam stays continuous
+// when the eased phase is fed back into a 2π angle.
+inline float applyEasing(float u, AreaLightLayer::Easing e) {
+    u = glm::clamp(u, 0.0f, 1.0f);
+    switch (e) {
+        case AreaLightLayer::Easing::Linear:
+            return u;
+        case AreaLightLayer::Easing::Smoothstep:
+            // Hermite 3u²-2u³ — classic GLSL smoothstep, C¹ at the ends.
+            return u * u * (3.0f - 2.0f * u);
+        case AreaLightLayer::Easing::EaseInOut:
+            // Sinusoidal ease, equivalent to easeMix(u, 1).
+            return 0.5f - 0.5f * std::cos(u * kPi);
+        case AreaLightLayer::Easing::Bounce: {
+            // Penner-style bounce, but normalised so f(1)==1 exactly. The
+            // light "lands" with a couple of decaying overshoots — reads as
+            // an articulated tap at the end of each swing.
+            const float n1 = 7.5625f, d1 = 2.75f;
+            float x = u;
+            if (x < 1.0f / d1)        x = n1 * x * x;
+            else if (x < 2.0f / d1) { x -= 1.5f  / d1; x = n1 * x * x + 0.75f; }
+            else if (x < 2.5f / d1) { x -= 2.25f / d1; x = n1 * x * x + 0.9375f; }
+            else                    { x -= 2.625f/ d1; x = n1 * x * x + 0.984375f; }
+            return x;
+        }
+    }
+    return u;
+}
+
 // Compute the scene's *safe orbit radius*: half the diagonal of the
 // world-space AABB (circumscribed-sphere radius), scaled by safetyFactor,
 // floored at a sensible minimum so empty scenes don't collapse to a point.
@@ -217,6 +247,171 @@ glm::vec3 AreaLightLayer::evalRandom_(double t) {
 }
 
 // ---------------------------------------------------------------------------
+// Articulated paths
+//
+// pathAngle_(): turns elapsed time into an eased, phase-offset angle. The
+// raw phase advances at `speedDegPerSec` (one "cycle" = 360°). We add the
+// per-light `phaseOffset` (in turns), fold the integer turns out, ease the
+// fractional 0..1 phase through the selected curve, then re-expand to an
+// absolute angle (whole turns + eased fraction)·2π. This keeps motion
+// monotonic across periods while letting Smoothstep/EaseInOut/Bounce shape
+// the *within-cycle* timing — so staggered-phase lights articulate as a
+// choreographed group rather than sliding at constant rate.
+// ---------------------------------------------------------------------------
+
+float AreaLightLayer::pathAngle_(double t) const {
+    double turns = t * (static_cast<double>(speedDegPerSec) / 360.0)
+                 + static_cast<double>(phaseOffset);
+    double whole = std::floor(turns);
+    float  frac  = static_cast<float>(turns - whole);    // [0,1)
+    float  eased = applyEasing(frac, easing);            // [0,1], f(0)=0,f(1)=1
+    return static_cast<float>(whole + static_cast<double>(eased)) * kTau;
+}
+
+// Figure-eight (Gerono lemniscate): x = sin θ, y = sin θ·cos θ. Laid on the
+// axis tangent plane and lifted to the sphere. Traces a crossing "∞" loop
+// over the structure — a sweep that returns through its own centre line.
+glm::vec3 AreaLightLayer::evalFigureEight_(double t) const {
+    glm::vec3 right, up, fwd;
+    axisFrame(orbitAxis, right, up, fwd);
+    float th = pathAngle_(t);
+    float xx = pathAmplitude * std::sin(th);
+    float yy = pathAmplitude * std::sin(th) * std::cos(th);
+    glm::vec3 v = fwd + right * xx + up * yy;
+    if (glm::length(v) < 1e-5f) v = fwd;
+    return glm::normalize(v);
+}
+
+// Rose / rhodonea: r(θ) = cos(k·θ) traces a k-petal (odd k) or 2k-petal
+// (even k) star. The petals bloom outward and snap back through the pole,
+// giving a punchy articulated "flower" sweep.
+glm::vec3 AreaLightLayer::evalRose_(double t) const {
+    glm::vec3 right, up, fwd;
+    axisFrame(orbitAxis, right, up, fwd);
+    float th = pathAngle_(t);
+    int   k  = std::max(1, roseK);
+    float r  = pathAmplitude * std::cos(static_cast<float>(k) * th);
+    float xx = r * std::cos(th);
+    float yy = r * std::sin(th);
+    glm::vec3 v = fwd + right * xx + up * yy;
+    if (glm::length(v) < 1e-5f) v = fwd;
+    return glm::normalize(v);
+}
+
+// Spiral: the azimuth sweeps steadily while the *polar* opening breathes
+// in and out (cos over `spiralTurns` excursions per cycle). The light winds
+// from near the pole out toward the equator and back — a coiling orbit.
+glm::vec3 AreaLightLayer::evalSpiral_(double t) const {
+    float th    = pathAngle_(t);
+    // Polar angle oscillates 0..(spiralPolar·π/2): 0 = at the axis pole,
+    // larger = swung toward the equator. cos keeps it smooth & bounded.
+    float breath = 0.5f - 0.5f * std::cos(spiralTurns * th);   // 0..1
+    float polar  = glm::clamp(spiralPolar, 0.0f, 1.0f) * (kPi * 0.5f) * breath;
+    float zz = std::cos(polar);                 // axis component (near 1 at pole)
+    float rr = std::sin(polar);                 // tangent-plane radius
+    float c  = rr * std::cos(th);
+    float s  = rr * std::sin(th);
+    switch (orbitAxis) {
+        case Axis::Z: return glm::vec3(c,  s,  zz);
+        case Axis::Y: return glm::vec3(c,  zz, s);
+        case Axis::X: return glm::vec3(zz, c,  s);
+    }
+    return glm::vec3(c, s, zz);
+}
+
+// Pendulum: a damped harmonic swing about the axis pole. The swing angle is
+// A·e^(-ζ·φ)·cos(φ) where φ is the (un-eased) free-running phase, so the arc
+// decays toward the pole then the cycle reseeds — a articulated rocking
+// motion. Swings within the tangent plane along `right`.
+glm::vec3 AreaLightLayer::evalPendulum_(double t) const {
+    glm::vec3 right, up, fwd;
+    axisFrame(orbitAxis, right, up, fwd);
+    // Free-running phase (no path-angle easing here; the damping shapes it).
+    double turns = t * (static_cast<double>(speedDegPerSec) / 360.0)
+                 + static_cast<double>(phaseOffset);
+    float  frac  = static_cast<float>(turns - std::floor(turns));   // 0..1
+    float  phi   = frac * kTau;
+    float  decay = std::exp(-glm::clamp(pendDamping, 0.0f, 4.0f) * frac);
+    float  swing = glm::radians(pendSwingDeg) * decay * std::cos(phi);
+    // Rotate `fwd` toward `right` by the swing angle: stays on the sphere.
+    glm::vec3 v = fwd * std::cos(swing) + right * std::sin(swing);
+    return glm::normalize(v);
+}
+
+// Compound: layer two harmonics on the tangent plane — a slow primary
+// circle plus a faster secondary loop (freq = compoundRatio), blended by
+// compoundMix. Non-integer ratios give a quasi-periodic woven path that
+// never quite repeats, reading as organic articulated drift.
+glm::vec3 AreaLightLayer::evalCompound_(double t) const {
+    glm::vec3 right, up, fwd;
+    axisFrame(orbitAxis, right, up, fwd);
+    float th  = pathAngle_(t);
+    float th2 = th * compoundRatio;
+    float mix = glm::clamp(compoundMix, 0.0f, 1.0f);
+    float xx = pathAmplitude * ((1.0f - mix) * std::cos(th) + mix * std::cos(th2));
+    float yy = pathAmplitude * ((1.0f - mix) * std::sin(th) + mix * std::sin(th2));
+    glm::vec3 v = fwd + right * xx + up * yy;
+    if (glm::length(v) < 1e-5f) v = fwd;
+    return glm::normalize(v);
+}
+
+// ---------------------------------------------------------------------------
+// Motion presets — one-click choreography bundles.
+// ---------------------------------------------------------------------------
+
+void AreaLightLayer::applyPreset(MotionPreset p) {
+    preset = p;
+    switch (p) {
+        case MotionPreset::Custom:
+            break;   // leave operator values as-is
+        case MotionPreset::SlowOrbit:
+            orbitMode      = OrbitMode::Circular;
+            orbitAxis      = Axis::Z;
+            speedDegPerSec = 9.0f;
+            easing         = Easing::Linear;
+            phaseOffset    = 0.0f;
+            break;
+        case MotionPreset::Figure8Sweep:
+            orbitMode      = OrbitMode::FigureEight;
+            orbitAxis      = Axis::Z;
+            speedDegPerSec = 26.0f;
+            pathAmplitude  = 1.0f;
+            easing         = Easing::EaseInOut;
+            phaseOffset    = 0.0f;
+            break;
+        case MotionPreset::RoseBloom:
+            orbitMode      = OrbitMode::Rose;
+            orbitAxis      = Axis::Z;
+            speedDegPerSec = 20.0f;
+            pathAmplitude  = 1.1f;
+            roseK          = 5;
+            easing         = Easing::Smoothstep;
+            phaseOffset    = 0.0f;
+            break;
+        case MotionPreset::PendulumPair:
+            orbitMode      = OrbitMode::Pendulum;
+            orbitAxis      = Axis::Z;
+            speedDegPerSec = 30.0f;
+            pendSwingDeg   = 70.0f;
+            pendDamping    = 0.5f;
+            easing         = Easing::Linear;
+            // Caller staggers phaseOffset (e.g. 0.0 and 0.5) across the pair.
+            phaseOffset    = 0.0f;
+            break;
+        case MotionPreset::ChaosSwarm:
+            orbitMode      = OrbitMode::Compound;
+            orbitAxis      = Axis::Z;
+            speedDegPerSec = 34.0f;
+            pathAmplitude  = 1.2f;
+            compoundRatio  = 2.7f;     // non-integer → never repeats
+            compoundMix    = 0.5f;
+            easing         = Easing::Bounce;
+            phaseOffset    = 0.0f;
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // update() — runs the orbit, applies the hard safety clamp.
 // ---------------------------------------------------------------------------
 
@@ -230,10 +425,15 @@ void AreaLightLayer::update(const RenderContext& ctx) {
     //    sphere around the centroid.
     glm::vec3 dir(0.0f, 0.0f, 1.0f);
     switch (orbitMode) {
-        case OrbitMode::Circular:  dir = evalCircular_(ctx.elapsedSeconds);  break;
-        case OrbitMode::Lissajous: dir = evalLissajous_(ctx.elapsedSeconds); break;
-        case OrbitMode::Helix:     dir = evalHelix_(ctx.elapsedSeconds);     break;
-        case OrbitMode::Random:    dir = evalRandom_(ctx.elapsedSeconds);    break;
+        case OrbitMode::Circular:    dir = evalCircular_(ctx.elapsedSeconds);    break;
+        case OrbitMode::Lissajous:   dir = evalLissajous_(ctx.elapsedSeconds);   break;
+        case OrbitMode::Helix:       dir = evalHelix_(ctx.elapsedSeconds);       break;
+        case OrbitMode::Random:      dir = evalRandom_(ctx.elapsedSeconds);      break;
+        case OrbitMode::FigureEight: dir = evalFigureEight_(ctx.elapsedSeconds); break;
+        case OrbitMode::Rose:        dir = evalRose_(ctx.elapsedSeconds);        break;
+        case OrbitMode::Spiral:      dir = evalSpiral_(ctx.elapsedSeconds);      break;
+        case OrbitMode::Pendulum:    dir = evalPendulum_(ctx.elapsedSeconds);    break;
+        case OrbitMode::Compound:    dir = evalCompound_(ctx.elapsedSeconds);    break;
     }
     if (glm::length(dir) < 1e-5f) dir = glm::vec3(0.0f, 0.0f, 1.0f);
     dir = glm::normalize(dir);
@@ -309,12 +509,46 @@ void AreaLightLayer::drawInspector() {
         ImGui::SliderFloat("Range (m)##area", &range,     0.5f, 200.0f);
     }
 
+    if (ImGui::CollapsingHeader("Motion preset", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* presets[] = {
+            "Custom", "Slow Orbit", "Figure-8 Sweep",
+            "Rose Bloom", "Pendulum Pair", "Chaos Swarm"
+        };
+        int pi = static_cast<int>(preset);
+        ImGui::SetNextItemWidth(170.0f);
+        if (ImGui::Combo("Preset##area", &pi, presets, 6)) {
+            applyPreset(static_cast<MotionPreset>(pi));
+        }
+        ImGui::TextDisabled("presets set mode + speed + amplitude + easing;");
+        ImGui::TextDisabled("stagger 'Phase' across lights for a swarm.");
+    }
+
     if (ImGui::CollapsingHeader("Orbit", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const char* modes[] = { "Circular", "Lissajous", "Helix", "Random" };
+        const char* modes[] = {
+            "Circular", "Lissajous", "Helix", "Random",
+            "Figure-8", "Rose", "Spiral", "Pendulum", "Compound"
+        };
         int mi = static_cast<int>(orbitMode);
         ImGui::SetNextItemWidth(150.0f);
-        if (ImGui::Combo("Mode##area", &mi, modes, 4)) {
+        if (ImGui::Combo("Mode##area", &mi, modes, 9)) {
             orbitMode = static_cast<OrbitMode>(mi);
+            preset    = MotionPreset::Custom;   // hand-picked mode
+        }
+
+        // --- Articulated path: shared phase + easing -----------------------
+        // Applies to every cyclic mode. Staggering `phaseOffset` across
+        // several area lights forms the choreographed/articulated swarm.
+        bool cyclic = (orbitMode != OrbitMode::Random);
+        if (cyclic) {
+            const char* eases[] = { "Linear", "Smoothstep", "Ease-in-out", "Bounce" };
+            int ei = static_cast<int>(easing);
+            ImGui::SetNextItemWidth(130.0f);
+            if (ImGui::Combo("Easing##area", &ei, eases, 4)) {
+                easing = static_cast<Easing>(ei);
+                preset = MotionPreset::Custom;
+            }
+            if (ImGui::SliderFloat("Phase (turns)##area", &phaseOffset, 0.0f, 1.0f))
+                preset = MotionPreset::Custom;
         }
 
         if (orbitMode == OrbitMode::Circular
@@ -352,6 +586,53 @@ void AreaLightLayer::drawInspector() {
         if (orbitMode == OrbitMode::Random) {
             ImGui::SliderFloat("Dwell (s)##area",  &dwellSeconds, 0.1f, 10.0f);
             ImGui::SliderFloat("Slerp ease##area", &slerpEase,    0.0f, 1.0f);
+        }
+
+        // --- Articulated path controls -----------------------------------
+        if (orbitMode == OrbitMode::FigureEight
+         || orbitMode == OrbitMode::Rose
+         || orbitMode == OrbitMode::Spiral
+         || orbitMode == OrbitMode::Pendulum
+         || orbitMode == OrbitMode::Compound) {
+            const char* axes[] = { "X", "Y", "Z" };
+            int ai = static_cast<int>(orbitAxis);
+            ImGui::SetNextItemWidth(80.0f);
+            if (ImGui::Combo("Pole axis##areaArt", &ai, axes, 3)) {
+                orbitAxis = static_cast<Axis>(ai);
+            }
+            if (ImGui::SliderFloat("Speed (deg/s)##areaArt",
+                                   &speedDegPerSec, -180.0f, 180.0f))
+                preset = MotionPreset::Custom;
+        }
+
+        if (orbitMode == OrbitMode::FigureEight) {
+            ImGui::SliderFloat("Amplitude##areaFig", &pathAmplitude, 0.0f, 1.5f);
+            ImGui::TextDisabled("Gerono lemniscate (crossing figure-8)");
+        }
+
+        if (orbitMode == OrbitMode::Rose) {
+            ImGui::SliderFloat("Amplitude##areaRose", &pathAmplitude, 0.0f, 1.5f);
+            ImGui::SliderInt("Petals k##areaRose", &roseK, 1, 12);
+            ImGui::TextDisabled("r=cos(k.theta): odd k -> k petals, even -> 2k");
+        }
+
+        if (orbitMode == OrbitMode::Spiral) {
+            ImGui::SliderFloat("Turns##areaSpiral",      &spiralTurns, 0.5f, 8.0f);
+            ImGui::SliderFloat("Polar open##areaSpiral", &spiralPolar, 0.0f, 1.0f);
+            ImGui::TextDisabled("azimuth sweeps while polar angle breathes");
+        }
+
+        if (orbitMode == OrbitMode::Pendulum) {
+            ImGui::SliderFloat("Swing (deg)##areaPend", &pendSwingDeg, 5.0f, 170.0f);
+            ImGui::SliderFloat("Damping##areaPend",     &pendDamping,  0.0f, 4.0f);
+            ImGui::TextDisabled("damped harmonic rocking about the pole");
+        }
+
+        if (orbitMode == OrbitMode::Compound) {
+            ImGui::SliderFloat("Amplitude##areaCmp",  &pathAmplitude, 0.0f, 1.5f);
+            ImGui::SliderFloat("Harm. ratio##areaCmp", &compoundRatio, 0.5f, 8.0f);
+            ImGui::SliderFloat("Harm. mix##areaCmp",   &compoundMix,   0.0f, 1.0f);
+            ImGui::TextDisabled("non-integer ratio -> quasi-periodic weave");
         }
     }
 

@@ -16,6 +16,8 @@
 #include "Workstation.h"
 #include "../core/Scene.h"
 #include "../core/Layer.h"
+#include "../core/ScenePreset.h"
+#include "../core/LayerFactory.h"
 #include "../core/StructureLayer.h"
 #include "../core/BeamLayer.h"
 #include "../core/DirectionalLightLayer.h"
@@ -81,6 +83,11 @@ static bool isPostFxLayer(const spacegen::ILayer* l) {
         || std::strcmp(n, "Glitch")                == 0
         || std::strcmp(n, "Volumetric Beams")      == 0;
 }
+
+// Forward decl — Presets UI block. Defined further down (after the preset
+// storage helpers, which sit next to writePanelState/readPanelState) but
+// called from drawLayerRack above them.
+static void drawPresetsSection(spacegen::Scene& scene, uint32_t& selectedLayerId);
 
 void styleSpaceGen() {
     ImGui::StyleColorsDark();
@@ -207,6 +214,9 @@ void drawLayerRack(spacegen::Scene& scene,
                    uint32_t& selectedLayerId,
                    bool* open) {
     if (!ImGui::Begin(kLayersWindowName, open)) { ImGui::End(); return; }
+
+    // Presets: save / load the whole layer stack, set a startup default.
+    drawPresetsSection(scene, selectedLayerId);
 
     // Top toolbar: add buttons.
     if (ImGui::Button("+ Spot")) {
@@ -884,6 +894,161 @@ static void readPanelState(spacegen::Scene& scene) {
     }
     std::fprintf(stderr, "[Workstation] panel_state.json loaded from %s\n",
                   p.string().c_str());
+}
+
+// ---- Preset storage (layer-stack save/load) --------------------------------
+//
+// Presets live in a `presets/` folder next to scene.json. Each named preset is
+// `presets/<name>.json`. The startup default is simply `presets/default.json`
+// — "Set as default" copies the chosen preset's contents there, and
+// loadDefaultPresetIfAny() reads it on launch. This mirrors the panel_state.json
+// "next to scene.json" convention and needs no extra marker file.
+
+static std::filesystem::path presetsDir(const spacegen::Scene& scene) {
+    return std::filesystem::path(scene.folderPath) / "presets";
+}
+
+static std::filesystem::path presetPath(const spacegen::Scene& scene,
+                                         const std::string& name) {
+    return presetsDir(scene) / (name + ".json");
+}
+
+static std::filesystem::path defaultPresetPath(const spacegen::Scene& scene) {
+    return presetPath(scene, "default");
+}
+
+// List preset stem names (without ".json"), sorted. "default" is included if
+// present so the operator can see/re-load the current startup default.
+static std::vector<std::string> listPresets(const spacegen::Scene& scene) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    auto dir = presetsDir(scene);
+    if (!std::filesystem::exists(dir, ec)) return out;
+    for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!e.is_regular_file()) continue;
+        const auto& p = e.path();
+        if (p.extension() == ".json") out.push_back(p.stem().string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// UI state for the Presets section, kept file-scoped like the UV knobs above.
+static char        gPresetNameBuf[64]   = "my-setup";
+static int         gPresetSelected      = -1;   // index into gPresetList
+static std::string gPresetStatus;               // last-action feedback line
+static std::vector<std::string> gPresetList;     // refreshed on demand
+static bool        gPresetListDirty     = true;  // refresh on first draw
+
+static void refreshPresetList(const spacegen::Scene& scene) {
+    gPresetList = listPresets(scene);
+    gPresetListDirty = false;
+    if (gPresetSelected >= static_cast<int>(gPresetList.size()))
+        gPresetSelected = gPresetList.empty() ? -1 : 0;
+}
+
+// Presets UI block. Rendered inside the Layer Rack panel (that's where the
+// stack the operator wants to persist lives). Mutates scene.bus on Load.
+static void drawPresetsSection(spacegen::Scene& scene,
+                               uint32_t& selectedLayerId) {
+    if (!ImGui::CollapsingHeader("Presets",
+                                  ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    if (gPresetListDirty) refreshPresetList(scene);
+
+    // --- Save current stack as a named preset ---
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::InputText("##presetName", gPresetNameBuf, sizeof(gPresetNameBuf));
+    ImGui::SameLine();
+    if (ImGui::Button("Save preset")) {
+        std::string name(gPresetNameBuf);
+        if (name.empty()) {
+            gPresetStatus = "Name is empty.";
+        } else {
+            std::error_code ec;
+            std::filesystem::create_directories(presetsDir(scene), ec);
+            auto path = presetPath(scene, name);
+            if (spacegen::savePreset(scene.bus, path.string())) {
+                gPresetStatus = "Saved: presets/" + name + ".json";
+                refreshPresetList(scene);
+                // Auto-select the just-saved preset.
+                for (size_t i = 0; i < gPresetList.size(); ++i)
+                    if (gPresetList[i] == name) gPresetSelected = (int)i;
+            } else {
+                gPresetStatus = "Save FAILED (cannot write file).";
+            }
+        }
+    }
+
+    ImGui::Separator();
+
+    // --- Pick + load / set-default / delete an existing preset ---
+    if (gPresetList.empty()) {
+        ImGui::TextDisabled("No presets saved yet.");
+    } else {
+        const char* preview = (gPresetSelected >= 0
+                               && gPresetSelected < (int)gPresetList.size())
+                                  ? gPresetList[gPresetSelected].c_str()
+                                  : "(select)";
+        ImGui::SetNextItemWidth(150.0f);
+        if (ImGui::BeginCombo("##presetList", preview)) {
+            for (int i = 0; i < (int)gPresetList.size(); ++i) {
+                bool sel = (i == gPresetSelected);
+                if (ImGui::Selectable(gPresetList[i].c_str(), sel))
+                    gPresetSelected = i;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        const bool hasSel = (gPresetSelected >= 0
+                             && gPresetSelected < (int)gPresetList.size());
+        ImGui::BeginDisabled(!hasSel);
+        if (ImGui::Button("Load")) {
+            auto path = presetPath(scene, gPresetList[gPresetSelected]);
+            if (spacegen::loadPreset(scene.bus, path.string())) {
+                selectedLayerId = 0;  // selection bookkeeping re-picks next frame
+                gPresetStatus = "Loaded: " + gPresetList[gPresetSelected];
+            } else {
+                gPresetStatus = "Load FAILED (bad/missing file).";
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Set as default")) {
+            // Copy the chosen preset's contents into presets/default.json so
+            // loadDefaultPresetIfAny() picks it up at next launch.
+            std::error_code ec;
+            std::filesystem::create_directories(presetsDir(scene), ec);
+            auto src = presetPath(scene, gPresetList[gPresetSelected]);
+            auto dst = defaultPresetPath(scene);
+            std::filesystem::copy_file(
+                src, dst,
+                std::filesystem::copy_options::overwrite_existing, ec);
+            if (!ec) {
+                gPresetStatus = "Default set: " + gPresetList[gPresetSelected];
+                refreshPresetList(scene);
+            } else {
+                gPresetStatus = "Set-default FAILED.";
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete")) {
+            std::error_code ec;
+            std::filesystem::remove(
+                presetPath(scene, gPresetList[gPresetSelected]), ec);
+            gPresetStatus = ec ? "Delete FAILED."
+                               : "Deleted: " + gPresetList[gPresetSelected];
+            refreshPresetList(scene);
+        }
+        ImGui::EndDisabled();
+    }
+
+    if (!gPresetStatus.empty()) {
+        ImGui::TextWrapped("%s", gPresetStatus.c_str());
+    }
+    ImGui::Separator();
 }
 
 // xatlas progress trampoline. Runs on the worker thread; writes to atomics
@@ -1791,6 +1956,24 @@ CompositionTarget Workstation::beginFrame(int sceneOutputW,
     return {offscreen_, offscreenW_, offscreenH_};
 }
 
+void Workstation::loadDefaultPresetIfAny(Scene& scene) {
+    if (defaultPresetLoaded_) return;   // idempotent regardless of caller
+    defaultPresetLoaded_ = true;
+    auto path = defaultPresetPath(scene);
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return;
+    if (spacegen::loadPreset(scene.bus, path.string())) {
+        selectedLayerId_ = 0;  // re-picked by endFrame's selection bookkeeping
+        std::fprintf(stderr,
+                     "[Workstation] default preset loaded from %s\n",
+                     path.string().c_str());
+    } else {
+        std::fprintf(stderr,
+                     "[Workstation] default preset present but failed to load: %s\n",
+                     path.string().c_str());
+    }
+}
+
 void Workstation::endFrame(MTL::CommandBuffer* cb,
                             MTL::Texture* swapchainTarget,
                             Scene& scene,
@@ -1808,7 +1991,11 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
         layoutBuilt_ = true;
     }
 
-    // First-frame: load panel state from disk if present.
+    // First-frame: apply the startup-default preset (if the operator set one),
+    // REPLACING the hardcoded starter stack, THEN restore per-panel slider
+    // state. Order matters: the preset rebuilds the bus, panel_state then
+    // re-applies any tuned sliders onto the layers it can still find.
+    loadDefaultPresetIfAny(scene);   // self-guarded: acts at most once
     if (!panelStateLoaded_) {
         readPanelState(scene);
         panelStateLoaded_ = true;

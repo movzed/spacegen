@@ -79,6 +79,17 @@ public:
                   Scene& scene,
                   MetalRenderer& renderer);
 
+    // Load the operator-chosen startup-default preset (presets/default.json
+    // next to scene.json) into scene.bus, REPLACING the current layer stack.
+    // No-op if no default preset exists. Idempotent: only acts the first time
+    // it succeeds. Safe to call once after the bus is set up.
+    //
+    // The Workstation also calls this automatically on its first endFrame, so
+    // main.cpp does NOT need to call it — but a one-liner after bus setup
+    // (`workstation.loadDefaultPresetIfAny(scene);`) is supported if the
+    // manager prefers the default applied before the first rendered frame.
+    void loadDefaultPresetIfAny(Scene& scene);
+
 private:
     void ensureOffscreen(int widthPx, int heightPx);
     void releaseOffscreen();
@@ -101,6 +112,7 @@ private:
     bool             showPostFx_       = true;
     bool             showDemo_         = false;
     bool             panelStateLoaded_ = false;
+    bool             defaultPresetLoaded_ = false;
 
     // Currently selected layer (by id) — drives the Inspector contents.
     uint32_t         selectedLayerId_  = 0;

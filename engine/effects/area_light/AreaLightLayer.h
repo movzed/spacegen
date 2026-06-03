@@ -57,15 +57,31 @@ public:
 
     // ---- Orbit ----------------------------------------------------------
     enum class OrbitMode : int {
-        Circular  = 0,
-        Lissajous = 1,
-        Helix     = 2,
-        Random    = 3,
+        Circular   = 0,
+        Lissajous  = 1,
+        Helix      = 2,
+        Random     = 3,
+        // --- Articulated paths (richer choreography) ---------------------
+        FigureEight = 4,   // Gerono lemniscate rolled onto the sphere
+        Rose        = 5,   // rhodonea curve r=cos(k·θ), k-petal star
+        Spiral      = 6,   // angle sweeps while polar radius breathes
+        Pendulum    = 7,   // damped harmonic swing about the axis pole
+        Compound    = 8,   // two stacked harmonics → quasi-periodic weave
     };
     enum class Axis : int { X = 0, Y = 1, Z = 2 };
 
+    // Easing applied to the *path parameter* (the normalised phase that
+    // drives a mode). Combined with `phaseOffset`, several lights with
+    // staggered phase + easing read as one articulated, choreographed swarm.
+    enum class Easing : int {
+        Linear    = 0,   // u
+        Smoothstep = 1,  // 3u²-2u³ (Hermite, C¹)
+        EaseInOut = 2,   // 0.5-0.5·cos(π·u)  (sinusoidal)
+        Bounce    = 3,   // decaying parabola bounce (Robert Penner)
+    };
+
     OrbitMode orbitMode  = OrbitMode::Circular;
-    Axis      orbitAxis  = Axis::Z;     // Circular + Helix
+    Axis      orbitAxis  = Axis::Z;     // Circular + Helix + articulated
 
     // The *operator-requested* orbit radius. The actual world-space radius
     // is `max(orbitRadius, safeRadius)` to enforce the hard constraint.
@@ -95,6 +111,46 @@ public:
     // with `0.5 - 0.5*cos(π·u)` (smoothstep-like).
     float     dwellSeconds = 2.0f;
     float     slerpEase    = 1.0f;   // 0 = linear, 1 = full cosine ease
+
+    // ---- Articulated path parameters -----------------------------------
+    // FigureEight / Rose / Spiral / Pendulum / Compound all share the
+    // operator-facing speed (deg/s) as their base angular rate, plus:
+    float     pathAmplitude = 0.9f;  // tangent-plane reach (0..1.5), shared
+    int       roseK         = 5;     // Rose: petal count (odd k → k petals,
+                                      //        even k → 2k petals)
+    float     spiralTurns   = 3.0f;  // Spiral: polar excursions per cycle
+    float     spiralPolar   = 0.85f; // Spiral: max polar opening (0..1)
+    float     pendDamping   = 0.6f;  // Pendulum: decay per cycle (0=undamped)
+    float     pendSwingDeg  = 70.0f; // Pendulum: peak swing half-angle
+    float     compoundRatio = 3.0f;  // Compound: 2nd harmonic freq multiplier
+    float     compoundMix   = 0.45f; // Compound: blend of 2nd harmonic (0..1)
+
+    // Per-light PHASE OFFSET (turns, 0..1) folded into the path parameter
+    // before easing. Staggering this across several area lights produces a
+    // choreographed, articulated swarm (lights chase each other along the
+    // same path).
+    float     phaseOffset = 0.0f;
+
+    // Easing applied to the cyclic path parameter (see Easing enum). Wrapped
+    // so the eased phase remains C⁰-continuous across the period seam.
+    Easing    easing = Easing::Linear;
+
+    // ---- Motion presets -------------------------------------------------
+    // One-click choreography: sets orbitMode + speed + amplitude + easing
+    // + phase together. `Custom` means "operator has hand-tuned values".
+    enum class MotionPreset : int {
+        Custom      = 0,
+        SlowOrbit   = 1,
+        Figure8Sweep = 2,
+        RoseBloom   = 3,
+        PendulumPair = 4,
+        ChaosSwarm  = 5,
+    };
+    MotionPreset preset = MotionPreset::Custom;
+
+    // Apply a preset's parameter bundle in-place. Leaves the safety clamp
+    // and all photometric/shape fields untouched — purely motion authoring.
+    void applyPreset(MotionPreset p);
 
     // ---- LFO modulators (optional intensity wobble) --------------------
     LFO       intensityLFO;
@@ -128,6 +184,19 @@ private:
     glm::vec3 evalLissajous_(double t) const;
     glm::vec3 evalHelix_(double t)     const;
     glm::vec3 evalRandom_(double t);            // mutates randomPrev_/Next_
+
+    // Articulated paths. Each returns a *unit-length* direction on the
+    // sphere (same contract as the originals): update() scales by the
+    // clamped radius, so the hard safety clamp still applies unchanged.
+    glm::vec3 evalFigureEight_(double t) const;
+    glm::vec3 evalRose_(double t)        const;
+    glm::vec3 evalSpiral_(double t)      const;
+    glm::vec3 evalPendulum_(double t)    const;
+    glm::vec3 evalCompound_(double t)    const;
+
+    // Maps elapsed time → an eased, phase-offset angle (radians) for the
+    // cyclic modes. Folds in `phaseOffset` and the `easing` selector.
+    float     pathAngle_(double t) const;
 };
 
 } // namespace spacegen

@@ -1,5 +1,5 @@
 // =============================================================================
-// UvAtlasGeogram — alternative atlas backend.
+// UvAtlasGeogram — alternative atlas backend (Tier 4).
 // =============================================================================
 //
 // When SPACEGEN_HAVE_GEOGRAM is defined (via -DSPACEGEN_ENABLE_GEOGRAM=ON
@@ -8,24 +8,49 @@
 // When not defined, it returns a not-implemented error so callers can
 // gracefully fall back to xatlas.
 //
+// Pipeline (matches the "Spectral LSCM + Tetris packing" the Tier-4
+// README promises):
+//   1. Build a GEO::Mesh from MeshData positions/indices.
+//   2. Repair/orient it so geogram sees a clean manifold (LSCM needs
+//      topological disks; degenerate input trips geo_assert()).
+//   3. GEO::mesh_make_atlas(M, hardAngle, PARAM_SPECTRAL_LSCM, PACK_TETRIS)
+//      - segments the mesh into charts (sharp-edge + VSA segmentation),
+//      - flattens each chart with Spectral Conformal Parameterization
+//        (Mullen-Tong-Alliez-Desbrun 2008); geogram falls back to plain
+//        LSCM (Lévy 2002) automatically if the ARPACK OpenNL extension
+//        is not present, so this is always safe to request,
+//      - packs the charts with the built-in "Tetris" packer (Ray, in the
+//        original LSCM article) and normalizes UVs into [0,1]².
+//   4. Read the per-facet-corner "tex_coord" attribute back, dedupe
+//      corners, and emit a MeshData-shaped result identical in layout to
+//      the xatlas path (vertices split at chart seams).
+//
 // References:
-//   - geogram repo: https://github.com/BrunoLevy/geogram (BSD-3).
-//     Lévy, B. — Spectral LSCM (SGP 2008), LSCM (SIGGRAPH 2002).
-//   - Function: GEO::mesh_make_atlas() in geogram/mesh/mesh_param.h.
+//   - geogram repo: https://github.com/BrunoLevy/geogram (BSD-3), v1.9.1.
+//     Lévy, Petitjean, Ray, Maillot — LSCM (SIGGRAPH 2002).
+//     Mullen, Tong, Alliez, Desbrun — Spectral Conformal Param. (SGP 2008).
+//   - API: GEO::mesh_make_atlas() / GEO::mesh_get_charts() in
+//     geogram/parameterization/mesh_atlas_maker.h.
 
 #include "UvAtlasGeogram.h"
 
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 #ifdef SPACEGEN_HAVE_GEOGRAM
-// Geogram public headers. The exact subset varies across versions; this
-// targets v1.9.x (the FetchContent tag in CMakeLists.txt).
+// Geogram public headers (v1.9.1 — the FetchContent tag in CMakeLists.txt).
+// NOTE: the parameterization API lives under geogram/parameterization/, NOT
+// the (nonexistent in 1.9.x) geogram/mesh/mesh_param.h.
 #include <geogram/basic/common.h>
 #include <geogram/basic/logger.h>
+#include <geogram/basic/attributes.h>
 #include <geogram/mesh/mesh.h>
-#include <geogram/mesh/mesh_io.h>
-#include <geogram/mesh/mesh_param.h>
+#include <geogram/mesh/mesh_repair.h>
+#include <geogram/parameterization/mesh_atlas_maker.h>
 #endif
 
 namespace spacegen {
@@ -55,7 +80,8 @@ UvAtlasResult generateAtlasGeogram(const MeshData&,
 namespace {
 
 // One-time geogram bootstrap. Idempotent across calls — geogram tracks
-// internally whether the runtime has been initialised.
+// internally whether the runtime has been initialised, but we still guard
+// with a function-local static so we only touch the Logger once.
 struct GeogramBootstrap {
     GeogramBootstrap() {
         GEO::initialize(GEO::GEOGRAM_INSTALL_NONE);
@@ -88,7 +114,10 @@ UvAtlasResult generateAtlasGeogram(const MeshData& mesh,
 
     if (cb) cb(2, "Building geogram mesh", user);
 
-    // ---- 1. Build a GEO::Mesh from the input. ----
+    // ---- 1. Build a GEO::Mesh from the input. ----------------------------
+    // Vertices are created 1:1 with mesh.positions and in the same order, so
+    // a geogram vertex index equals the original input vertex index. We rely
+    // on that below to copy positions/normals/uv0 straight from the input.
     GEO::Mesh M;
     M.vertices.set_dimension(3);
     M.vertices.create_vertices(static_cast<GEO::index_t>(mesh.positions.size()));
@@ -99,64 +128,103 @@ UvAtlasResult generateAtlasGeogram(const MeshData& mesh,
         p[2] = mesh.positions[i].z;
     }
     const size_t nTri = mesh.indices.size() / 3;
-    M.facets.create_triangles(static_cast<GEO::index_t>(nTri));
+    GEO::index_t firstTri = M.facets.create_triangles(
+        static_cast<GEO::index_t>(nTri));
     for (size_t t = 0; t < nTri; ++t) {
-        M.facets.set_vertex(GEO::index_t(t), 0, mesh.indices[t*3 + 0]);
-        M.facets.set_vertex(GEO::index_t(t), 1, mesh.indices[t*3 + 1]);
-        M.facets.set_vertex(GEO::index_t(t), 2, mesh.indices[t*3 + 2]);
+        GEO::index_t f = firstTri + static_cast<GEO::index_t>(t);
+        M.facets.set_vertex(f, 0, mesh.indices[t * 3 + 0]);
+        M.facets.set_vertex(f, 1, mesh.indices[t * 3 + 1]);
+        M.facets.set_vertex(f, 2, mesh.indices[t * 3 + 2]);
     }
     M.facets.connect();
 
-    if (cb) cb(20, "Running mesh_make_atlas (Spectral LSCM + Tetris)", user);
+    if (cb) cb(10, "Repairing mesh topology", user);
 
-    // ---- 2. Run geogram's atlas generator. ----
-    // hard_angles_threshold maps to Tier-1 Sharp Edges: edges with
-    // dihedral > threshold are treated as forced chart boundaries.
-    // We pass UvAtlasOptions::sharpEdgeAngleDeg to keep the controls
-    // unified across backends.
-    double hard_angle = opts.preCutSharpEdges
+    // ---- 1b. Clean the mesh so geogram's parameterizer is happy. ----------
+    // LSCM/ABF rely on consistent facet orientation + a valid half-edge
+    // structure and assert on incoherent winding. We deliberately do NOT
+    // request MESH_REPAIR_COLOCATE here: colocation renumbers/merges vertices,
+    // which would break the "geogram vertex index == input vertex index"
+    // identity we use below to copy positions/normals/uv0 straight from the
+    // input. Topology dissociation (always done) + duplicate-facet removal
+    // keep vertices 1:1 with the input; mesh_reorient() then makes the
+    // per-chart border walk well-defined. Both are no-ops on clean input, so
+    // good meshes are not perturbed.
+    GEO::mesh_repair(
+        M,
+        GEO::MeshRepairMode(GEO::MESH_REPAIR_TOPOLOGY | GEO::MESH_REPAIR_DUP_F),
+        /*colocate_epsilon=*/0.0);
+    GEO::mesh_reorient(M);
+
+    if (cb) cb(20, "mesh_make_atlas (Spectral LSCM + Tetris)", user);
+
+    // ---- 2. Run geogram's atlas generator. --------------------------------
+    // hard_angles_threshold maps to the Tier-1 "Sharp Edges" control: edges
+    // whose dihedral angle exceeds the threshold are forced chart boundaries.
+    // We pass UvAtlasOptions::sharpEdgeAngleDeg to keep the controls unified
+    // across backends. When pre-cut is disabled we pass 180° so only
+    // geogram's own segmentation heuristics introduce seams.
+    const double hardAngle = opts.preCutSharpEdges
         ? static_cast<double>(opts.sharpEdgeAngleDeg)
-        : 360.0;   // effectively no hard cuts beyond geogram's own heuristics
+        : 180.0;
     try {
-        // Newer geogram exposes mesh_make_atlas with multiple options;
-        // we use the conservative signature that's stable since v1.7.x.
-        GEO::mesh_make_atlas(M, hard_angle);
+        // Spectral LSCM for the per-chart flattening (degrades to plain LSCM
+        // if ARPACK is unavailable) + the built-in Tetris packer, which also
+        // normalizes the resulting UVs into [0,1]² (see mesh_param_packer.cpp
+        // Packer::pack_surface).
+        GEO::mesh_make_atlas(
+            M,
+            hardAngle,
+            GEO::PARAM_SPECTRAL_LSCM,
+            GEO::PACK_TETRIS,
+            /*verbose=*/false);
     } catch (const std::exception& e) {
-        res.error = std::string("geogram atlas failed: ") + e.what();
+        res.error = std::string("geogram mesh_make_atlas failed: ") + e.what();
+        return res;
+    } catch (...) {
+        res.error = "geogram mesh_make_atlas failed (unknown exception)";
         return res;
     }
 
     if (cb) cb(80, "Translating geogram output", user);
 
-    // ---- 3. Pull the UV attribute geogram wrote into facet_corners. ----
-    // The attribute name is "tex_coord" by geogram convention.
-    if (!M.facet_corners.attributes().is_defined("tex_coord")) {
-        res.error = "geogram produced no tex_coord attribute";
+    // ---- 3. Pull the UV attribute geogram wrote into facet_corners. -------
+    // mesh_make_atlas stores per-CORNER (per face-vertex) UVs in a dimension-2
+    // double vector attribute named "tex_coord" on facet_corners — vertices
+    // on chart seams therefore carry different UVs per incident face, exactly
+    // like xatlas's vertex split. The values are already normalized to [0,1]
+    // by the Tetris packer, so (unlike the xatlas path) we do NOT divide by an
+    // atlas pixel size.
+    if (!GEO::Attribute<double>::is_defined(
+            M.facet_corners.attributes(), "tex_coord", 2)) {
+        res.error = "geogram produced no dimension-2 tex_coord attribute "
+                    "(parameterization likely failed)";
         return res;
     }
     GEO::Attribute<double> tc(M.facet_corners.attributes(), "tex_coord");
-    if (tc.dimension() < 2) {
-        res.error = "tex_coord attribute has unexpected dimension";
-        return res;
-    }
 
-    // geogram writes per-CORNER (per face-vertex) UVs, mirroring xatlas's
-    // behaviour — vertices on chart seams are duplicated. We rebuild a
-    // MeshData with corner-unique vertices: each face-corner becomes its
-    // own output vertex, sharing position/normal with the original input
-    // vertex via the corner-to-vertex map.
+    // Number of UV charts/islands, recomputed from the committed tex coords.
+    const int chartCount = static_cast<int>(GEO::mesh_get_charts(M));
+
+    // We rebuild a MeshData with corner-unique vertices: each face-corner
+    // becomes its own output vertex, sharing position/normal/uv0 with the
+    // original input vertex via the (geogram vertex == input vertex) identity.
     const GEO::index_t nF = M.facets.nb();
-    res.positions.reserve(nF * 3);
-    res.normals.reserve(nF * 3);
-    res.uvs0.reserve(nF * 3);
-    res.uvs1.reserve(nF * 3);
-    res.indices.reserve(nF * 3);
+    res.positions.reserve(size_t(nF) * 3);
+    res.normals.reserve(size_t(nF) * 3);
+    res.uvs0.reserve(size_t(nF) * 3);
+    res.uvs1.reserve(size_t(nF) * 3);
+    res.indices.reserve(size_t(nF) * 3);
 
-    const bool haveN  = !mesh.normals.empty() && mesh.normals.size() == mesh.positions.size();
-    const bool haveU0 = !mesh.uvs.empty()      && mesh.uvs.size()    == mesh.positions.size();
+    const bool haveN  = !mesh.normals.empty()
+                        && mesh.normals.size() == mesh.positions.size();
+    const bool haveU0 = !mesh.uvs.empty()
+                        && mesh.uvs.size() == mesh.positions.size();
+    const uint32_t origVertCount = static_cast<uint32_t>(mesh.positions.size());
 
-    // Deduplicate corners with identical (origVertex, uv). Keeps memory
-    // tight without re-stitching seams.
+    // Deduplicate corners with identical (origVertex, uv): keeps the output
+    // vertex count tight without re-stitching seams (matches xatlas, which
+    // shares a vertex when position + uv coincide across faces).
     struct CornerKey {
         uint32_t origV; float u, v;
         bool operator==(const CornerKey& o) const {
@@ -166,29 +234,35 @@ UvAtlasResult generateAtlasGeogram(const MeshData& mesh,
     struct CornerKeyHash {
         size_t operator()(const CornerKey& k) const {
             uint64_t h = uint64_t(k.origV) * 0x9E3779B185EBCA87ULL;
-            h ^= std::hash<float>{}(k.u);
+            h ^= std::hash<float>{}(k.u) * 0x100000001B3ULL;
             h ^= std::hash<float>{}(k.v);
             return size_t(h);
         }
     };
     std::unordered_map<CornerKey, uint32_t, CornerKeyHash> dedup;
-    dedup.reserve(nF * 3 / 2);
+    dedup.reserve(size_t(nF) * 3 / 2 + 1);
 
     for (GEO::index_t f = 0; f < nF; ++f) {
-        GEO::index_t c0 = M.facets.corners_begin(f);
+        const GEO::index_t c0 = M.facets.corners_begin(f);
         for (GEO::index_t k = 0; k < 3; ++k) {
-            GEO::index_t c = c0 + k;
+            const GEO::index_t c = c0 + k;
             GEO::index_t v = M.facet_corners.vertex(c);
-            CornerKey key { v, (float)tc[c*2 + 0], (float)tc[c*2 + 1] };
+            // After mesh_repair the geogram vertex index still indexes the
+            // (colocated) input vertices; clamp defensively just in case.
+            uint32_t origV = (v < origVertCount) ? uint32_t(v) : 0u;
+
+            CornerKey key { origV,
+                            float(tc[size_t(c) * 2 + 0]),
+                            float(tc[size_t(c) * 2 + 1]) };
             auto it = dedup.find(key);
             uint32_t newIdx;
             if (it == dedup.end()) {
                 newIdx = static_cast<uint32_t>(res.positions.size());
                 dedup.emplace(key, newIdx);
-                res.positions.push_back(mesh.positions[v]);
-                res.normals.push_back(haveN ? mesh.normals[v]
-                                              : glm::vec3(0,0,1));
-                res.uvs0.push_back(haveU0 ? mesh.uvs[v] : glm::vec2(0.0f));
+                res.positions.push_back(mesh.positions[origV]);
+                res.normals.push_back(haveN ? mesh.normals[origV]
+                                            : glm::vec3(0, 0, 1));
+                res.uvs0.push_back(haveU0 ? mesh.uvs[origV] : glm::vec2(0.0f));
                 res.uvs1.push_back(glm::vec2(key.u, key.v));
             } else {
                 newIdx = it->second;
@@ -199,15 +273,23 @@ UvAtlasResult generateAtlasGeogram(const MeshData& mesh,
 
     if (cb) cb(95, "Building output mesh", user);
 
-    res.chartCount  = 0;          // geogram doesn't surface chart count directly
-    res.atlasWidth  = 0;
-    res.atlasHeight = 0;
+    // Atlas dimensions: the Tetris packer emits UVs already normalized to
+    // [0,1], so there is no intrinsic pixel size. Report a nominal square
+    // resolution (the operator's requested max, or the packer's 1024 default)
+    // so the cache header + UI have sane non-zero dimensions. uvs1 themselves
+    // are resolution-independent — the texel size is chosen at sample time.
+    const int nominal = opts.maxAtlasSize > 0 ? opts.maxAtlasSize : 1024;
+    res.chartCount  = chartCount;
+    res.atlasWidth  = nominal;
+    res.atlasHeight = nominal;
     res.ok          = true;
 
-    std::printf("[UvAtlasGeogram] mesh_make_atlas done: in=%zu verts → "
-                 "out=%zu verts, %zu indices\n",
-                 mesh.positions.size(), res.positions.size(),
-                 res.indices.size());
+    std::printf("[UvAtlasGeogram] Spectral LSCM + Tetris done: in=%zu verts -> "
+                "out=%zu verts (%+d), %zu indices, %d charts, atlas %dx%d\n",
+                mesh.positions.size(), res.positions.size(),
+                int(res.positions.size()) - int(mesh.positions.size()),
+                res.indices.size(), res.chartCount,
+                res.atlasWidth, res.atlasHeight);
 
     if (cb) cb(100, "Done", user);
     return res;

@@ -53,6 +53,38 @@ public:
     int        amountModSlot  = 0;
     float      amountModDepth = 1.0f;
 
+    // ---- Built-in smooth animation -----------------------------------------
+    // So the fracture animates on its own without the operator wiring an
+    // external modulator. The envelope is computed INSIDE effectiveAmount()
+    // and *added* to the static amount + modulator-bank contribution, then
+    // clamped to [0,1]. Everything stays folded into that one resolved value
+    // the renderer reads — no new GPU-facing fields.
+    //
+    //   Static  — no envelope; behaves exactly like the old layer.
+    //   Pulse   — smooth cosine breathing between [animFloor .. animFloor+depth].
+    //   Loop    — repeating attack -> hold -> decay ramp, eased (smoothstep).
+    //   OneShot — a single eased attack -> hold -> decay, fired by retrigger()
+    //             (or auto-looped every animPeriod seconds if animLoopOneShot).
+    enum class AnimMode : uint32_t { Static, Pulse, Loop, OneShot };
+    AnimMode   animMode    = AnimMode::Static;
+    float      animDepth   = 1.0f;   // peak height the envelope adds [0..1]
+    float      animFloor   = 0.0f;   // baseline the envelope sits on  [0..1]
+    float      animRateHz  = 0.25f;  // Pulse breaths/sec; Loop cycles/sec
+    float      animAttack   = 0.30f; // OneShot/Loop rise time (s)
+    float      animHold     = 0.20f; // OneShot/Loop sustain at peak (s)
+    float      animDecay    = 0.60f; // OneShot/Loop fall time (s)
+    bool       animLoopOneShot = false; // auto-refire OneShot every animPeriod
+    float      animPeriod   = 4.0f;  // s between auto OneShot fires
+
+    // OneShot trigger bookkeeping. `retrigger()` stamps the next start time;
+    // a negative start means "armed but never fired" (envelope reads 0).
+    // mutable so it can be (re)armed lazily from the const effectiveAmount().
+    mutable double animTriggerTime = -1.0;
+
+    // Arm a OneShot envelope to begin at time `t` (seconds). Call from the
+    // inspector button or any controller. Safe to call every frame.
+    void retrigger(double t) const { animTriggerTime = t; }
+
     // ---- Cracks -------------------------------------------------------------
     // Voronoi cell network in world space; fragments near a cell edge darken
     // and/or emit a glow. `crackDensity` = cells per meter.
@@ -60,9 +92,9 @@ public:
     float      crackWidth       = 0.06f;    // edge band thickness, normalized
     float      crackJitter      = 0.7f;     // cell jitter [0..1], 0 = cubic grid
     float      crackJitterSpeed = 0.12f;    // cell drift over time
-    float      crackDarken      = 0.85f;    // 0..1 base-color multiplier at edge
-    glm::vec3  crackGlowColor   = glm::vec3(1.00f, 0.45f, 0.10f); // orange
-    float      crackGlow        = 0.8f;
+    float      crackDarken      = 0.78f;    // 0..1 base-color multiplier at edge
+    glm::vec3  crackGlowColor   = glm::vec3(1.00f, 0.52f, 0.18f); // warm ember
+    float      crackGlow        = 1.1f;
 
     // ---- Dissolve burn ------------------------------------------------------
     // Noise-driven discard, optionally radial from `burnPoint`. Edge of the
@@ -81,11 +113,13 @@ public:
     // Each vertex is assigned to a world-space grid cell at resolution
     // `shardDensity`. The vertex is offset outward along the cell's centroid
     // direction, with per-shard jitter and per-shard spin.
-    float      shardDensity = 1.5f;         // cells per meter (clamped 0.3..5.0)
-    float      shardJitter  = 0.7f;         // direction randomness per shard
-    float      shardSpin    = 0.3f;         // rotation around shard center
-    // explodeStrength: meters of outward push at amount=1.
-    float      explodeStrength = 1.2f;
+    float      shardDensity = 2.2f;         // cells per meter (clamped 0.3..5.0)
+    float      shardJitter  = 0.45f;        // direction randomness per shard
+    float      shardSpin    = 0.5f;         // rotation around shard center
+    // explodeStrength: meters of outward push at amount=1. The renderer caps
+    // the outward push at 0.5m, so values much above ~0.5 just saturate; we
+    // keep the default in the readable-shards range rather than fighting it.
+    float      explodeStrength = 0.45f;
 
     // ---- Glitch tear --------------------------------------------------------
     // Vertical bands of vertices slide horizontally; per-fragment alpha
@@ -104,6 +138,22 @@ public:
     // resolved amount. StructureLayer uses this to decide whether to populate
     // the fracture uniforms or write zeros.
     bool active(double t, const class ModulatorBank* mods) const;
+
+    // ---- Movement presets ---------------------------------------------------
+    // One-call recipes that set the mode bitmask + the relevant per-mode params
+    // + AnimMode/envelope for a good-looking, self-animating result. These only
+    // touch existing fields, so the GPU contract is untouched. `Custom` is a
+    // sentinel for "the operator has hand-tweaked it" and applyPreset() ignores
+    // it.
+    enum class Preset : int {
+        Custom = 0,
+        SlowDissolve,   // gentle radial burn, warm edge, slow Loop
+        CrackPulse,     // ember crack network breathing on a Pulse
+        ExplodeBurst,   // shards part once on a OneShot, eased
+        GlitchStorm,    // fast datamosh Pulse
+    };
+    Preset currentPreset = Preset::Custom;
+    void   applyPreset(Preset p, double now = 0.0);
 };
 
 } // namespace spacegen
