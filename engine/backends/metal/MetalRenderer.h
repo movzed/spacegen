@@ -14,6 +14,7 @@ struct Scene;
 struct MeshData;
 struct Light;
 struct RenderContext;
+struct VirtualSpot;
 class  Bus;
 class  StructureLayer;
 class  BeamLayer;
@@ -64,7 +65,10 @@ public:
         int            heatmapMetric = 0,
         int            heatmapUV     = 1,
         float          projectorOnFlatMix       = 0.0f,
-        float          projectorFlatnessThreshold = 0.05f);
+        float          projectorFlatnessThreshold = 0.05f,
+        // LightClonerLayer expansion — virtual spots appended to the
+        // existing spot array (kMaxSpots ceiling shared).
+        const std::vector<VirtualSpot>& virtualSpots = {});
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.

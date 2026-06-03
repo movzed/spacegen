@@ -5,6 +5,7 @@
 #include "DirectionalLightLayer.h"
 #include "Scene.h"
 #include "SyphonInputLayer.h"
+#include "../effects/light_cloner/LightClonerLayer.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include "imgui.h"
@@ -31,6 +32,7 @@ void StructureLayer::render(RenderContext& ctx) {
     bool           syphonFlipY = false;
     float          syphonProjFlatMix = 0.0f;
     float          syphonProjFlatThresh = 0.05f;
+    std::vector<VirtualSpot> virtualSpots;
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -42,6 +44,8 @@ void StructureLayer::render(RenderContext& ctx) {
                 dirs.push_back(d);
             } else if (auto* a = dynamic_cast<const AmbientLightLayer*>(l.get())) {
                 ambientColor += a->color * (a->intensity * a->opacity);
+            } else if (auto* c = dynamic_cast<const LightClonerLayer*>(l.get())) {
+                c->expandSpots(ctx, virtualSpots);
             } else if (auto* s = dynamic_cast<SyphonInputLayer*>(l.get())) {
                 if (!syphonTex) {
                     syphonTex   = s->currentTexture();
@@ -61,7 +65,8 @@ void StructureLayer::render(RenderContext& ctx) {
                                           showStretchHeatmap,
                                           stretchMetric, stretchUV,
                                           syphonProjFlatMix,
-                                          syphonProjFlatThresh);
+                                          syphonProjFlatThresh,
+                                          virtualSpots);
 }
 
 void StructureLayer::drawInspector() {

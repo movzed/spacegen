@@ -6,6 +6,7 @@
 #include "../../core/BeamLayer.h"
 #include "../../core/DirectionalLightLayer.h"
 #include "../../core/ModulatorBank.h"
+#include "../../effects/light_cloner/LightClonerLayer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,14 +23,16 @@ namespace {
 // Up to MAX_DIRS directional lights + MAX_SPOTS spot lights, all
 // collected from the bus. NO volumetric render — spot lights are
 // projection-mapping style: only visible where they hit the surface.
-constexpr int kMaxSpots = 32;   // up to ~4 rigs × 8 fixtures
+constexpr int kMaxSpots = 64;   // up to ~4 rigs × 8 fixtures, plus
+                                  // LightClonerLayer virtual-spot expansion
+                                  // (Notch Cloner pattern, up to 64 clones).
 constexpr int kMaxDirs  = 4;
 constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
 
 constant float PI         = 3.14159265359;
-constant int   MAX_SPOTS  = 32;
+constant int   MAX_SPOTS  = 64;
 constant int   MAX_DIRS   = 4;
 
 struct VertexIn {
@@ -779,7 +782,8 @@ void MetalRenderer::renderStructureMeshes(
     int            heatmapMetric,
     int            heatmapUV,
     float          projectorOnFlatMix,
-    float          projectorFlatnessThreshold)
+    float          projectorFlatnessThreshold,
+    const std::vector<VirtualSpot>& virtualSpots)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -851,6 +855,19 @@ void MetalRenderer::renderStructureMeshes(
             spotsPacked[spotCount].paramsOuter  =
                 glm::vec4(outerCos, 0.0f, 0.0f, 0.0f);
         }
+    }
+
+    // Append LightClonerLayer-expanded virtual spots into the same array,
+    // capped at kMaxSpots. Each VirtualSpot is already fully resolved
+    // (position + direction + color + cone cosines) by the cloner's
+    // expandSpots() call site upstream.
+    for (const auto& vs : virtualSpots) {
+        if (spotCount >= kMaxSpots) break;
+        spotsPacked[spotCount].posIntensity = glm::vec4(vs.worldPos,  vs.intensity);
+        spotsPacked[spotCount].dirRange     = glm::vec4(vs.direction, vs.range);
+        spotsPacked[spotCount].colorInner   = glm::vec4(vs.color,     vs.innerCos);
+        spotsPacked[spotCount].paramsOuter  = glm::vec4(vs.outerCos, 0.0f, 0.0f, 0.0f);
+        ++spotCount;
     }
 
     // Pack directional lights (pan/tilt + intensity LFOs).
