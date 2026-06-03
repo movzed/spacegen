@@ -62,8 +62,10 @@ void StructureLayer::render(RenderContext& ctx) {
             } else if (auto* c = dynamic_cast<const LightClonerLayer*>(l.get())) {
                 c->expandSpots(ctx, virtualSpots);
             } else if (auto* ar = dynamic_cast<AreaLightLayer*>(l.get())) {
-                // Idempotent: bus has likely already called ar->render()
-                // (which calls update()) earlier this frame, but tick again
+                // Non-const cast because update() mutates the cached
+                // positionWorld/normalWorld. Idempotent on (t, randomSeed)
+                // — the bus has likely already called ar->render() (which
+                // calls update()) earlier this frame, but we tick again
                 // so a freshly-added layer is ready on its first frame.
                 ar->update(ctx);
                 areas.push_back(ar);
@@ -73,21 +75,46 @@ void StructureLayer::render(RenderContext& ctx) {
                 surfaceProcMix   = std::max(surfaceProcMix, p->opacity);
                 surfaceProcScale = 2.0f + 4.0f * p->opacity;
             } else if (auto* d = dynamic_cast<const MeshDeformationLayer*>(l.get())) {
-                surfaceDeformAmount = std::max(surfaceDeformAmount,
-                                                d->opacity * 0.20f);
-                surfaceDeformScale  = 1.5f;
+                // Gate on the op chain: a freshly-added Deform layer has
+                // an empty `ops` vector, so doing nothing is the right
+                // default. The MVP shader does a sin/cos wave proportional
+                // to surfaceDeformAmount — we only switch it on when the
+                // operator armed at least one enabled, non-zero op.
+                float chainAmt = 0.0f;
+                for (const auto& op : d->ops) {
+                    if (!op.enabled) continue;
+                    if (op.intensity <= 0.0f) continue;
+                    chainAmt = std::max(chainAmt, op.intensity);
+                }
+                if (chainAmt > 1e-3f) {
+                    surfaceDeformAmount = std::max(surfaceDeformAmount,
+                                                    chainAmt
+                                                    * d->opacity
+                                                    * 0.20f);
+                    surfaceDeformScale  = 1.5f;
+                }
             } else if (auto* f = dynamic_cast<const MeshFractureLayer*>(l.get())) {
-                // Default opacity is 1.0 on every ILayer. If we passed
-                // that straight through, the shader's discard threshold
-                // (> 0.6) annihilated the structure as soon as the layer
-                // was added. Scale by 0.5 so opacity=1.0 produces visible
-                // cracks WITHOUT the discard tier — operator dials past
-                // ~1.2 (i.e. opacity 1 + masterAmount > 1) to start
-                // shattering whole cells, which they have to do
-                // intentionally.
-                surfaceFractureAmount = std::max(surfaceFractureAmount,
-                                                  f->opacity * 0.5f);
-                surfaceFractureSeed   = static_cast<float>(f->id) * 0.137f;
+                // Gate on operator intent: mode bitmask must be non-zero
+                // AND effectiveAmount() must be > epsilon. Default
+                // mode=0 + amount=0 means "freshly added, nothing
+                // armed" — produce zero output. The 0.5 cap on the
+                // shader amount keeps us under the whole-cell discard
+                // tier (>0.8) so cranking the slider up only intensifies
+                // cracks; operator has to stack layers / use a modulator
+                // to reach the shatter regime intentionally.
+                if (f->mode != 0u) {
+                    const ModulatorBank* fmods = ctx.scene
+                        ? &ctx.scene->modulators : nullptr;
+                    float amt = f->effectiveAmount(ctx.elapsedSeconds,
+                                                     fmods);
+                    amt *= f->opacity;
+                    if (amt > 1e-3f) {
+                        surfaceFractureAmount =
+                            std::max(surfaceFractureAmount, amt * 0.5f);
+                        surfaceFractureSeed =
+                            static_cast<float>(f->id) * 0.137f;
+                    }
+                }
             } else if (auto* s = dynamic_cast<SyphonInputLayer*>(l.get())) {
                 if (!syphonTex) {
                     syphonTex   = s->currentTexture();

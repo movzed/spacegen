@@ -53,9 +53,10 @@ void ChromaticAberrationEffect::buildPipeline(MTL::Device* device,
     MTL::Library* lib = device->newLibrary(src, opts, &err);
     opts->release();
     if (!lib) {
-        std::string msg = "[CA] MSL compile failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
+        std::fprintf(stderr, "[CA] MSL compile failed: %s\n",
+                      err ? err->localizedDescription()->utf8String()
+                          : "(no error)");
+        return;
     }
 
     MTL::Function* vsFn = lib->newFunction(
@@ -63,10 +64,11 @@ void ChromaticAberrationEffect::buildPipeline(MTL::Device* device,
     MTL::Function* fsFn = lib->newFunction(
         NS::String::string("ca_fs", NS::UTF8StringEncoding));
     if (!vsFn || !fsFn) {
+        std::fprintf(stderr, "[CA] ca_vs/ca_fs not found in library\n");
         if (vsFn) vsFn->release();
         if (fsFn) fsFn->release();
         lib->release();
-        throw std::runtime_error("[CA] ca_vs/ca_fs not found in library");
+        return;
     }
 
     MTL::RenderPipelineDescriptor* pd =
@@ -84,9 +86,10 @@ void ChromaticAberrationEffect::buildPipeline(MTL::Device* device,
     lib->release();
 
     if (!pipeline_) {
-        std::string msg = "[CA] pipeline build failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
+        std::fprintf(stderr, "[CA] pipeline build failed: %s\n",
+                      err ? err->localizedDescription()->utf8String()
+                          : "(no error)");
+        return;
     }
     builtFmt_ = fmt;
 }
@@ -94,16 +97,23 @@ void ChromaticAberrationEffect::buildPipeline(MTL::Device* device,
 void ChromaticAberrationEffect::render(RenderContext& ctx) {
     if (!ctx.renderer || !ctx.cmdBuf || !ctx.colorTarget) return;
 
-    // Acquire ping-pong target from the renderer. The renderer owns this
-    // texture; we render into it then ask the renderer to swap so the
-    // next layer / present sees the result.
+    // Render-into-scratch + blit-back-to-colorTarget pattern. We can't
+    // sample from and write to the same texture in one encoder, so we
+    // ping-pong through the renderer's shared scratch (acquirePingPongTarget),
+    // then blit the result back over colorTarget. This matches Bloom's
+    // and MotionBlur's pattern. We do NOT call swapPingPong — the
+    // Workstation displays a fixed MTL::Texture* pointer captured at
+    // beginFrame, so we must update that texture's CONTENT in place
+    // rather than rotate the pointer.
     MTL::Texture* dst = ctx.renderer->acquirePingPongTarget(ctx);
     if (!dst) return;   // renderer couldn't allocate — bail silently
     MTL::Texture* src = ctx.colorTarget;
 
-    // Lazy pipeline build (first frame or format change).
+    // Lazy pipeline build (first frame or format change). Errors are
+    // logged but never thrown — first-frame fault would crash the app.
     MTL::Device* device = src->device();
     buildPipeline(device, src->pixelFormat());
+    if (!pipeline_) return;
 
     // Resolve effective strength: static slider + (optional) mod-bank.
     float effStrength = strength;
@@ -138,8 +148,16 @@ void ChromaticAberrationEffect::render(RenderContext& ctx) {
                          NS::UInteger(0), NS::UInteger(4));
     enc->endEncoding();
 
-    // Swap so subsequent layers read our output as the "current" color.
-    ctx.renderer->swapPingPong(ctx);
+    // Blit the scratch result back over colorTarget so the workstation
+    // sees the updated content in the texture it's displaying.
+    MTL::BlitCommandEncoder* blit = ctx.cmdBuf->blitCommandEncoder();
+    if (blit) {
+        MTL::Origin o = MTL::Origin::Make(0, 0, 0);
+        MTL::Size   s = MTL::Size::Make(ctx.colorTarget->width(),
+                                         ctx.colorTarget->height(), 1);
+        blit->copyFromTexture(dst, 0, 0, o, s, ctx.colorTarget, 0, 0, o);
+        blit->endEncoding();
+    }
 }
 
 void ChromaticAberrationEffect::drawInspector() {

@@ -169,17 +169,28 @@ private:
     // -------- Pipeline state (built on first render) --------
     MTL::Library*              library_         = nullptr;
     MTL::ComputePipelineState* updatePipeline_  = nullptr;
+    MTL::ComputePipelineState* initPipeline_    = nullptr;
     MTL::RenderPipelineState*  spritePipeline_  = nullptr;
     MTL::RenderPipelineState*  trailPipeline_   = nullptr;
     MTL::DepthStencilState*    depthReadState_  = nullptr;
     bool                       pipelineReady_   = false;
 
+    // Dummy 16-byte buffers bound at slots 4/5 when trail mode is off (K==1).
+    // The update_particles kernel declares both buffers unconditionally;
+    // Metal's argument-validation will fault on dispatch if anything at
+    // those slots is unbound, even when the kernel never dereferences
+    // them on the K==1 codepath. Keeping placebos around is simpler than
+    // shipping a function-constant kernel variant.
+    MTL::Buffer*               dummyTrailRing_  = nullptr;
+    MTL::Buffer*               dummyTrailHead_  = nullptr;
+
     // Misc state.
-    double  lastFrameTime_ = -1.0;
-    int     framesSinceMeshUpload_ = 0;
-    int     currentParticleCount_ = 0;
-    int     currentTrailLength_   = 1;
-    uint32_t spawnSeed_           = 0x9E3779B9u;
+    double   lastFrameTime_         = -1.0;
+    int      framesSinceMeshUpload_ = 0;
+    int      currentParticleCount_  = 0;
+    int      currentTrailLength_    = 1;
+    uint32_t spawnSeed_             = 0x9E3779B9u;
+    bool     needsSeed_             = false;   // set by realloc, cleared after dispatch
 
     // -------- Internal helpers --------
     void buildPipelinesIfNeeded(MetalRenderer& renderer);

@@ -69,9 +69,10 @@ void GlitchEffect::buildPipeline(MTL::Device* device, MTL::PixelFormat fmt) {
     MTL::Library* lib = device->newLibrary(src, opts, &err);
     opts->release();
     if (!lib) {
-        std::string msg = "[Glitch] MSL compile failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
+        std::fprintf(stderr, "[Glitch] MSL compile failed: %s\n",
+                      err ? err->localizedDescription()->utf8String()
+                          : "(no error)");
+        return;
     }
 
     MTL::Function* vsFn = lib->newFunction(
@@ -79,10 +80,11 @@ void GlitchEffect::buildPipeline(MTL::Device* device, MTL::PixelFormat fmt) {
     MTL::Function* fsFn = lib->newFunction(
         NS::String::string("glitch_fs", NS::UTF8StringEncoding));
     if (!vsFn || !fsFn) {
+        std::fprintf(stderr, "[Glitch] glitch_vs/glitch_fs not found\n");
         if (vsFn) vsFn->release();
         if (fsFn) fsFn->release();
         lib->release();
-        throw std::runtime_error("[Glitch] glitch_vs/glitch_fs not found");
+        return;
     }
 
     MTL::RenderPipelineDescriptor* pd =
@@ -98,9 +100,10 @@ void GlitchEffect::buildPipeline(MTL::Device* device, MTL::PixelFormat fmt) {
     lib->release();
 
     if (!pipeline_) {
-        std::string msg = "[Glitch] pipeline build failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
+        std::fprintf(stderr, "[Glitch] pipeline build failed: %s\n",
+                      err ? err->localizedDescription()->utf8String()
+                          : "(no error)");
+        return;
     }
     builtFmt_ = fmt;
 }
@@ -132,12 +135,16 @@ float GlitchEffect::computeEffectiveAmount(const RenderContext& ctx) const {
 void GlitchEffect::render(RenderContext& ctx) {
     if (!ctx.renderer || !ctx.cmdBuf || !ctx.colorTarget) return;
 
+    // Same render-into-scratch + blit-back pattern as ChromaticAberration:
+    // do NOT swapPingPong because the Workstation displays a fixed
+    // texture pointer captured at beginFrame.
     MTL::Texture* dst = ctx.renderer->acquirePingPongTarget(ctx);
     if (!dst) return;
     MTL::Texture* srcTex = ctx.colorTarget;
 
     MTL::Device* device = srcTex->device();
     buildPipeline(device, srcTex->pixelFormat());
+    if (!pipeline_) return;
 
     // ---- Resolve effective amount + BPM beat ----
     float A = computeEffectiveAmount(ctx);
@@ -198,7 +205,15 @@ void GlitchEffect::render(RenderContext& ctx) {
                          NS::UInteger(0), NS::UInteger(4));
     enc->endEncoding();
 
-    ctx.renderer->swapPingPong(ctx);
+    // Blit the scratch result back over colorTarget.
+    MTL::BlitCommandEncoder* blit = ctx.cmdBuf->blitCommandEncoder();
+    if (blit) {
+        MTL::Origin o = MTL::Origin::Make(0, 0, 0);
+        MTL::Size   s = MTL::Size::Make(ctx.colorTarget->width(),
+                                         ctx.colorTarget->height(), 1);
+        blit->copyFromTexture(dst, 0, 0, o, s, ctx.colorTarget, 0, 0, o);
+        blit->endEncoding();
+    }
 }
 
 void GlitchEffect::drawInspector() {

@@ -138,7 +138,9 @@ public:
     // points "outward" radially from the cluster by default; pan/tilt offset
     // that. When `aimInward=true`, the direction flips so all clones look
     // toward `origin` (great for shining a cluster onto a centerpiece).
-    bool      aimInward          = false;
+    // Default flipped to `true`: a freshly-added cloner should illuminate
+    // the structure (the most common intent), not radiate at the void.
+    bool      aimInward          = true;
     float     panDeg             = 0.0f;
     float     tiltDeg            = 0.0f;
 

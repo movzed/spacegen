@@ -274,9 +274,12 @@ static float3 sfxProceduralBase(float3 baseColor, float3 worldPos,
     // Per-cell hue from hash.
     float h = sfxHash21(cell);
     float3 cellCol = float3(0.5 + 0.5 * cos(6.2831 * h + float3(0.0, 2.0, 4.0)));
-    // Edge darkening (visible cell borders).
+    // Subtle border darkening — centers stay full color, only the edges
+    // (where d is small) drop to 55% so cell shapes read without blacking
+    // out the whole material. Previous code multiplied by `edge` directly,
+    // which made centers (edge ≈ 0) pitch-black.
     float edge = smoothstep(0.30, 0.45, d);
-    cellCol *= edge;
+    cellCol *= mix(0.55, 1.0, edge);
     return mix(baseColor, cellCol, mix01);
 }
 

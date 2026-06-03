@@ -158,6 +158,18 @@ void VolumetricBeamLayer::render(RenderContext& ctx) {
 }
 
 void VolumetricBeamLayer::drawInspector() {
+    // The renderer's renderVolumetricBeams() is intentionally a no-op stub.
+    // Volumetric cones in air violate the projection-mapping principle
+    // ("never show the light, only its projection on the stage"), so this
+    // layer is kept available as a future opt-in but produces nothing
+    // visible. Warn the operator before they spend time tuning sliders.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.25f, 1.0f));
+    ImGui::TextWrapped("STUB — implementation pending. The renderer does"
+                        " not raymarch beams; this layer produces no output."
+                        " See engine/backends/metal/MetalRenderer.cpp"
+                        " (renderVolumetricBeams).");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
     ImGui::TextDisabled("Concert haze — \"cones of light in air\".");
     ImGui::TextDisabled("Reads scene depth; raymarches every spotlight.");
 

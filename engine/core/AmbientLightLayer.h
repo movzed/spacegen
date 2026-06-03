@@ -18,7 +18,9 @@ public:
     void        drawInspector() override;
 
     glm::vec3 color     = glm::vec3(1.0f);   // tint (white = pure base color)
-    float     intensity = 0.02f;             // multiplier
+    float     intensity = 0.15f;             // multiplier — was 0.02 (invisible
+                                              // against dark slate clear); 0.15
+                                              // produces a legible fill on +Add.
 };
 
 } // namespace spacegen

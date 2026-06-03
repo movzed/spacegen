@@ -87,9 +87,10 @@ void MotionBlurEffect::ensurePipeline_(MTL::Device* device,
     MTL::Library* lib = device_->newLibrary(src, opts, &err);
     opts->release();
     if (!lib) {
-        std::string msg = "[MotionBlur] MSL compile failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
+        std::fprintf(stderr, "[MotionBlur] MSL compile failed: %s\n",
+                      err ? err->localizedDescription()->utf8String()
+                          : "(no error)");
+        return;
     }
 
     MTL::Function* vsFn = lib->newFunction(
@@ -97,10 +98,11 @@ void MotionBlurEffect::ensurePipeline_(MTL::Device* device,
     MTL::Function* fsFn = lib->newFunction(
         NS::String::string("mb_fs", NS::UTF8StringEncoding));
     if (!vsFn || !fsFn) {
+        std::fprintf(stderr, "[MotionBlur] mb_vs/mb_fs not found\n");
         if (vsFn) vsFn->release();
         if (fsFn) fsFn->release();
         lib->release();
-        throw std::runtime_error("[MotionBlur] mb_vs/mb_fs not found");
+        return;
     }
 
     MTL::RenderPipelineDescriptor* pd =
@@ -115,9 +117,10 @@ void MotionBlurEffect::ensurePipeline_(MTL::Device* device,
     fsFn->release();
     lib->release();
     if (!pipeline_) {
-        std::string msg = "[MotionBlur] pipeline build failed: ";
-        if (err) msg += err->localizedDescription()->utf8String();
-        throw std::runtime_error(msg);
+        std::fprintf(stderr, "[MotionBlur] pipeline build failed: %s\n",
+                      err ? err->localizedDescription()->utf8String()
+                          : "(no error)");
+        return;
     }
 
     // Linear sampler with clamp-to-edge — taps that fall off the trailing

@@ -71,9 +71,12 @@ void SDFParticleLayer::releaseAllGpuResources()
     if (particleBuf_)    { particleBuf_->release();    particleBuf_    = nullptr; }
     if (trailRingBuf_)   { trailRingBuf_->release();   trailRingBuf_   = nullptr; }
     if (trailHeadBuf_)   { trailHeadBuf_->release();   trailHeadBuf_   = nullptr; }
+    if (dummyTrailRing_) { dummyTrailRing_->release(); dummyTrailRing_ = nullptr; }
+    if (dummyTrailHead_) { dummyTrailHead_->release(); dummyTrailHead_ = nullptr; }
     if (triCDFBuf_)      { triCDFBuf_->release();      triCDFBuf_      = nullptr; }
     if (triVertsBuf_)    { triVertsBuf_->release();    triVertsBuf_    = nullptr; }
     if (updatePipeline_) { updatePipeline_->release(); updatePipeline_ = nullptr; }
+    if (initPipeline_)   { initPipeline_->release();   initPipeline_   = nullptr; }
     if (spritePipeline_) { spritePipeline_->release(); spritePipeline_ = nullptr; }
     if (trailPipeline_)  { trailPipeline_->release();  trailPipeline_  = nullptr; }
     if (depthReadState_) { depthReadState_->release(); depthReadState_ = nullptr; }
@@ -133,6 +136,31 @@ void SDFParticleLayer::buildPipelinesIfNeeded(MetalRenderer& renderer)
             err ? err->localizedDescription()->utf8String() : "?");
         return;
     }
+
+    // Compute pipeline — init_particles (one-shot seed).
+    MTL::Function* initFn = library_->newFunction(
+        NS::String::string("init_particles", NS::UTF8StringEncoding));
+    if (initFn) {
+        initPipeline_ = device->newComputePipelineState(initFn, &err);
+        initFn->release();
+        if (!initPipeline_) {
+            std::fprintf(stderr,
+                "[SDFParticleLayer] init pipeline build failed: %s\n",
+                err ? err->localizedDescription()->utf8String() : "?");
+            // Non-fatal: respawn() in update_particles will eventually
+            // backfill, but the first few frames will look chaotic.
+        }
+    } else {
+        std::fprintf(stderr, "[SDFParticleLayer] init_particles not found.\n");
+    }
+
+    // 16-byte dummy buffers bound to slots 4/5 when trail mode is off.
+    // Content irrelevant — the kernel never reads from them on the K==1
+    // codepath, but Metal's validation checks bind-state, not access.
+    dummyTrailRing_ = device->newBuffer(16,
+                                          MTL::ResourceStorageModePrivate);
+    dummyTrailHead_ = device->newBuffer(16,
+                                          MTL::ResourceStorageModePrivate);
 
     // Render pipeline — point sprites.
     {
@@ -265,11 +293,12 @@ void SDFParticleLayer::reallocBuffersIfNeeded(MetalRenderer& renderer,
 
 void SDFParticleLayer::seedParticleBufferGPU()
 {
-    // We rely on the update kernel's respawn path to fill newly-allocated
-    // private memory with valid particles. Initially all 32-byte slots are
-    // zeroed (Metal guarantees this for `newBuffer(length:options:)`); zero
-    // age + zero lifetime → respawn() triggers in update.
-    // No explicit kernel dispatch needed.
+    // Mark for seeding — the actual init_particles dispatch happens in
+    // render() where we have a live command buffer. Metal does NOT zero-
+    // initialize Private storage buffers, so without an explicit seed
+    // each slot's `pos`/`age`/`lifetime` are uninitialised garbage and
+    // can produce NaN trajectories that never become visible.
+    needsSeed_ = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +447,31 @@ void SDFParticleLayer::render(RenderContext& ctx)
 
     packUniforms(ctx);
 
-    // ---- 1. Compute pass — update_particles ----
+    // ---- 1a. One-shot seed (init_particles) if newly allocated ----
+    // Dispatching this here, on the same command buffer that immediately
+    // runs update_particles, guarantees the seed lands before any update
+    // reads garbage. The kernel is gated on initPipeline_ existing AND
+    // a fresh allocation happening (needsSeed_).
+    if (needsSeed_ && initPipeline_) {
+        MTL::ComputeCommandEncoder* sec = ctx.cmdBuf->computeCommandEncoder();
+        if (sec) {
+            sec->setComputePipelineState(initPipeline_);
+            sec->setBuffer(particleBuf_, 0, 0);
+            sec->setBytes(&u_, sizeof(u_), 1);
+            if (triCDFBuf_)   sec->setBuffer(triCDFBuf_,   0, 2);
+            if (triVertsBuf_) sec->setBuffer(triVertsBuf_, 0, 3);
+            uint32_t seedValue = spawnSeed_++;
+            sec->setBytes(&seedValue, sizeof(seedValue), 4);
+            NS::UInteger tgs = initPipeline_->maxTotalThreadsPerThreadgroup();
+            MTL::Size gs = MTL::Size((NS::UInteger)currentParticleCount_, 1, 1);
+            MTL::Size tg = MTL::Size(std::min<NS::UInteger>(tgs, 256), 1, 1);
+            sec->dispatchThreads(gs, tg);
+            sec->endEncoding();
+            needsSeed_ = false;
+        }
+    }
+
+    // ---- 1b. Compute pass — update_particles ----
     MTL::ComputeCommandEncoder* cenc = ctx.cmdBuf->computeCommandEncoder();
     if (!cenc) return;
     cenc->setComputePipelineState(updatePipeline_);
@@ -426,10 +479,12 @@ void SDFParticleLayer::render(RenderContext& ctx)
     cenc->setBytes(&u_, sizeof(u_), 1);
     if (triCDFBuf_)   cenc->setBuffer(triCDFBuf_,   0, 2);
     if (triVertsBuf_) cenc->setBuffer(triVertsBuf_, 0, 3);
-    if (trailRingBuf_ && trailHeadBuf_) {
-        cenc->setBuffer(trailRingBuf_, 0, 4);
-        cenc->setBuffer(trailHeadBuf_, 0, 5);
-    }
+    // ALWAYS bind buffer(4) and buffer(5) — Metal validation faults on
+    // dispatch if a kernel-declared buffer slot is unbound, regardless
+    // of whether the kernel actually reads from it. Use real trails when
+    // K>1, dummy 16-byte buffers otherwise.
+    cenc->setBuffer(trailRingBuf_ ? trailRingBuf_ : dummyTrailRing_, 0, 4);
+    cenc->setBuffer(trailHeadBuf_ ? trailHeadBuf_ : dummyTrailHead_, 0, 5);
     NS::UInteger threadgroupSize =
         updatePipeline_->maxTotalThreadsPerThreadgroup();
     MTL::Size gridSize    = MTL::Size((NS::UInteger)currentParticleCount_, 1, 1);
