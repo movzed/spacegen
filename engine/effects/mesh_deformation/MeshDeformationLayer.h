@@ -99,6 +99,13 @@ public:
     // Public for simplicity (v1 — see Layer.h commentary).
     std::vector<DeformOp> ops;
 
+    // Global safety clamp (meters): the renderer caps the total per-vertex
+    // displacement of the whole chain to this distance, so layered octaves
+    // can never detach the mesh from the physical structure it is mapped
+    // onto (projection-mapping invariant). Operator-tunable in the
+    // inspector.
+    float maxDisplacement = 1.5f;
+
     // Add a new op of a given type at the end with sensible defaults.
     DeformOp& addOp(DeformOpType type);
 

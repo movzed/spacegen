@@ -400,6 +400,14 @@ void MeshDeformationLayer::drawInspector() {
         ImGui::SameLine();
         ImGui::TextDisabled("(applied top -> bottom)");
 
+        // Global safety clamp — bounds total displacement so the mesh
+        // can't detach from the physical structure (projection mapping).
+        ImGui::SliderFloat("Max displacement (m)##defmax",
+                            &maxDisplacement, 0.05f, 5.0f);
+        if (ops.empty()) {
+            ImGui::TextDisabled("Add an op below to deform the structure.");
+        }
+
         // Per-op inspectors.
         int toRemove   = -1;
         int moveSrc    = -1;

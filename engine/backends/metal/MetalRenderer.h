@@ -20,6 +20,7 @@ class  StructureLayer;
 class  BeamLayer;
 class  DirectionalLightLayer;
 class  AreaLightLayer;
+class  MeshDeformationLayer;
 
 // M3-B: layer-driven Metal backend.
 // Owns the pipelines + offscreen depth + per-mesh GPU buffers. Exposes
@@ -78,7 +79,11 @@ public:
         // AreaLightLayer panels — already updated by the bus walk in
         // StructureLayer, so positionWorld / normalWorld / effectiveR
         // are guaranteed fresh by the time we read them here.
-        const std::vector<const AreaLightLayer*>& areas = {});
+        const std::vector<const AreaLightLayer*>& areas = {},
+        // MeshDeformationLayer: when non-null and it has armed ops, the
+        // renderer snapshots its op chain and packs it into the vertex
+        // shader uniform. nullptr → the surfaceFx.z MVP wave is used.
+        const MeshDeformationLayer* deformLayer = nullptr);
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.

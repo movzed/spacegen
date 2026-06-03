@@ -8,6 +8,7 @@
 #include "../../core/ModulatorBank.h"
 #include "../../effects/light_cloner/LightClonerLayer.h"
 #include "../../effects/area_light/AreaLightLayer.h"
+#include "../../effects/mesh_deformation/MeshDeformationLayer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +30,8 @@ constexpr int kMaxSpots = 64;   // up to ~4 rigs × 8 fixtures, plus
                                   // (Notch Cloner pattern, up to 64 clones).
 constexpr int kMaxDirs  = 4;
 constexpr int kMaxAreas = 8;    // AreaLightLayer panels — see effects/area_light.
+constexpr int kRendDeformOps = 16;  // MeshDeformationLayer chain — see deformers.metal.inc.
+constexpr int kRendFfdSlots  = 4;
 constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
@@ -37,6 +40,25 @@ constant float PI         = 3.14159265359;
 constant int   MAX_SPOTS  = 64;
 constant int   MAX_DIRS   = 4;
 constant int   MAX_AREAS  = 8;
+
+// ---- MeshDeformationLayer chain (mirrors deformers.metal.inc) ----
+constant int OP_NONE       = 0;
+constant int OP_CURL_NOISE = 1;
+constant int OP_VORONOI    = 2;
+constant int OP_TWIST      = 3;
+constant int OP_BEND       = 4;
+constant int OP_TAPER      = 5;
+constant int OP_WAVE       = 6;
+constant int OP_SPHERIFY   = 7;
+constant int OP_FFD_LITE   = 8;
+constant int MAX_DEFORM_OPS = 16;
+constant int MAX_FFD_SLOTS  = 4;
+
+struct GpuDeformOp {
+    float4 header;   // .x type, .y intensity, .z time, .w ffd slot index (-1 unless FFD)
+    float4 pA;
+    float4 pB;
+};
 
 struct VertexIn {
     float3 position [[attribute(0)]];
@@ -98,6 +120,10 @@ struct Uniforms {
     //      future quality upgrades. ----
     float4    surfaceFx;            // .x holoOpacity, .y procMix, .z deformAmt, .w fractureAmt
     float4    surfaceFxParams;      // .x procScale, .y deformScale, .z fractureSeed, .w time
+    // ---- MeshDeformationLayer chain (full agent dispatcher) ----
+    float4    deformMeta;           // .x deformCount, .y maxDisplacement(m), .zw unused
+    GpuDeformOp deformers[MAX_DEFORM_OPS];
+    float4    ffdCorners[MAX_FFD_SLOTS * 8];   // 4 slots × 8 corner deltas
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
     AreaLight areas[MAX_AREAS];
@@ -107,6 +133,172 @@ struct Uniforms {
 static float vsHash(float3 p) {
     float3 s = sin(p * float3(127.1, 311.7, 74.7));
     return fract(s.x + s.y + s.z) * 2.0 - 1.0;
+}
+
+// ============================================================
+// MeshDeformationLayer dispatcher (inlined from deformers.metal.inc).
+// Prefixed `df` to avoid collision with the sfx* / vsHash helpers.
+// ============================================================
+static float dfHash13(float3 p) {
+    float n = dot(p, float3(127.1, 311.7, 74.7));
+    return fract(sin(n) * 43758.5453123) * 2.0 - 1.0;
+}
+static float3 dfHash33(float3 p) {
+    p = float3(dot(p, float3(127.1, 311.7, 74.7)),
+                dot(p, float3(269.5, 183.3, 246.1)),
+                dot(p, float3(113.5, 271.9, 124.6)));
+    return fract(sin(p) * 43758.5453123) * 2.0 - 1.0;
+}
+static float3 dfFade5(float3 t) {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+static float dfNoise3(float3 p) {
+    float3 i = floor(p);
+    float3 f = fract(p);
+    float3 u = dfFade5(f);
+    float n000 = dot(dfHash33(i + float3(0,0,0)), f - float3(0,0,0));
+    float n100 = dot(dfHash33(i + float3(1,0,0)), f - float3(1,0,0));
+    float n010 = dot(dfHash33(i + float3(0,1,0)), f - float3(0,1,0));
+    float n110 = dot(dfHash33(i + float3(1,1,0)), f - float3(1,1,0));
+    float n001 = dot(dfHash33(i + float3(0,0,1)), f - float3(0,0,1));
+    float n101 = dot(dfHash33(i + float3(1,0,1)), f - float3(1,0,1));
+    float n011 = dot(dfHash33(i + float3(0,1,1)), f - float3(0,1,1));
+    float n111 = dot(dfHash33(i + float3(1,1,1)), f - float3(1,1,1));
+    float nx00 = mix(n000, n100, u.x);
+    float nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x);
+    float nx11 = mix(n011, n111, u.x);
+    float nxy0 = mix(nx00, nx10, u.y);
+    float nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+static float3 dfNoiseField(float3 p) {
+    return float3(dfNoise3(p + float3(0.0,  0.0,  0.0)),
+                   dfNoise3(p + float3(31.4, 17.3, 11.0)),
+                   dfNoise3(p + float3(91.0, 64.7, 47.2)));
+}
+static float3 dfRotateAxis(float3 v, float3 a, float theta) {
+    float c = cos(theta), s = sin(theta);
+    return v * c + cross(a, v) * s + a * dot(a, v) * (1.0 - c);
+}
+static float3 dfCurlOf(float3 p) {
+    const float e = 1e-2;
+    float3 dx = (dfNoiseField(p + float3(e,0,0)) - dfNoiseField(p - float3(e,0,0))) / (2.0*e);
+    float3 dy = (dfNoiseField(p + float3(0,e,0)) - dfNoiseField(p - float3(0,e,0))) / (2.0*e);
+    float3 dz = (dfNoiseField(p + float3(0,0,e)) - dfNoiseField(p - float3(0,0,e))) / (2.0*e);
+    return float3(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x);
+}
+static float3 dfOpCurlNoise(float3 pos, GpuDeformOp op) {
+    float scale = op.pA.x, amount = op.pA.y, speed = op.pA.z;
+    bool timeOn = op.pA.w > 0.5;
+    float t = op.header.z;
+    float3 q = pos * scale;
+    if (timeOn) q += t * speed * float3(1.0, 1.3, 0.7);
+    return pos + dfCurlOf(q) * amount * op.header.y;
+}
+static float3 dfOpVoronoi(float3 pos, GpuDeformOp op) {
+    float scale = max(op.pA.x, 1e-3), shatter = op.pA.y;
+    float jitter = clamp(op.pA.z, 0.0, 1.0);
+    float3 q = pos / scale, i = floor(q), f = q - i;
+    float bestDist = 1e9; float3 bestCell = float3(0.0);
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        float3 cell = float3(float(dx), float(dy), float(dz));
+        float3 r = (dfHash33(i + cell) * 0.5 + 0.5) * jitter;
+        float3 diff = (cell + r) - f;
+        float d = dot(diff, diff);
+        if (d < bestDist) { bestDist = d; bestCell = cell + r; }
+    }
+    float3 centerWorld = (i + bestCell) * scale;
+    return pos + (centerWorld - pos) * shatter * op.header.y;
+}
+static float3 dfOpTwist(float3 pos, GpuDeformOp op) {
+    float3 axis = normalize(op.pA.xyz + float3(1e-6));
+    float amount = op.pA.w * op.header.y;
+    float3 center = op.pB.xyz;
+    float3 q = pos - center;
+    return dfRotateAxis(q, axis, dot(q, axis) * amount) + center;
+}
+static float3 dfOpBend(float3 pos, GpuDeformOp op) {
+    float3 axis = normalize(op.pA.xyz + float3(1e-6));
+    float angle = op.pA.w * op.header.y;
+    float3 bendDir = normalize(op.pB.xyz + float3(1e-6, 0.0, 0.0));
+    float3 rotAxis = normalize(cross(axis, bendDir) + float3(0.0, 1e-6, 0.0));
+    return dfRotateAxis(pos, rotAxis, dot(pos, bendDir) * angle);
+}
+static float3 dfOpTaper(float3 pos, GpuDeformOp op) {
+    float3 axis = normalize(op.pA.xyz + float3(1e-6));
+    float amount = op.pA.w * op.header.y;
+    float3 center = op.pB.xyz;
+    bool doClamp = op.pB.w > 0.5;
+    float3 q = pos - center;
+    float h = dot(q, axis);
+    float s = 1.0 + h * amount;
+    if (doClamp) s = max(s, 0.0);
+    float3 axial = axis * h;
+    return center + axial + (q - axial) * s;
+}
+static float3 dfOpWave(float3 pos, float3 vertexNormal, GpuDeformOp op) {
+    float3 dir = normalize(op.pA.xyz + float3(1e-6));
+    float freq = op.pA.w, speed = op.pB.x, amp = op.pB.y * op.header.y;
+    int mode = int(op.pB.z + 0.5);
+    float t = op.header.z;
+    float s = sin(dot(pos, dir) * freq - t * speed) * amp;
+    float3 along = (mode == 1) ? float3(0.0, 0.0, 1.0)
+                  : (mode == 2) ? dir
+                  : normalize(vertexNormal + float3(1e-6, 0.0, 0.0));
+    return pos + along * s;
+}
+static float3 dfOpSpherify(float3 pos, GpuDeformOp op) {
+    float3 center = op.pA.xyz;
+    float radius = op.pA.w, strength = op.pB.x * op.header.y;
+    float3 d = pos - center;
+    float len = length(d) + 1e-6;
+    return mix(pos, center + (d / len) * radius, clamp(strength, 0.0, 1.0));
+}
+static float3 dfOpFfdLite(float3 pos, GpuDeformOp op,
+                           constant float4* ffdCornersBase) {
+    float3 bmin = op.pA.xyz, bmax = op.pB.xyz;
+    int slot = int(op.header.w + 0.5);
+    if (slot < 0) return pos;
+    float3 size = max(bmax - bmin, float3(1e-4));
+    float3 u = clamp((pos - bmin) / size, 0.0, 1.0);
+    constant float4* sb = ffdCornersBase + slot * 8;
+    float3 b000 = float3(bmin.x, bmin.y, bmin.z) + sb[0].xyz;
+    float3 b100 = float3(bmax.x, bmin.y, bmin.z) + sb[1].xyz;
+    float3 b010 = float3(bmin.x, bmax.y, bmin.z) + sb[2].xyz;
+    float3 b110 = float3(bmax.x, bmax.y, bmin.z) + sb[3].xyz;
+    float3 b001 = float3(bmin.x, bmin.y, bmax.z) + sb[4].xyz;
+    float3 b101 = float3(bmax.x, bmin.y, bmax.z) + sb[5].xyz;
+    float3 b011 = float3(bmin.x, bmax.y, bmax.z) + sb[6].xyz;
+    float3 b111 = float3(bmax.x, bmax.y, bmax.z) + sb[7].xyz;
+    float3 dx00 = mix(b000, b100, u.x);
+    float3 dx10 = mix(b010, b110, u.x);
+    float3 dx01 = mix(b001, b101, u.x);
+    float3 dx11 = mix(b011, b111, u.x);
+    float3 dxy0 = mix(dx00, dx10, u.y);
+    float3 dxy1 = mix(dx01, dx11, u.y);
+    return mix(pos, mix(dxy0, dxy1, u.z), op.header.y);
+}
+static float3 dfApplyChain(float3 pos, float3 vertexNormal,
+                            constant GpuDeformOp* ops, int opCount,
+                            constant float4* ffdCornersBase) {
+    float3 p = pos;
+    for (int i = 0; i < opCount && i < MAX_DEFORM_OPS; ++i) {
+        GpuDeformOp op = ops[i];
+        int type = int(op.header.x + 0.5);
+        if (type == OP_NONE || op.header.y <= 0.0) continue;
+        if      (type == OP_CURL_NOISE) p = dfOpCurlNoise(p, op);
+        else if (type == OP_VORONOI)    p = dfOpVoronoi(p, op);
+        else if (type == OP_TWIST)      p = dfOpTwist(p, op);
+        else if (type == OP_BEND)       p = dfOpBend(p, op);
+        else if (type == OP_TAPER)      p = dfOpTaper(p, op);
+        else if (type == OP_WAVE)       p = dfOpWave(p, vertexNormal, op);
+        else if (type == OP_SPHERIFY)   p = dfOpSpherify(p, op);
+        else if (type == OP_FFD_LITE)   p = dfOpFfdLite(p, op, ffdCornersBase);
+    }
+    return p;
 }
 
 vertex VertexOut vs_main(VertexIn in [[stage_in]],
@@ -134,17 +326,31 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
         pos += in.normal * displaceAmount * (1.0 + n) * 0.5;
     }
 
-    // ---- MeshDeformationLayer MVP: noise wave + outward bulge. Read
-    //      amount + scale from surfaceFx — when 0 the deformation
-    //      collapses to identity so the existing displace/twist path
-    //      stays untouched on scenes without a Deform layer. ----
-    float deformAmount = u.surfaceFx.z;
-    float deformScale  = u.surfaceFxParams.y;
-    float sfxTime      = u.surfaceFxParams.w;
-    if (deformAmount > 1e-4) {
-        float w = sin(pos.x * deformScale + sfxTime * 2.0)
-                * cos(pos.z * deformScale + sfxTime * 1.3);
-        pos += in.normal * deformAmount * w;
+    // ---- MeshDeformationLayer: full agent deformer chain ----
+    // When the operator has armed ops, run the real dispatcher (bend,
+    // twist, taper, curl-noise, wave, spherify, FFD). Otherwise fall
+    // back to the single-wave MVP gated on surfaceFx.z. Displacement is
+    // clamped to deformMeta.y meters so layered octaves can never detach
+    // the mesh from the physical structure it's mapped onto.
+    int deformCount = int(u.deformMeta.x + 0.5);
+    if (deformCount > 0) {
+        float3 deformed = dfApplyChain(pos, in.normal,
+                                        &u.deformers[0], deformCount,
+                                        &u.ffdCorners[0]);
+        float maxDisp = u.deformMeta.y > 1e-4 ? u.deformMeta.y : 1.5;
+        float3 delta = deformed - pos;
+        float len = length(delta);
+        if (len > maxDisp) delta *= (maxDisp / len);
+        pos += delta;
+    } else {
+        float deformAmount = u.surfaceFx.z;
+        float deformScale  = u.surfaceFxParams.y;
+        float sfxTime      = u.surfaceFxParams.w;
+        if (deformAmount > 1e-4) {
+            float w = sin(pos.x * deformScale + sfxTime * 2.0)
+                    * cos(pos.z * deformScale + sfxTime * 1.3);
+            pos += in.normal * deformAmount * w;
+        }
     }
 
     float4 world = u.model * float4(pos, 1.0);
@@ -643,6 +849,14 @@ struct GpuArea {
     glm::vec4 colorRadius;    // .rgb color, .a equivalent radius
 };
 
+// CPU mirror of the MSL GpuDeformOp — must match byte-for-byte. Identical
+// layout to MeshDeformationLayer::GpuChain::GpuOp so we can memcpy directly.
+struct GpuDeformOpC {
+    glm::vec4 header;
+    glm::vec4 pA;
+    glm::vec4 pB;
+};
+
 struct Uniforms {
     glm::mat4 projection;
     glm::mat4 view;
@@ -660,6 +874,9 @@ struct Uniforms {
     glm::vec4 syphonParams;      // .x useAtlasUVs (0/1), .z flipY (0/1)
     glm::vec4 surfaceFx;         // .x holo .y proc .z deform .w fracture
     glm::vec4 surfaceFxParams;   // .x procScale .y deformScale .z fracSeed .w time
+    glm::vec4 deformMeta;        // .x deformCount, .y maxDisplacement(m)
+    GpuDeformOpC deformers[kRendDeformOps];
+    glm::vec4 ffdCorners[kRendFfdSlots * 8];
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
     GpuArea   areas[kMaxAreas];
@@ -1036,7 +1253,8 @@ void MetalRenderer::renderStructureMeshes(
     const std::vector<VirtualSpot>& virtualSpots,
     const glm::vec4& surfaceFx,
     const glm::vec4& surfaceFxParams,
-    const std::vector<const AreaLightLayer*>& areas)
+    const std::vector<const AreaLightLayer*>& areas,
+    const MeshDeformationLayer* deformLayer)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -1157,6 +1375,21 @@ void MetalRenderer::renderStructureMeshes(
     }
     areaCount = areaWritten;
 
+    // Snapshot the deformer chain once (identical for every mesh). The
+    // snapshot evaluates each op's effective intensity through the
+    // modulator bank. count == 0 → vertex shader falls back to the MVP
+    // wave (or identity if surfaceFx.z is also 0).
+    MeshDeformationLayer::GpuChain deformChain;
+    int deformOpCount = 0;
+    float deformMaxDisp = 1.5f;
+    if (deformLayer) {
+        const ModulatorBank* dmods = ctx.scene ? &ctx.scene->modulators
+                                               : nullptr;
+        deformChain    = deformLayer->snapshot(t, dmods);
+        deformOpCount  = deformChain.count;
+        deformMaxDisp  = deformLayer->maxDisplacement;
+    }
+
     for (const auto& gm : gpuMeshes_) {
         // Resolve the material for this mesh (or the default).
         const GpuMaterial& mat =
@@ -1202,6 +1435,18 @@ void MetalRenderer::renderStructureMeshes(
                                      0.0f);
         u.surfaceFx       = surfaceFx;
         u.surfaceFxParams = surfaceFxParams;
+        // Deformer chain (snapshot is identical for every mesh).
+        u.deformMeta = glm::vec4(static_cast<float>(deformOpCount),
+                                  deformMaxDisp, 0.0f, 0.0f);
+        if (deformOpCount > 0) {
+            // GpuChain::GpuOp == GpuDeformOpC byte-for-byte (3× vec4).
+            std::memcpy(u.deformers, deformChain.ops.data(),
+                         sizeof(GpuDeformOpC) * kRendDeformOps);
+            // ffdSlots is std::array<std::array<vec4,8>,4> — contiguous,
+            // matches u.ffdCorners[32].
+            std::memcpy(u.ffdCorners, deformChain.ffdSlots.data(),
+                         sizeof(glm::vec4) * kRendFfdSlots * 8);
+        }
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
         std::memcpy(u.areas, areasPacked, sizeof(GpuArea) * kMaxAreas);

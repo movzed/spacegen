@@ -31,6 +31,7 @@ void StructureLayer::render(RenderContext& ctx) {
     std::vector<const BeamLayer*>             spots;
     std::vector<const DirectionalLightLayer*> dirs;
     std::vector<const AreaLightLayer*>        areas;
+    const MeshDeformationLayer*               deformLayer = nullptr;
     glm::vec3 ambientColor(0.0f);
     MTL::Texture*  syphonTex   = nullptr;
     float          syphonMix   = 0.0f;
@@ -75,23 +76,19 @@ void StructureLayer::render(RenderContext& ctx) {
                 surfaceProcMix   = std::max(surfaceProcMix, p->opacity);
                 surfaceProcScale = 2.0f + 4.0f * p->opacity;
             } else if (auto* d = dynamic_cast<const MeshDeformationLayer*>(l.get())) {
-                // Gate on the op chain: a freshly-added Deform layer has
-                // an empty `ops` vector, so doing nothing is the right
-                // default. The MVP shader does a sin/cos wave proportional
-                // to surfaceDeformAmount — we only switch it on when the
-                // operator armed at least one enabled, non-zero op.
-                float chainAmt = 0.0f;
+                // The full agent deformer chain is forwarded to the
+                // renderer (which snapshots + packs it into the vertex
+                // shader). We keep the first deform layer with armed ops.
+                // The surfaceDeformAmount MVP path stays as a fallback for
+                // the (rare) case the renderer can't pack the chain.
+                bool hasArmedOp = false;
                 for (const auto& op : d->ops) {
-                    if (!op.enabled) continue;
-                    if (op.intensity <= 0.0f) continue;
-                    chainAmt = std::max(chainAmt, op.intensity);
+                    if (op.enabled && op.intensity > 0.0f) {
+                        hasArmedOp = true; break;
+                    }
                 }
-                if (chainAmt > 1e-3f) {
-                    surfaceDeformAmount = std::max(surfaceDeformAmount,
-                                                    chainAmt
-                                                    * d->opacity
-                                                    * 0.20f);
-                    surfaceDeformScale  = 1.5f;
+                if (hasArmedOp && !deformLayer) {
+                    deformLayer = d;
                 }
             } else if (auto* f = dynamic_cast<const MeshFractureLayer*>(l.get())) {
                 // Gate on operator intent: mode bitmask must be non-zero
@@ -143,7 +140,8 @@ void StructureLayer::render(RenderContext& ctx) {
                                           virtualSpots,
                                           surfaceFxVec,
                                           surfaceFxParamsVec,
-                                          areas);
+                                          areas,
+                                          deformLayer);
 }
 
 void StructureLayer::drawInspector() {
