@@ -9,6 +9,7 @@
 #include "../../effects/light_cloner/LightClonerLayer.h"
 #include "../../effects/area_light/AreaLightLayer.h"
 #include "../../effects/mesh_deformation/MeshDeformationLayer.h"
+#include "../../effects/procedural_material/ProceduralMaterialLayer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -124,6 +125,11 @@ struct Uniforms {
     float4    deformMeta;           // .x deformCount, .y maxDisplacement(m), .zw unused
     GpuDeformOp deformers[MAX_DEFORM_OPS];
     float4    ffdCorners[MAX_FFD_SLOTS * 8];   // 4 slots × 8 corner deltas
+    // ---- ProceduralMaterialLayer (full 10-pattern dispatcher, triplanar) ----
+    float4    procColorA;           // .rgb colour A, .a opacity
+    float4    procColorB;           // .rgb colour B, .a opacity
+    float4    procShape;            // .x scale, .y contrast, .z mix, .w pattern
+    float4    procAnim;             // .xy drift, .z time mult, .w octaves
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
     AreaLight areas[MAX_AREAS];
@@ -509,6 +515,222 @@ static bool sfxFractureDiscardOrTint(float3 worldPos, float amount,
     return cellAlive < (amount - 0.8) * 3.0;
 }
 
+// ============================================================
+// ProceduralMaterialLayer dispatcher (inlined from patterns.metal.inc).
+// All helpers are `proc`-prefixed — no collision with sfx*/df*/vs*.
+// Sampled triplanar in world space so the pattern paints the physical
+// structure regardless of UV seams (projection-mapping invariant).
+// ============================================================
+static float procHash21(float2 p) {
+    return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+}
+static float2 procHash22(float2 p) {
+    float n = sin(dot(p, float2(127.1, 311.7)));
+    return fract(float2(262144.0, 32768.0) * n);
+}
+static float3 procHash33(float3 p) {
+    p = float3(dot(p, float3(127.1, 311.7,  74.7)),
+               dot(p, float3(269.5, 183.3, 246.1)),
+               dot(p, float3(113.5, 271.9, 124.6)));
+    return fract(sin(p) * 43758.5453);
+}
+static float procValueNoise2(float2 p) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float a = procHash21(i + float2(0.0, 0.0));
+    float b = procHash21(i + float2(1.0, 0.0));
+    float c = procHash21(i + float2(0.0, 1.0));
+    float d = procHash21(i + float2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+static float procValueNoise3(float3 p) {
+    float3 i = floor(p);
+    float3 f = fract(p);
+    float3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float a = procHash33(i + float3(0,0,0)).x;
+    float b = procHash33(i + float3(1,0,0)).x;
+    float c = procHash33(i + float3(0,1,0)).x;
+    float d = procHash33(i + float3(1,1,0)).x;
+    float e = procHash33(i + float3(0,0,1)).x;
+    float g = procHash33(i + float3(1,0,1)).x;
+    float h = procHash33(i + float3(0,1,1)).x;
+    float k = procHash33(i + float3(1,1,1)).x;
+    float ab = mix(a, b, u.x), cd = mix(c, d, u.x);
+    float eg = mix(e, g, u.x), hk = mix(h, k, u.x);
+    return mix(mix(ab, cd, u.y), mix(eg, hk, u.y), u.z);
+}
+static float procFbm2(float2 p, int octaves) {
+    float v = 0.0, amp = 0.5;
+    float2x2 rot = float2x2(0.8, 0.6, -0.6, 0.8);
+    int n = clamp(octaves, 1, 8);
+    for (int i = 0; i < n; ++i) { v += amp * procValueNoise2(p); p = rot * p * 2.0; amp *= 0.5; }
+    return v;
+}
+static float procFbm3(float3 p, int octaves) {
+    float v = 0.0, amp = 0.5;
+    int n = clamp(octaves, 1, 8);
+    for (int i = 0; i < n; ++i) { v += amp * procValueNoise3(p); p *= 2.0; amp *= 0.5; }
+    return v;
+}
+static float3 procPalette(float t, float3 A, float3 B) {
+    t = clamp(t, 0.0, 1.0);
+    return mix(A, B, smoothstep(0.0, 1.0, t));
+}
+static float procApplyContrast(float t, float c) {
+    float s = clamp(c, 0.0, 2.0);
+    return clamp((t - 0.5) * s + 0.5, 0.0, 1.0);
+}
+static float3 procVoronoi(float2 p, float time, float contrast, float3 A, float3 B) {
+    float2 i = floor(p), f = fract(p);
+    float minD = 1e9;
+    for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x) {
+        float2 g = float2(float(x), float(y));
+        float2 o = procHash22(i + g);
+        o = 0.5 + 0.5 * sin(time + 6.2831 * o);
+        float2 r = g + o - f;
+        minD = min(minD, dot(r, r));
+    }
+    float F1 = sqrt(minD);
+    if (contrast < 0.5) {
+        float t = procApplyContrast(1.0 - F1, contrast * 2.0);
+        return procPalette(t, A, B);
+    } else {
+        float edge = 0.04 + 0.16 * (1.0 - (contrast - 0.5) * 2.0);
+        float aa   = fwidth(F1) * 1.5 + 1e-4;
+        float k    = smoothstep(edge, edge + aa, F1);
+        return procPalette(1.0 - k, A, B);
+    }
+}
+static float3 procPerlinFbm(float2 p, float time, float contrast, int octaves, float3 A, float3 B) {
+    float t = procFbm3(float3(p, time * 0.5), octaves);
+    return procPalette(procApplyContrast(t, contrast), A, B);
+}
+static float3 procCurlNoise(float2 p, float time, float contrast, int octaves, float3 A, float3 B) {
+    const float eps = 0.04;
+    float psi_xp = procFbm3(float3(p + float2(eps, 0.0), time * 0.4), octaves);
+    float psi_xm = procFbm3(float3(p - float2(eps, 0.0), time * 0.4), octaves);
+    float psi_yp = procFbm3(float3(p + float2(0.0, eps), time * 0.4), octaves);
+    float psi_ym = procFbm3(float3(p - float2(0.0, eps), time * 0.4), octaves);
+    float2 v = float2((psi_yp - psi_ym) / (2.0 * eps), -(psi_xp - psi_xm) / (2.0 * eps));
+    float t = saturate(length(v) * 0.5);
+    return procPalette(procApplyContrast(t, contrast), A, B);
+}
+static float procHexDist(float2 p) {
+    p.x *= 1.1547005;
+    p.y += 0.5 * floor(fmod(p.x, 2.0));
+    p = abs(fract(p) - 0.5);
+    return abs(max(p.x * 1.5 + p.y, p.y * 2.0) - 1.0);
+}
+static float3 procHex(float2 p, float time, float contrast, float3 A, float3 B) {
+    p += 0.05 * float2(cos(time * 0.7), sin(time * 0.5));
+    float d  = procHexDist(p);
+    float aa = fwidth(d) * 1.5 + 1e-4;
+    float thresh = 0.04 + 0.10 * (2.0 - contrast);
+    float k = smoothstep(thresh, thresh + aa, d);
+    return procPalette(1.0 - k, A, B);
+}
+static float3 procChecker(float2 p, float time, float contrast, int octaves, float3 A, float3 B) {
+    float c = 0.0, amp = 1.0, wsum = 0.0;
+    float2 q = p * 3.1415926 + time * 0.5;
+    int n = clamp(octaves, 1, 8);
+    for (int i = 0; i < n; ++i) { c += amp * sign(sin(q.x) * sin(q.y)); wsum += amp; q *= 2.0; amp *= 0.5; }
+    float t = (c / max(wsum, 1e-4)) * 0.5 + 0.5;
+    return procPalette(procApplyContrast(t, contrast), A, B);
+}
+static float3 procRings(float2 p, float time, float contrast, float3 A, float3 B) {
+    float d = length(p);
+    float t = fract(d - time * 0.5);
+    float w = clamp(0.5 - 0.45 * (contrast - 1.0), 0.05, 0.95);
+    float band = smoothstep(0.5 - w * 0.5, 0.5, t) * (1.0 - smoothstep(0.5, 0.5 + w * 0.5, t));
+    return procPalette(band, A, B);
+}
+static float3 procVoronoiShatter(float2 p, float time, float contrast, float3 A, float3 B) {
+    float2 i = floor(p), f = fract(p);
+    float F1 = 1e9, F2 = 1e9; float2 winnerCell = float2(0.0);
+    for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x) {
+        float2 g = float2(float(x), float(y));
+        float2 o = procHash22(i + g);
+        o = 0.5 + 0.5 * sin(time * 0.6 + 6.2831 * o);
+        float2 r = g + o - f; float d2 = dot(r, r);
+        if (d2 < F1) { F2 = F1; F1 = d2; winnerCell = i + g; }
+        else if (d2 < F2) { F2 = d2; }
+    }
+    float edge = sqrt(F2) - sqrt(F1);
+    float gapW = 0.02 + 0.18 * (2.0 - contrast);
+    float gap  = smoothstep(0.0, gapW, edge);
+    float3 inside = procPalette(procHash21(winnerCell), A, B);
+    return mix(B * 0.25, inside, gap);
+}
+static float3 procWood(float2 p, float time, float contrast, int octaves, float3 A, float3 B) {
+    float2 q = p;
+    float r = sqrt(q.x * q.x * 0.1 + q.y * q.y);
+    r += 0.55 * procFbm3(float3(q * 3.0, time * 0.2), octaves);
+    float g = fract(r);
+    float w = clamp(0.5 - 0.45 * (contrast - 1.0), 0.05, 0.95);
+    g = smoothstep(0.5 - w * 0.5, 0.5 + w * 0.5, g);
+    return procPalette(g, A, B);
+}
+static float3 procMarble(float2 p, float time, float contrast, int octaves, float3 A, float3 B) {
+    float warp = procFbm3(float3(p, time * 0.15), octaves);
+    float t = sin((p.x + 4.0 * warp) * 1.0) * 0.5 + 0.5;
+    return procPalette(procApplyContrast(t, contrast), A, B);
+}
+static float3 procBrick(float2 p, float time, float contrast, float3 A, float3 B) {
+    float2 q = float2(p.x * 0.5, p.y);
+    float row = floor(q.y);
+    float offset = fmod(row, 2.0) * 0.5;
+    float u = fract(q.x + offset), v = fract(q.y);
+    float mw = 0.04 + 0.06 * (2.0 - contrast);
+    float mortarU = smoothstep(0.0, mw, u) * (1.0 - smoothstep(1.0 - mw, 1.0, u));
+    float mortarV = smoothstep(0.0, mw, v) * (1.0 - smoothstep(1.0 - mw, 1.0, v));
+    float brickMask = mortarU * mortarV;
+    float col = floor(q.x + offset);
+    float id  = procHash21(float2(col, row));
+    id = fract(id + sin(time * 0.4 + id * 6.2831) * 0.05);
+    float3 brick  = procPalette(id, A, B);
+    float3 mortar = mix(A, B, 0.5) * 0.35;
+    return mix(mortar, brick, brickMask);
+}
+static float3 procEvaluate2D(float2 uv, float elapsedSeconds,
+                              float4 colA, float4 colB, float4 shape, float4 anim) {
+    float scale = shape.x, contrast = shape.y;
+    int pattern = int(shape.w + 0.5);
+    int octaves = int(clamp(anim.w, 1.0, 8.0));
+    float timeScale = anim.z;
+    float3 A = colA.rgb, B = colB.rgb;
+    float t = elapsedSeconds * timeScale;
+    float2 sp = uv * scale + anim.xy * elapsedSeconds;
+    switch (pattern) {
+        case 0:  return procVoronoi       (sp, t, contrast, A, B);
+        case 1:  return procPerlinFbm     (sp, t, contrast, octaves, A, B);
+        case 2:  return procCurlNoise     (sp, t, contrast, octaves, A, B);
+        case 3:  return procHex           (sp, t, contrast, A, B);
+        case 4:  return procChecker       (sp, t, contrast, octaves, A, B);
+        case 5:  return procRings         (sp, t, contrast, A, B);
+        case 6:  return procVoronoiShatter(sp, t, contrast, A, B);
+        case 7:  return procWood          (sp, t, contrast, octaves, A, B);
+        case 8:  return procMarble        (sp, t, contrast, octaves, A, B);
+        case 9:  return procBrick         (sp, t, contrast, A, B);
+        default: return mix(A, B, 0.5);
+    }
+}
+// World-space triplanar wrapper: blend three planar evaluations by the
+// squared normal so the pattern sticks to the physical structure with no
+// UV seam stretching — the #1 reason Notch materials read clean.
+static float3 sfxProceduralTriplanar(float3 worldPos, float3 N, float elapsed,
+                                      float4 colA, float4 colB,
+                                      float4 shape, float4 anim) {
+    float3 w = pow(abs(N), float3(4.0));
+    w /= (w.x + w.y + w.z + 1e-5);
+    float3 cx = procEvaluate2D(worldPos.yz, elapsed, colA, colB, shape, anim);
+    float3 cy = procEvaluate2D(worldPos.zx, elapsed, colA, colB, shape, anim);
+    float3 cz = procEvaluate2D(worldPos.xy, elapsed, colA, colB, shape, anim);
+    return cx * w.x + cy * w.y + cz * w.z;
+}
+
 fragment float4 fs_main(VertexOut in [[stage_in]],
                         constant Uniforms& u [[buffer(0)]],
                         texture2d<float> baseColorMap [[texture(0)]],
@@ -646,11 +868,18 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
                      * baseTex.rgb;
     float3 baseColor = mix(baseMat, syphonSample, syphonMix);
 
-    // ---- ProceduralMaterialLayer MVP splice ----
-    baseColor = sfxProceduralBase(baseColor, in.worldPos,
-                                   u.surfaceFx.y,
-                                   u.surfaceFxParams.x,
-                                   u.surfaceFxParams.w);
+    // ---- ProceduralMaterialLayer: full 10-pattern triplanar dispatcher ----
+    // procShape.z is the effective mix (mix * layer opacity, packed CPU
+    // side). 0 → fast-path skip. Sampled in world space (triplanar) so the
+    // pattern paints the physical structure regardless of UV seams.
+    float procMix = u.procShape.z;
+    if (procMix > 1e-3) {
+        float3 procCol = sfxProceduralTriplanar(in.worldPos, N,
+                                                 u.surfaceFxParams.w,
+                                                 u.procColorA, u.procColorB,
+                                                 u.procShape, u.procAnim);
+        baseColor = mix(baseColor, procCol, procMix);
+    }
 
     // ---- MeshFractureLayer MVP splice: discard whole cells + tint cracks ----
     float3 fractureTint;
@@ -877,6 +1106,10 @@ struct Uniforms {
     glm::vec4 deformMeta;        // .x deformCount, .y maxDisplacement(m)
     GpuDeformOpC deformers[kRendDeformOps];
     glm::vec4 ffdCorners[kRendFfdSlots * 8];
+    glm::vec4 procColorA;        // ProceduralMaterialUniforms.colorA
+    glm::vec4 procColorB;        // .colorB
+    glm::vec4 procShape;         // .shape (scale, contrast, mix, pattern)
+    glm::vec4 procAnim;          // .anim (driftXY, timeMult, octaves)
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
     GpuArea   areas[kMaxAreas];
@@ -1254,7 +1487,8 @@ void MetalRenderer::renderStructureMeshes(
     const glm::vec4& surfaceFx,
     const glm::vec4& surfaceFxParams,
     const std::vector<const AreaLightLayer*>& areas,
-    const MeshDeformationLayer* deformLayer)
+    const MeshDeformationLayer* deformLayer,
+    const ProceduralMaterialUniforms* procMat)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -1446,6 +1680,16 @@ void MetalRenderer::renderStructureMeshes(
             // matches u.ffdCorners[32].
             std::memcpy(u.ffdCorners, deformChain.ffdSlots.data(),
                          sizeof(glm::vec4) * kRendFfdSlots * 8);
+        }
+        // Procedural material block (10-pattern triplanar). disabled* when
+        // no layer present → shape.z (mix) == 0 → shader fast-path skip.
+        if (procMat) {
+            u.procColorA = procMat->colorA;
+            u.procColorB = procMat->colorB;
+            u.procShape  = procMat->shape;
+            u.procAnim   = procMat->anim;
+        } else {
+            u.procShape = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);  // mix=0
         }
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);

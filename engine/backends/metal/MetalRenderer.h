@@ -21,6 +21,7 @@ class  BeamLayer;
 class  DirectionalLightLayer;
 class  AreaLightLayer;
 class  MeshDeformationLayer;
+struct ProceduralMaterialUniforms;
 
 // M3-B: layer-driven Metal backend.
 // Owns the pipelines + offscreen depth + per-mesh GPU buffers. Exposes
@@ -83,7 +84,10 @@ public:
         // MeshDeformationLayer: when non-null and it has armed ops, the
         // renderer snapshots its op chain and packs it into the vertex
         // shader uniform. nullptr → the surfaceFx.z MVP wave is used.
-        const MeshDeformationLayer* deformLayer = nullptr);
+        const MeshDeformationLayer* deformLayer = nullptr,
+        // ProceduralMaterialLayer packed block (10-pattern triplanar). When
+        // non-null its mix > 0 enables the procedural baseColor replacement.
+        const ProceduralMaterialUniforms* procMat = nullptr);
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.

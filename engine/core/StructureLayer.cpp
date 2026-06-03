@@ -32,6 +32,8 @@ void StructureLayer::render(RenderContext& ctx) {
     std::vector<const DirectionalLightLayer*> dirs;
     std::vector<const AreaLightLayer*>        areas;
     const MeshDeformationLayer*               deformLayer = nullptr;
+    ProceduralMaterialUniforms                procUniforms{};
+    bool                                      procPacked = false;
     glm::vec3 ambientColor(0.0f);
     MTL::Texture*  syphonTex   = nullptr;
     float          syphonMix   = 0.0f;
@@ -73,8 +75,16 @@ void StructureLayer::render(RenderContext& ctx) {
             } else if (auto* h = dynamic_cast<const HologramMaterialLayer*>(l.get())) {
                 surfaceHoloOpacity = std::max(surfaceHoloOpacity, h->opacity);
             } else if (auto* p = dynamic_cast<const ProceduralMaterialLayer*>(l.get())) {
-                surfaceProcMix   = std::max(surfaceProcMix, p->opacity);
-                surfaceProcScale = 2.0f + 4.0f * p->opacity;
+                // Pack the full 10-pattern block (triplanar, palette,
+                // octaves, contrast, drift). Keep the first procedural
+                // layer in the bus. packProceduralMaterial folds layer
+                // opacity into shape.z (mix), so a disabled/zero-mix layer
+                // hits the shader fast-path.
+                if (!procPacked) {
+                    procUniforms = packProceduralMaterial(*p);
+                    procPacked   = true;
+                }
+                surfaceProcMix = std::max(surfaceProcMix, p->opacity);
             } else if (auto* d = dynamic_cast<const MeshDeformationLayer*>(l.get())) {
                 // The full agent deformer chain is forwarded to the
                 // renderer (which snapshots + packs it into the vertex
@@ -141,7 +151,8 @@ void StructureLayer::render(RenderContext& ctx) {
                                           surfaceFxVec,
                                           surfaceFxParamsVec,
                                           areas,
-                                          deformLayer);
+                                          deformLayer,
+                                          procPacked ? &procUniforms : nullptr);
 }
 
 void StructureLayer::drawInspector() {
