@@ -71,20 +71,32 @@ public:
     // Curl-noise field parameters.
     // curlScale ≈ 1/wavelength (spatial frequency).
     // curlAmplitude in m/s — the velocity contribution at peak noise.
-    float curlScale     = 0.6f;
-    float curlAmplitude = 1.5f;
+    // Defaults tuned LOW + short-wavelength so Surface-emitted particles
+    // stay clinging to the structure (gentle shimmer) rather than being
+    // swept off it. NOTE: the SDF force/crawl/collision currently reference
+    // the scene BOUNDING BOX, not the mesh, so they pull particles toward
+    // the box shell — they're left OFF by default until a real mesh SDF
+    // bake lands (tracked separately). With no SDF force + tiny curl,
+    // particles simply drift near their birth point on the mesh surface.
+    float curlScale     = 1.2f;
+    float curlAmplitude = 0.15f;
 
     // SDF force.
     //  > 0: attract  (particles pulled toward the structure surface)
     //  < 0: repel    (particles pushed away)
     // |sdfStrength| up to ~5; bigger = harder pull.
-    float sdfStrength   = 1.2f;
+    // Default 0: the SDF is the bbox (wrong surface), so any pull drags
+    // particles off the mesh toward the box. Re-enable once a mesh SDF
+    // exists.
+    float sdfStrength   = 0.0f;
 
     // SDF influence falloff (meters). Force ∝ exp(-(d/sdfRange)²).
-    float sdfRange      = 1.5f;
+    float sdfRange      = 0.5f;
 
     // Velocity damping (per second). 0 = no drag, 1 = halve every second.
-    float drag          = 0.10f;
+    // Higher default so particles bleed speed and hover near their birth
+    // point on the mesh instead of drifting off (cheap surface-cling).
+    float drag          = 0.40f;
 
     // Per-particle color over a 3-stop life ramp:
     //   t<0.5 : mix(colorStart, colorMid, t*2)
@@ -121,12 +133,15 @@ public:
     // attract so escapees snap back.
 
     // Surface-crawl: project the curl-noise velocity onto the SDF tangent
-    // plane (remove the surface-normal component) so energy crawls ALONG
-    // the structure instead of lifting off it. DEFAULT ON.
-    bool  surfaceCrawl   = true;
+    // plane (remove the surface-normal component). DEFAULT OFF until the
+    // SDF references the real mesh — right now it uses the bounding box, so
+    // "crawling along the surface" means crawling along the BOX, which
+    // pulls particles off the structure.
+    bool  surfaceCrawl   = false;
 
     // SDF collision "hug": keep particles within skinOffset of the surface.
-    bool  collisionEnable = true;
+    // DEFAULT OFF for the same bbox-vs-mesh reason.
+    bool  collisionEnable = false;
     // Skin band thickness (m). Particles closer than this are pushed out to
     // exactly skinOffset; ~5 cm reads as "painting" the structure.
     float skinOffset     = 0.05f;

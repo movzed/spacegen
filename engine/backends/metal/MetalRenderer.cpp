@@ -963,6 +963,24 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     float3 N = normalize(in.worldNormal);
     float3 V = normalize(u.cameraWorldPos.xyz - in.worldPos);
 
+    // ---- Displaced-geometry normals --------------------------------------
+    // The vertex stage moves positions (deformer chain + fracture explode/
+    // glitch) but the interpolated normal stays the ORIGINAL surface normal.
+    // Lighting would then shade deformed/cracked geometry as if it were flat
+    // — deform "does nothing", explode looks flat. Recompute a geometric
+    // normal from world-position screen derivatives so light actually
+    // catches the new relief. Gated on deform/fracture being active so
+    // undeformed meshes keep their smooth interpolated normals (no faceting).
+    bool deformActiveN = (u.deformMeta.x > 0.5) ||
+                         (uint(u.fracMeta.x + 0.5) != 0u && u.fracMeta.y > 1e-3);
+    if (deformActiveN) {
+        float3 Ngeo = normalize(cross(dfdx(in.worldPos), dfdy(in.worldPos)));
+        // cross() sign is ambiguous — flip into the same hemisphere as the
+        // interpolated normal so front faces stay lit.
+        Ngeo = faceforward(Ngeo, -N, Ngeo);
+        N = Ngeo;
+    }
+
     // ---- Tier 2: Stretch heatmap diagnostic ----------------------------
     // When enabled, the structure renders as a viridis-like heatmap of per-
     // fragment UV distortion. We derive the singular values σ₁, σ₂ of the
@@ -1093,13 +1111,14 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     // procShape.z is the effective mix (mix * layer opacity, packed CPU
     // side). 0 → fast-path skip. Sampled in world space (triplanar) so the
     // pattern paints the physical structure regardless of UV seams.
-    float procMix = u.procShape.z;
+    float  procMix = u.procShape.z;
+    float3 procColSaved = float3(0.0);
     if (procMix > 1e-3) {
-        float3 procCol = sfxProceduralTriplanar(in.worldPos, N,
-                                                 u.surfaceFxParams.w,
-                                                 u.procColorA, u.procColorB,
-                                                 u.procShape, u.procAnim);
-        baseColor = mix(baseColor, procCol, procMix);
+        procColSaved = sfxProceduralTriplanar(in.worldPos, N,
+                                               u.surfaceFxParams.w,
+                                               u.procColorA, u.procColorB,
+                                               u.procShape, u.procAnim);
+        baseColor = mix(baseColor, procColSaved, procMix);
     }
 
     // ---- MeshFractureLayer: 4 modes (cracks/dissolve/glitch fragment-side;
@@ -1264,6 +1283,15 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     }
 
     float3 colorLin = ambient * baseColor + totalLight;
+
+    // Procedural emissive floor: blend a fraction of the (unlit) procedural
+    // colour back in so the texture is readable even on an unlit stage.
+    // Without this, procedural is pure albedo × lighting and vanishes when
+    // no light layers are enabled (the default scene). 35% reads clearly
+    // while still letting 65% respond to the lighting.
+    if (procMix > 1e-3) {
+        colorLin = mix(colorLin, procColSaved, 0.35 * procMix);
+    }
 
     // ---- HologramMaterialLayer: full configurable sub-effects ----
     colorLin = sfxHologramFull(colorLin, N, V, in.worldPos, u);

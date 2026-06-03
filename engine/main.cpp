@@ -216,19 +216,9 @@ int main(int argc, char** argv) {
         b->innerDeg     = 12.0f;
         b->outerDeg     = 22.0f;
     }
-    // ---- Diagnostic auto-add: Bloom + MotionBlur to verify the effect
-    //      bus walks on startup. The operator can disable / remove them
-    //      from the Layer Rack if not wanted.
-    {
-        auto* bl = scene.bus.add<spacegen::BloomEffect>();
-        bl->name      = "Bloom (auto)";
-        bl->threshold = 0.2f;     // catch most of the lit surface
-        bl->intensity = 1.5f;     // visible halo on bright highlights
-    }
-    {
-        auto* mb = scene.bus.add<spacegen::MotionBlurEffect>();
-        mb->name      = "Motion Blur (auto)";
-    }
+    // Post-FX (Bloom, MotionBlur, CA, Glitch) are NOT auto-added — the
+    // operator adds them from the Post-FX panel when wanted. The default
+    // scene is clean so it's clear what each effect contributes.
 
     // ImGui Workstation (overlays panels on top of the rendered scene).
     spacegen::gui::Workstation workstation(window, device, kColorFmt);

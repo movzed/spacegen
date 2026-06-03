@@ -60,9 +60,11 @@ public:
     glm::vec3   masterGlowColor    = glm::vec3(0.40f, 0.85f, 1.00f);
 
     // ---- 1. Scan lines ----
-    bool        scanEnabled        = true;
+    // Default OFF: scanFreq 220 on a multi-metre structure produced dense
+    // ~3cm horizontal banding that read as "ugly lines". Operator opts in.
+    bool        scanEnabled        = false;
     bool        scanHarmonic       = false;       // add 3× harmonic stripe
-    float       scanFreq           = 220.0f;      // stripes per screen height
+    float       scanFreq           = 12.0f;       // stripes per world metre (was 220)
     float       scanSpeed          = 0.5f;        // cycles per second
     float       scanIntensity      = 0.45f;       // 0..1 modulation depth
 
@@ -93,11 +95,15 @@ public:
         Deriv  = 1,   // fwidth(worldPos) — works on any mesh
         Bary   = 2,   // requires baked barycentric buffer (3× verts)
     };
-    WireMode    wireMode           = WireMode::Deriv;
+    // Default OFF: the derivative wireframe drew a 1m axis-aligned grid on
+    // all three world axes, reading as a dense ugly cube grid. Operator
+    // opts in; when on, wireScale controls the grid spacing in metres.
+    WireMode    wireMode           = WireMode::Off;
     glm::vec3   wireColor          = glm::vec3(0.40f, 0.85f, 1.00f);
     float       wireThickness      = 1.2f;        // pixels
     float       wireSharpness      = 1.5f;
     float       wireIntensity      = 0.8f;
+    float       wireScale          = 0.5f;        // grid lines per world metre
 
     // ---- 6. Color shift ----
     bool        hueEnabled         = false;
