@@ -10,6 +10,7 @@
 #include "../../effects/area_light/AreaLightLayer.h"
 #include "../../effects/mesh_deformation/MeshDeformationLayer.h"
 #include "../../effects/procedural_material/ProceduralMaterialLayer.h"
+#include "../../effects/mesh_fracture/MeshFractureLayer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -130,6 +131,17 @@ struct Uniforms {
     float4    procColorB;           // .rgb colour B, .a opacity
     float4    procShape;            // .x scale, .y contrast, .z mix, .w pattern
     float4    procAnim;             // .xy drift, .z time mult, .w octaves
+    // ---- MeshFractureLayer (4 modes: cracks/dissolve/explode/glitch) ----
+    float4    fracMeta;             // .x mode(bits), .y amount, .z seed, .w time
+    float4    fracCracks;           // .x density, .y width, .z jitter, .w darken
+    float4    fracCrackGlow;        // .rgb glow colour, .w glow strength
+    float4    fracDissolveA;        // .x scale, .y speed, .z radius, .w radialBias
+    float4    fracDissolveB;        // .x edgeWidth, .y edgeGlow, .z useRadial, .w jitterSpeed
+    float4    fracBurn;             // .xyz burn point, .w unused
+    float4    fracDissolveColor;    // .rgb edge colour, .w unused
+    float4    fracExplode;          // .x shardDensity, .y jitter, .z spin, .w strength
+    float4    fracMeshCenter;       // .xyz world mesh centroid, .w explodeCap(m)
+    float4    fracGlitch;           // .x freq, .y magnitude, .z speed, .w dropout
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
     AreaLight areas[MAX_AREAS];
@@ -307,6 +319,43 @@ static float3 dfApplyChain(float3 pos, float3 vertexNormal,
     return p;
 }
 
+// ============================================================
+// MeshFractureLayer — vertex-stage displacement (Explode + Glitch).
+// Operates in WORLD space (after u.model). Bounded by explodeCap so
+// shards stay near the physical structure (projection-mapping rule).
+// Mode bits: 1=Cracks 2=Dissolve 4=Explode 8=Glitch.
+// ============================================================
+static float3 fracVertexDisplace(float3 wp, constant Uniforms& u) {
+    uint  mode   = uint(u.fracMeta.x + 0.5);
+    float amount = u.fracMeta.y;
+    if (amount < 1e-3) return wp;
+
+    if ((mode & 4u) != 0u) {   // Explode: per-shard outward push + spin
+        float density = max(u.fracExplode.x, 0.3);
+        float3 cellId = floor(wp * density);
+        float3 shardCentroid = (cellId + 0.5) / density;
+        float3 jit = dfHash33(cellId) * u.fracExplode.y;   // [-1,1]·jitter
+        float3 meshC = u.fracMeshCenter.xyz;
+        float3 dir = normalize(shardCentroid - meshC + jit + float3(1e-5));
+        float cap  = max(u.fracMeshCenter.w, 0.0);
+        float push = min(u.fracExplode.w * amount, cap);   // hard cap (m)
+        wp += dir * push;
+        float ang = u.fracExplode.z * amount * 6.2831 * dfHash13(cellId + 7.0);
+        float3 rel = wp - shardCentroid;
+        float c = cos(ang), s = sin(ang);
+        rel = float3(c * rel.x - s * rel.y, s * rel.x + c * rel.y, rel.z);
+        wp = shardCentroid + rel;
+    }
+    if ((mode & 8u) != 0u) {   // Glitch: lateral band tear (capped)
+        float band = floor(wp.y * u.fracGlitch.x);
+        float roll = floor(u.fracMeta.w * u.fracGlitch.z);
+        float sh = dfHash13(float3(band, roll, 0.0))
+                 * min(u.fracGlitch.y, 0.3) * amount;
+        wp.x += sh;
+    }
+    return wp;
+}
+
 vertex VertexOut vs_main(VertexIn in [[stage_in]],
                          constant Uniforms& u [[buffer(1)]])
 {
@@ -360,8 +409,10 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
     }
 
     float4 world = u.model * float4(pos, 1.0);
-    out.position = u.projection * u.view * world;
-    out.worldPos = world.xyz;
+    // MeshFractureLayer vertex displacement (Explode + Glitch) in world space.
+    float3 wp = fracVertexDisplace(world.xyz, u);
+    out.position = u.projection * u.view * float4(wp, 1.0);
+    out.worldPos = wp;
     out.worldNormal = (u.model * float4(in.normal, 0.0)).xyz;
     out.uv  = in.uv;
     out.uv1 = in.uv1;
@@ -731,6 +782,62 @@ static float3 sfxProceduralTriplanar(float3 worldPos, float3 N, float elapsed,
     return cx * w.x + cy * w.y + cz * w.z;
 }
 
+// ============================================================
+// MeshFractureLayer — fragment-stage modes (Cracks/Dissolve/Glitch).
+// Darkens baseColor and adds emissive; returns true to discard.
+// Explode + Glitch-lateral happen in the vertex stage (fracVertexDisplace).
+// ============================================================
+static bool fracFragment(float3 wp, constant Uniforms& u,
+                          thread float3& baseColor, thread float3& emissive) {
+    uint  mode   = uint(u.fracMeta.x + 0.5);
+    float amount = u.fracMeta.y;
+    float seed   = u.fracMeta.z;
+    float time   = u.fracMeta.w;
+    if (mode == 0u || amount < 1e-3) return false;
+
+    // CRACKS — Voronoi F1 edge band darkens + glows.
+    if ((mode & 1u) != 0u) {
+        float density = max(u.fracCracks.x, 0.2);
+        float2 p = wp.xy * density + seed + time * u.fracDissolveB.w;
+        float2 cell;
+        float d = sfxVoronoi(p, cell);
+        float width = max(u.fracCracks.y, 1e-3);
+        float crackBand = 1.0 - smoothstep(0.0, width, d);
+        baseColor *= mix(1.0, u.fracCracks.w, crackBand);
+        emissive  += u.fracCrackGlow.rgb * u.fracCrackGlow.w * crackBand * amount;
+    }
+
+    // DISSOLVE — fbm-threshold erosion with a glowing burn edge.
+    if ((mode & 2u) != 0u) {
+        float scale = max(u.fracDissolveA.x, 1e-3);
+        float speed = u.fracDissolveA.y;
+        float n = procFbm3(wp * scale + float3(0.0, 0.0, time * speed * 0.1), 4);
+        float thr = amount;
+        if (u.fracDissolveB.z > 0.5) {   // radial bias from burn point
+            float rad = length(wp - u.fracBurn.xyz)
+                      / max(u.fracDissolveA.z, 1e-3);
+            thr -= u.fracDissolveA.w * (rad - 0.5);
+        }
+        float edgeW = max(u.fracDissolveB.x, 1e-3);
+        if (n < thr - edgeW) return true;          // fully eaten
+        float edge = 1.0 - smoothstep(thr - edgeW, thr, n);
+        emissive += u.fracDissolveColor.rgb * u.fracDissolveB.y * edge * amount;
+    }
+
+    // GLITCH — per-band fragment dropout (flicker-darken + digital tint).
+    if ((mode & 8u) != 0u) {
+        float band = floor(wp.y * u.fracGlitch.x);
+        float roll = floor(time * u.fracGlitch.z);
+        float h = fract(sin(dot(float2(band, roll), float2(127.1, 311.7)))
+                        * 43758.5453);
+        if (h < u.fracGlitch.w * amount) {
+            baseColor *= 0.15;
+            emissive  += float3(0.10, 0.30, 0.40) * amount;
+        }
+    }
+    return false;
+}
+
 fragment float4 fs_main(VertexOut in [[stage_in]],
                         constant Uniforms& u [[buffer(0)]],
                         texture2d<float> baseColorMap [[texture(0)]],
@@ -881,12 +988,10 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
         baseColor = mix(baseColor, procCol, procMix);
     }
 
-    // ---- MeshFractureLayer MVP splice: discard whole cells + tint cracks ----
-    float3 fractureTint;
-    bool fracDiscard = sfxFractureDiscardOrTint(in.worldPos,
-                                                  u.surfaceFx.w,
-                                                  u.surfaceFxParams.z,
-                                                  fractureTint);
+    // ---- MeshFractureLayer: 4 modes (cracks/dissolve/glitch fragment-side;
+    //      explode + glitch-lateral already applied in the vertex stage) ----
+    float3 fractureTint = float3(0.0);
+    bool fracDiscard = fracFragment(in.worldPos, u, baseColor, fractureTint);
     if (fracDiscard) discard_fragment();
     float  roughness = max(u.baseColorRoughness.a
                           * u.matMR.y
@@ -1110,6 +1215,16 @@ struct Uniforms {
     glm::vec4 procColorB;        // .colorB
     glm::vec4 procShape;         // .shape (scale, contrast, mix, pattern)
     glm::vec4 procAnim;          // .anim (driftXY, timeMult, octaves)
+    glm::vec4 fracMeta;          // mode, amount, seed, time
+    glm::vec4 fracCracks;        // density, width, jitter, darken
+    glm::vec4 fracCrackGlow;     // glowColor.rgb, glow
+    glm::vec4 fracDissolveA;     // scale, speed, radius, radialBias
+    glm::vec4 fracDissolveB;     // edgeWidth, edgeGlow, useRadial, jitterSpeed
+    glm::vec4 fracBurn;          // burnPoint.xyz
+    glm::vec4 fracDissolveColor; // edgeColor.rgb
+    glm::vec4 fracExplode;       // shardDensity, jitter, spin, strength
+    glm::vec4 fracMeshCenter;    // centroid.xyz, explodeCap(m)
+    glm::vec4 fracGlitch;        // freq, magnitude, speed, dropout
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
     GpuArea   areas[kMaxAreas];
@@ -1488,7 +1603,8 @@ void MetalRenderer::renderStructureMeshes(
     const glm::vec4& surfaceFxParams,
     const std::vector<const AreaLightLayer*>& areas,
     const MeshDeformationLayer* deformLayer,
-    const ProceduralMaterialUniforms* procMat)
+    const ProceduralMaterialUniforms* procMat,
+    const MeshFractureLayer* fracLayer)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -1624,6 +1740,55 @@ void MetalRenderer::renderStructureMeshes(
         deformMaxDisp  = deformLayer->maxDisplacement;
     }
 
+    // Pack the fracture params once (identical for every mesh). Amount uses
+    // the layer's real master amount + modulator bank (NOT the inherited
+    // opacity). mode==0 / amount==0 → shader fast-path skip.
+    glm::vec4 fracMeta(0.0f), fracCracks(0.0f), fracCrackGlow(0.0f);
+    glm::vec4 fracDissolveA(0.0f), fracDissolveB(0.0f), fracBurn(0.0f);
+    glm::vec4 fracDissolveColor(0.0f), fracExplode(0.0f);
+    glm::vec4 fracMeshCenter(0.0f), fracGlitch(0.0f);
+    if (fracLayer && fracLayer->mode != 0u) {
+        const ModulatorBank* fmods = ctx.scene ? &ctx.scene->modulators
+                                               : nullptr;
+        float amt = fracLayer->effectiveAmount(t, fmods)
+                  * std::clamp(fracLayer->opacity, 0.0f, 1.0f);
+        if (amt > 1e-3f) {
+            glm::vec3 centroid = ctx.scene ? ctx.scene->centroid
+                                           : glm::vec3(0.0f);
+            fracMeta      = glm::vec4(static_cast<float>(fracLayer->mode),
+                                       amt,
+                                       static_cast<float>(fracLayer->id) * 0.137f,
+                                       static_cast<float>(t));
+            fracCracks    = glm::vec4(fracLayer->crackDensity,
+                                       fracLayer->crackWidth,
+                                       fracLayer->crackJitter,
+                                       fracLayer->crackDarken);
+            fracCrackGlow = glm::vec4(fracLayer->crackGlowColor,
+                                       fracLayer->crackGlow);
+            fracDissolveA = glm::vec4(fracLayer->dissolveScale,
+                                       fracLayer->dissolveSpeed,
+                                       fracLayer->dissolveRadius,
+                                       fracLayer->dissolveRadialBias);
+            fracDissolveB = glm::vec4(fracLayer->dissolveEdgeWidth,
+                                       fracLayer->dissolveEdgeGlow,
+                                       fracLayer->useRadialDissolve ? 1.0f : 0.0f,
+                                       fracLayer->crackJitterSpeed);
+            fracBurn      = glm::vec4(fracLayer->burnPoint, 0.0f);
+            fracDissolveColor = glm::vec4(fracLayer->dissolveEdgeColor, 0.0f);
+            fracExplode   = glm::vec4(fracLayer->shardDensity,
+                                       fracLayer->shardJitter,
+                                       fracLayer->shardSpin,
+                                       fracLayer->explodeStrength);
+            // Hard explode cap (m): shards stay near the structure so the
+            // projection illusion never breaks (research finding).
+            fracMeshCenter = glm::vec4(centroid, 0.5f);
+            fracGlitch    = glm::vec4(fracLayer->glitchFrequency,
+                                       fracLayer->glitchMagnitude,
+                                       fracLayer->glitchSpeed,
+                                       fracLayer->glitchDropout);
+        }
+    }
+
     for (const auto& gm : gpuMeshes_) {
         // Resolve the material for this mesh (or the default).
         const GpuMaterial& mat =
@@ -1691,6 +1856,17 @@ void MetalRenderer::renderStructureMeshes(
         } else {
             u.procShape = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);  // mix=0
         }
+        // Fracture params (fracMeta.x == 0 → shader fast-path skip).
+        u.fracMeta          = fracMeta;
+        u.fracCracks        = fracCracks;
+        u.fracCrackGlow     = fracCrackGlow;
+        u.fracDissolveA     = fracDissolveA;
+        u.fracDissolveB     = fracDissolveB;
+        u.fracBurn          = fracBurn;
+        u.fracDissolveColor = fracDissolveColor;
+        u.fracExplode       = fracExplode;
+        u.fracMeshCenter    = fracMeshCenter;
+        u.fracGlitch        = fracGlitch;
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
         std::memcpy(u.areas, areasPacked, sizeof(GpuArea) * kMaxAreas);

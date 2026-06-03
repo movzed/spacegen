@@ -32,6 +32,7 @@ void StructureLayer::render(RenderContext& ctx) {
     std::vector<const DirectionalLightLayer*> dirs;
     std::vector<const AreaLightLayer*>        areas;
     const MeshDeformationLayer*               deformLayer = nullptr;
+    const MeshFractureLayer*                  fracLayer   = nullptr;
     ProceduralMaterialUniforms                procUniforms{};
     bool                                      procPacked = false;
     glm::vec3 ambientColor(0.0f);
@@ -101,26 +102,12 @@ void StructureLayer::render(RenderContext& ctx) {
                     deformLayer = d;
                 }
             } else if (auto* f = dynamic_cast<const MeshFractureLayer*>(l.get())) {
-                // Gate on operator intent: mode bitmask must be non-zero
-                // AND effectiveAmount() must be > epsilon. Default
-                // mode=0 + amount=0 means "freshly added, nothing
-                // armed" — produce zero output. The 0.5 cap on the
-                // shader amount keeps us under the whole-cell discard
-                // tier (>0.8) so cranking the slider up only intensifies
-                // cracks; operator has to stack layers / use a modulator
-                // to reach the shatter regime intentionally.
-                if (f->mode != 0u) {
-                    const ModulatorBank* fmods = ctx.scene
-                        ? &ctx.scene->modulators : nullptr;
-                    float amt = f->effectiveAmount(ctx.elapsedSeconds,
-                                                     fmods);
-                    amt *= f->opacity;
-                    if (amt > 1e-3f) {
-                        surfaceFractureAmount =
-                            std::max(surfaceFractureAmount, amt * 0.5f);
-                        surfaceFractureSeed =
-                            static_cast<float>(f->id) * 0.137f;
-                    }
+                // Forward the first armed fracture layer (mode != 0) to the
+                // renderer, which evaluates effectiveAmount() + packs the
+                // full per-mode param set. The renderer applies the bounded
+                // explode cap. Default mode=0 → nothing happens on add.
+                if (f->mode != 0u && !fracLayer) {
+                    fracLayer = f;
                 }
             } else if (auto* s = dynamic_cast<SyphonInputLayer*>(l.get())) {
                 if (!syphonTex) {
@@ -152,7 +139,8 @@ void StructureLayer::render(RenderContext& ctx) {
                                           surfaceFxParamsVec,
                                           areas,
                                           deformLayer,
-                                          procPacked ? &procUniforms : nullptr);
+                                          procPacked ? &procUniforms : nullptr,
+                                          fracLayer);
 }
 
 void StructureLayer::drawInspector() {

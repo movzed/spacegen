@@ -21,6 +21,7 @@ class  BeamLayer;
 class  DirectionalLightLayer;
 class  AreaLightLayer;
 class  MeshDeformationLayer;
+class  MeshFractureLayer;
 struct ProceduralMaterialUniforms;
 
 // M3-B: layer-driven Metal backend.
@@ -87,7 +88,10 @@ public:
         const MeshDeformationLayer* deformLayer = nullptr,
         // ProceduralMaterialLayer packed block (10-pattern triplanar). When
         // non-null its mix > 0 enables the procedural baseColor replacement.
-        const ProceduralMaterialUniforms* procMat = nullptr);
+        const ProceduralMaterialUniforms* procMat = nullptr,
+        // MeshFractureLayer (4 modes). When non-null with mode != 0 the
+        // renderer evaluates effectiveAmount() and packs the per-mode params.
+        const MeshFractureLayer* fracLayer = nullptr);
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.
