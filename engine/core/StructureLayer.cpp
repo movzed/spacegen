@@ -34,8 +34,7 @@ void StructureLayer::render(RenderContext& ctx) {
     const MeshDeformationLayer*               deformLayer = nullptr;
     const MeshFractureLayer*                  fracLayer   = nullptr;
     const HologramMaterialLayer*              holoLayer   = nullptr;
-    ProceduralMaterialUniforms                procUniforms{};
-    bool                                      procPacked = false;
+    std::vector<ProceduralMaterialUniforms>   procStack;   // bottom-to-top
     glm::vec3 ambientColor(0.0f);
     MTL::Texture*  syphonTex   = nullptr;
     float          syphonMix   = 0.0f;
@@ -81,14 +80,12 @@ void StructureLayer::render(RenderContext& ctx) {
                 if (!holoLayer) holoLayer = h;
                 surfaceHoloOpacity = std::max(surfaceHoloOpacity, h->opacity);
             } else if (auto* p = dynamic_cast<const ProceduralMaterialLayer*>(l.get())) {
-                // Pack the full 10-pattern block (triplanar, palette,
-                // octaves, contrast, drift). Keep the first procedural
-                // layer in the bus. packProceduralMaterial folds layer
-                // opacity into shape.z (mix), so a disabled/zero-mix layer
-                // hits the shader fast-path.
-                if (!procPacked) {
-                    procUniforms = packProceduralMaterial(*p);
-                    procPacked   = true;
+                // Layered material: collect every procedural layer in bus
+                // order (bottom-to-top), up to the shader's 4-layer cap.
+                // Each packs its pattern + blend mode + mask; the renderer
+                // composites them onto the structure albedo.
+                if (procStack.size() < 4) {
+                    procStack.push_back(packProceduralMaterial(*p));
                 }
                 surfaceProcMix = std::max(surfaceProcMix, p->opacity);
             } else if (auto* d = dynamic_cast<const MeshDeformationLayer*>(l.get())) {
@@ -144,7 +141,9 @@ void StructureLayer::render(RenderContext& ctx) {
                                           surfaceFxParamsVec,
                                           areas,
                                           deformLayer,
-                                          procPacked ? &procUniforms : nullptr,
+                                          procStack.empty() ? nullptr
+                                                            : procStack.data(),
+                                          static_cast<int>(procStack.size()),
                                           fracLayer,
                                           holoLayer);
 }

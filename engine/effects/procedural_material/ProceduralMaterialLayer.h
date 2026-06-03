@@ -36,6 +36,30 @@ enum class ProcPattern : int {
     Count        = 10
 };
 
+// How this texture layer composites onto the albedo accumulated by the
+// layers below it (node-based / layered material stack). The bottom layer
+// always uses Normal against the structure base color.
+enum class ProcBlend : int {
+    Normal   = 0,   // straight over (lerp by opacity·mask)
+    Add      = 1,
+    Multiply = 2,
+    Screen   = 3,
+    Overlay  = 4,
+    Count    = 5
+};
+
+// Optional spatial mask that gates where this layer contributes — the key
+// to a node-based look (one texture only on edges, one only by height,
+// one driven by noise, etc.). Evaluated in world space.
+enum class ProcMask : int {
+    None        = 0,   // full strength everywhere
+    Fresnel     = 1,   // pow(1 - N·V, maskParam) — rim/edge emphasis
+    HeightZ     = 2,   // smoothstep along world Z, centred at maskParam
+    Noise       = 3,   // world-space fbm at maskScale
+    PatternLuma = 4,   // luminance of this layer's own pattern
+    Count       = 5
+};
+
 class ProceduralMaterialLayer : public ILayer {
 public:
     ProceduralMaterialLayer();
@@ -83,6 +107,17 @@ public:
     // baseColorFactor × baseColorMap texture) is lerped against the
     // pattern output by this value before the Syphon mix runs.
     float     mix         = 1.0f;
+
+    // ---- Layered-material compositing (node-based stack) ----
+    // How this layer blends onto the albedo accumulated by layers below it,
+    // and an optional spatial mask gating where it contributes. Multiple
+    // ProceduralMaterialLayers in the bus stack in order (bottom = first
+    // added). The bottom layer effectively blends over the structure base.
+    ProcBlend textureBlend = ProcBlend::Normal;
+    ProcMask  maskType      = ProcMask::None;
+    float     maskScale     = 2.0f;    // Noise mask spatial frequency
+    float     maskParam     = 3.0f;    // Fresnel power / Height centre (m)
+    bool      maskInvert     = false;
 };
 
 // CPU-side mirror of the MSL uniform block. Packed to match the layout
@@ -93,6 +128,7 @@ struct ProceduralMaterialUniforms {
     glm::vec4 colorB;          // .rgb sRGB colour B, .a desaturate amount
     glm::vec4 shape;           // .x scale, .y contrast, .z mix, .w pattern (int)
     glm::vec4 anim;            // .xy animSpeed.xy, .z animSpeed.z, .w octaves
+    glm::vec4 blend;           // .x blendMode, .y maskType, .z maskScale, .w maskParam(+sign=invert)
 };
 
 // Pack a layer's state into the uniform block. Resolves the desaturation

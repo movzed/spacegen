@@ -145,8 +145,40 @@ void ProceduralMaterialLayer::drawInspector() {
     if (ImGui::CollapsingHeader("Blend",
                                  ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::SliderFloat("Mix##pmm", &mix, 0.0f, 1.0f);
-        ImGui::TextDisabled("0 = invisible, 1 = full procedural replace.");
-        ImGui::TextDisabled("Inserted BEFORE Syphon mix in fs_main.");
+        ImGui::TextDisabled("0 = invisible, 1 = full strength.");
+
+        // Layered-material compositing: how this layer blends onto the
+        // layers below it, and an optional spatial mask.
+        static const char* kBlendNames[] = {
+            "Normal", "Add", "Multiply", "Screen", "Overlay"
+        };
+        int b = static_cast<int>(textureBlend);
+        if (ImGui::Combo("Blend mode##pmbl", &b, kBlendNames,
+                          static_cast<int>(ProcBlend::Count))) {
+            textureBlend = static_cast<ProcBlend>(b);
+        }
+
+        static const char* kMaskNames[] = {
+            "None", "Fresnel (edges)", "Height (Z)", "Noise", "Pattern luma"
+        };
+        int m = static_cast<int>(maskType);
+        if (ImGui::Combo("Mask##pmmask", &m, kMaskNames,
+                          static_cast<int>(ProcMask::Count))) {
+            maskType = static_cast<ProcMask>(m);
+        }
+        if (maskType != ProcMask::None) {
+            if (maskType == ProcMask::Noise) {
+                ImGui::SliderFloat("Mask scale##pmms", &maskScale, 0.1f, 20.0f);
+            }
+            if (maskType == ProcMask::Fresnel) {
+                ImGui::SliderFloat("Fresnel power##pmmp", &maskParam, 0.5f, 8.0f);
+            } else if (maskType == ProcMask::HeightZ) {
+                ImGui::SliderFloat("Height centre (m)##pmmp", &maskParam, -5.0f, 5.0f);
+            }
+            ImGui::Checkbox("Invert mask##pmmi", &maskInvert);
+        }
+        ImGui::TextDisabled("Stack several Procedural layers — they");
+        ImGui::TextDisabled("composite bottom-to-top with these modes.");
     }
 }
 
@@ -179,6 +211,16 @@ ProceduralMaterialUniforms packProceduralMaterial(
                        l.animSpeed.y,
                        std::max(l.animSpeed.z, 0.0f),
                        static_cast<float>(octClamped));
+
+    // blend: x = blend mode, y = mask type, z = mask scale,
+    //        w = mask param (negated to flag invert — the shader reads
+    //        abs() for the value and sign for the invert toggle).
+    float maskP = std::max(l.maskParam, 0.01f);
+    if (l.maskInvert) maskP = -maskP;
+    u.blend = glm::vec4(static_cast<float>(static_cast<int>(l.textureBlend)),
+                        static_cast<float>(static_cast<int>(l.maskType)),
+                        std::max(l.maskScale, 1e-3f),
+                        maskP);
     return u;
 }
 

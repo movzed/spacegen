@@ -87,9 +87,11 @@ public:
         // renderer snapshots its op chain and packs it into the vertex
         // shader uniform. nullptr → the surfaceFx.z MVP wave is used.
         const MeshDeformationLayer* deformLayer = nullptr,
-        // ProceduralMaterialLayer packed block (10-pattern triplanar). When
-        // non-null its mix > 0 enables the procedural baseColor replacement.
-        const ProceduralMaterialUniforms* procMat = nullptr,
+        // ProceduralMaterialLayer stack (node-based / layered). Array of up
+        // to 4 packed layer blocks composited bottom-to-top; procMatCount==0
+        // disables the procedural path.
+        const ProceduralMaterialUniforms* procMats = nullptr,
+        int procMatCount = 0,
         // MeshFractureLayer (4 modes). When non-null with mode != 0 the
         // renderer evaluates effectiveAmount() and packs the per-mode params.
         const MeshFractureLayer* fracLayer = nullptr,

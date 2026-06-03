@@ -35,6 +35,7 @@ constexpr int kMaxDirs  = 4;
 constexpr int kMaxAreas = 8;    // AreaLightLayer panels — see effects/area_light.
 constexpr int kRendDeformOps = 16;  // MeshDeformationLayer chain — see deformers.metal.inc.
 constexpr int kRendFfdSlots  = 4;
+constexpr int kRendMaxProc   = 4;   // layered procedural material stack.
 constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
@@ -56,6 +57,7 @@ constant int OP_SPHERIFY   = 7;
 constant int OP_FFD_LITE   = 8;
 constant int MAX_DEFORM_OPS = 16;
 constant int MAX_FFD_SLOTS  = 4;
+constant int MAX_PROC       = 4;   // layered procedural material stack
 
 struct GpuDeformOp {
     float4 header;   // .x type, .y intensity, .z time, .w ffd slot index (-1 unless FFD)
@@ -127,11 +129,13 @@ struct Uniforms {
     float4    deformMeta;           // .x deformCount, .y maxDisplacement(m), .zw unused
     GpuDeformOp deformers[MAX_DEFORM_OPS];
     float4    ffdCorners[MAX_FFD_SLOTS * 8];   // 4 slots × 8 corner deltas
-    // ---- ProceduralMaterialLayer (full 10-pattern dispatcher, triplanar) ----
-    float4    procColorA;           // .rgb colour A, .a opacity
-    float4    procColorB;           // .rgb colour B, .a opacity
-    float4    procShape;            // .x scale, .y contrast, .z mix, .w pattern
-    float4    procAnim;             // .xy drift, .z time mult, .w octaves
+    // ---- ProceduralMaterialLayer stack (node-based / layered) ----
+    float4    procMeta;             // .x layerCount
+    float4    procColorA[MAX_PROC]; // per layer: .rgb colour A
+    float4    procColorB[MAX_PROC]; // per layer: .rgb colour B
+    float4    procShape[MAX_PROC];  // per layer: scale, contrast, mix, pattern
+    float4    procAnim[MAX_PROC];   // per layer: drift, time mult, octaves
+    float4    procBlend[MAX_PROC];  // per layer: blendMode, maskType, maskScale, maskParam(signed=invert)
     // ---- MeshFractureLayer (4 modes: cracks/dissolve/explode/glitch) ----
     float4    fracMeta;             // .x mode(bits), .y amount, .z seed, .w time
     float4    fracCracks;           // .x density, .y width, .z jitter, .w darken
@@ -896,6 +900,39 @@ static float3 sfxProceduralTriplanar(float3 worldPos, float3 N, float elapsed,
     return cx * w.x + cy * w.y + cz * w.z;
 }
 
+// Per-channel blend operators for the layered material stack.
+static float3 procBlendOp(int mode, float3 base, float3 top) {
+    if (mode == 1) return base + top;                       // Add
+    if (mode == 2) return base * top;                       // Multiply
+    if (mode == 3) return 1.0 - (1.0 - base) * (1.0 - top); // Screen
+    if (mode == 4) {                                        // Overlay
+        float3 lo = 2.0 * base * top;
+        float3 hi = 1.0 - 2.0 * (1.0 - base) * (1.0 - top);
+        return mix(lo, hi, step(0.5, base));
+    }
+    return top;                                             // Normal
+}
+
+// Spatial mask for a layer (0 = layer hidden, 1 = full). World-space so it
+// sticks to the structure. maskParam<0 flags invert (sign carries it).
+static float procMaskWeight(int maskType, float maskScale, float maskParamSigned,
+                            float3 worldPos, float3 N, float3 V,
+                            float3 layerColor) {
+    bool invert = maskParamSigned < 0.0;
+    float maskParam = abs(maskParamSigned);
+    float m = 1.0;
+    if (maskType == 1) {                 // Fresnel rim
+        m = pow(1.0 - max(dot(N, V), 0.0), max(maskParam, 0.1));
+    } else if (maskType == 2) {          // Height along world Z, centred at maskParam
+        m = smoothstep(maskParam - 0.6, maskParam + 0.6, worldPos.z);
+    } else if (maskType == 3) {          // world-space fbm
+        m = saturate(procFbm3(worldPos * maskScale, 4));
+    } else if (maskType == 4) {          // own pattern luminance
+        m = dot(layerColor, float3(0.2126, 0.7152, 0.0722));
+    }
+    return invert ? (1.0 - m) : m;
+}
+
 // ============================================================
 // MeshFractureLayer — fragment-stage modes (Cracks/Dissolve/Glitch).
 // Darkens baseColor and adds emissive; returns true to discard.
@@ -1107,19 +1144,34 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
                      * baseTex.rgb;
     float3 baseColor = mix(baseMat, syphonSample, syphonMix);
 
-    // ---- ProceduralMaterialLayer: full 10-pattern triplanar dispatcher ----
-    // procShape.z is the effective mix (mix * layer opacity, packed CPU
-    // side). 0 → fast-path skip. Sampled in world space (triplanar) so the
-    // pattern paints the physical structure regardless of UV seams.
-    float  procMix = u.procShape.z;
+    // ---- ProceduralMaterialLayer stack (node-based / layered) ----
+    // Up to MAX_PROC layers composite bottom-to-top onto the albedo, each
+    // with its own pattern (world-space triplanar), blend mode and spatial
+    // mask. procMeta.x = active layer count; 0 → fast-path skip.
+    int    procCount   = int(u.procMeta.x + 0.5);
+    float  procMaxMix  = 0.0;
     float3 procColSaved = float3(0.0);
-    if (procMix > 1e-3) {
-        procColSaved = sfxProceduralTriplanar(in.worldPos, N,
-                                               u.surfaceFxParams.w,
-                                               u.procColorA, u.procColorB,
-                                               u.procShape, u.procAnim);
-        baseColor = mix(baseColor, procColSaved, procMix);
+    for (int pi = 0; pi < procCount && pi < MAX_PROC; ++pi) {
+        float layerMix = u.procShape[pi].z;          // mix · opacity (CPU)
+        if (layerMix <= 1e-3) continue;
+        float3 patCol = sfxProceduralTriplanar(in.worldPos, N,
+                                                u.surfaceFxParams.w,
+                                                u.procColorA[pi],
+                                                u.procColorB[pi],
+                                                u.procShape[pi],
+                                                u.procAnim[pi]);
+        int   blendMode = int(u.procBlend[pi].x + 0.5);
+        int   maskType  = int(u.procBlend[pi].y + 0.5);
+        float maskScale = u.procBlend[pi].z;
+        float maskParam = u.procBlend[pi].w;
+        float m = procMaskWeight(maskType, maskScale, maskParam,
+                                  in.worldPos, N, V, patCol);
+        float3 blended = procBlendOp(blendMode, baseColor, patCol);
+        baseColor = mix(baseColor, blended, layerMix * m);
+        procColSaved = baseColor;
+        procMaxMix = max(procMaxMix, layerMix * m);
     }
+    float procMix = procMaxMix;
 
     // ---- MeshFractureLayer: 4 modes (cracks/dissolve/glitch fragment-side;
     //      explode + glitch-lateral already applied in the vertex stage) ----
@@ -1351,10 +1403,12 @@ struct Uniforms {
     glm::vec4 deformMeta;        // .x deformCount, .y maxDisplacement(m)
     GpuDeformOpC deformers[kRendDeformOps];
     glm::vec4 ffdCorners[kRendFfdSlots * 8];
-    glm::vec4 procColorA;        // ProceduralMaterialUniforms.colorA
-    glm::vec4 procColorB;        // .colorB
-    glm::vec4 procShape;         // .shape (scale, contrast, mix, pattern)
-    glm::vec4 procAnim;          // .anim (driftXY, timeMult, octaves)
+    glm::vec4 procMeta;          // .x layerCount
+    glm::vec4 procColorA[kRendMaxProc];
+    glm::vec4 procColorB[kRendMaxProc];
+    glm::vec4 procShape[kRendMaxProc];
+    glm::vec4 procAnim[kRendMaxProc];
+    glm::vec4 procBlend[kRendMaxProc];
     glm::vec4 fracMeta;          // mode, amount, seed, time
     glm::vec4 fracCracks;        // density, width, jitter, darken
     glm::vec4 fracCrackGlow;     // glowColor.rgb, glow
@@ -1753,7 +1807,8 @@ void MetalRenderer::renderStructureMeshes(
     const glm::vec4& surfaceFxParams,
     const std::vector<const AreaLightLayer*>& areas,
     const MeshDeformationLayer* deformLayer,
-    const ProceduralMaterialUniforms* procMat,
+    const ProceduralMaterialUniforms* procMats,
+    int procMatCount,
     const MeshFractureLayer* fracLayer,
     const HologramMaterialLayer* holoLayer)
 {
@@ -2037,15 +2092,16 @@ void MetalRenderer::renderStructureMeshes(
             std::memcpy(u.ffdCorners, deformChain.ffdSlots.data(),
                          sizeof(glm::vec4) * kRendFfdSlots * 8);
         }
-        // Procedural material block (10-pattern triplanar). disabled* when
-        // no layer present → shape.z (mix) == 0 → shader fast-path skip.
-        if (procMat) {
-            u.procColorA = procMat->colorA;
-            u.procColorB = procMat->colorB;
-            u.procShape  = procMat->shape;
-            u.procAnim   = procMat->anim;
-        } else {
-            u.procShape = glm::vec4(1.0f, 1.0f, 0.0f, 0.0f);  // mix=0
+        // Procedural material stack (node-based). Pack up to kRendMaxProc
+        // layers; procMeta.x = count. count==0 → shader fast-path skip.
+        int pc = std::min(procMatCount, kRendMaxProc);
+        u.procMeta = glm::vec4(static_cast<float>(pc), 0.0f, 0.0f, 0.0f);
+        for (int pi = 0; pi < pc; ++pi) {
+            u.procColorA[pi] = procMats[pi].colorA;
+            u.procColorB[pi] = procMats[pi].colorB;
+            u.procShape[pi]  = procMats[pi].shape;
+            u.procAnim[pi]   = procMats[pi].anim;
+            u.procBlend[pi]  = procMats[pi].blend;
         }
         // Fracture params (fracMeta.x == 0 → shader fast-path skip).
         u.fracMeta          = fracMeta;
