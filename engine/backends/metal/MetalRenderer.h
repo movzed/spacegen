@@ -68,7 +68,12 @@ public:
         float          projectorFlatnessThreshold = 0.05f,
         // LightClonerLayer expansion — virtual spots appended to the
         // existing spot array (kMaxSpots ceiling shared).
-        const std::vector<VirtualSpot>& virtualSpots = {});
+        const std::vector<VirtualSpot>& virtualSpots = {},
+        // Surface-FX MVP packing (Hologram, ProceduralMaterial,
+        // MeshDeformation, MeshFracture — all four packed into 2 vec4s
+        // so the splice is minimally invasive on the structure shader).
+        const glm::vec4& surfaceFx       = glm::vec4(0.0f),
+        const glm::vec4& surfaceFxParams = glm::vec4(0.0f, 1.5f, 0.0f, 0.0f));
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.

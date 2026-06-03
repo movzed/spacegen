@@ -62,6 +62,25 @@ constexpr const char* kLayersWindowName      = "Layers";
 constexpr const char* kModulatorsWindowName  = "Modulators";
 constexpr const char* kInspectorWindowName   = "Inspector";
 constexpr const char* kUvAnalysisWindowName  = "UV Analysis";
+constexpr const char* kPostFxWindowName      = "Post-FX";
+
+// True for screen-space effects (Bloom, Motion Blur, Chromatic Aberration,
+// Glitch, Volumetric) — they live in the Post-FX panel instead of the
+// Layers panel. The distinction is by typeName so we don't have to mutate
+// the agent-written effect classes' kind() return.
+//
+// 3D-scene / generators (lights, materials, deformations, fractures,
+// particles, syphon, structure) stay in the Layers panel.
+static bool isPostFxLayer(const spacegen::ILayer* l) {
+    if (!l) return false;
+    const char* n = l->typeName();
+    if (!n) return false;
+    return std::strcmp(n, "Bloom (Karis/Jimenez)") == 0
+        || std::strcmp(n, "Motion Blur")           == 0
+        || std::strcmp(n, "Chromatic Aberration")  == 0
+        || std::strcmp(n, "Glitch")                == 0
+        || std::strcmp(n, "Volumetric Beams")      == 0;
+}
 
 void styleSpaceGen() {
     ImGui::StyleColorsDark();
@@ -105,6 +124,7 @@ void buildDefaultLayout(ImGuiID dockspace_id) {
 
     ImGui::DockBuilderDockWindow(kStatsWindowName,       dockLeft);
     ImGui::DockBuilderDockWindow(kLayersWindowName,      dockLeftBottom);
+    ImGui::DockBuilderDockWindow(kPostFxWindowName,      dockLeftBottom);
     ImGui::DockBuilderDockWindow(kModulatorsWindowName,  dockLeftBottom);
     ImGui::DockBuilderDockWindow(kUvAnalysisWindowName,  dockLeftBottom);
     ImGui::DockBuilderDockWindow(kInspectorWindowName,   dockRight);
@@ -115,7 +135,8 @@ void buildDefaultLayout(ImGuiID dockspace_id) {
 void drawMainMenuBar(bool& showStats, bool& showLayers,
                      bool& showModulators,
                      bool& showInspector, bool& showDemo,
-                     bool& showUvAnalysis) {
+                     bool& showUvAnalysis,
+                     bool& showPostFx) {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             ImGui::MenuItem("New scene...",   nullptr, false, false);
@@ -129,6 +150,7 @@ void drawMainMenuBar(bool& showStats, bool& showLayers,
         if (ImGui::BeginMenu("View")) {
             ImGui::MenuItem(kStatsWindowName,      nullptr, &showStats);
             ImGui::MenuItem(kLayersWindowName,     nullptr, &showLayers);
+            ImGui::MenuItem(kPostFxWindowName,     nullptr, &showPostFx);
             ImGui::MenuItem(kModulatorsWindowName, nullptr, &showModulators);
             ImGui::MenuItem(kInspectorWindowName,  nullptr, &showInspector);
             ImGui::MenuItem(kUvAnalysisWindowName, nullptr, &showUvAnalysis);
@@ -225,25 +247,10 @@ void drawLayerRack(spacegen::Scene& scene,
         s->name = buf;
         selectedLayerId = s->id;
     }
-    // ---- New effect layers (designed by the 10 parallel agents) ----
-    if (ImGui::Button("+ Bloom")) {
-        auto* b = scene.bus.add<spacegen::BloomEffect>();
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "Bloom %zu",
-                       scene.bus.layers.size());
-        b->name = buf;
-        selectedLayerId = b->id;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("+ Motion Blur")) {
-        auto* m = scene.bus.add<spacegen::MotionBlurEffect>();
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "Motion Blur %zu",
-                       scene.bus.layers.size());
-        m->name = buf;
-        selectedLayerId = m->id;
-    }
-    ImGui::SameLine();
+    // ---- Scene layers (lights, materials, deformations, fractures,
+    //      particles, syphon — everything that affects the 3D output).
+    //      Post-FX (Bloom / Motion Blur / CA / Glitch / Volumetric) lives
+    //      in the separate Post-FX panel.
     if (ImGui::Button("+ Hologram")) {
         auto* h = scene.bus.add<spacegen::HologramMaterialLayer>();
         char buf[64];
@@ -295,24 +302,6 @@ void drawLayerRack(spacegen::Scene& scene,
         c->name = buf;
         selectedLayerId = c->id;
     }
-    if (ImGui::Button("+ Chromatic Aberr.")) {
-        auto* e = scene.bus.add<spacegen::ChromaticAberrationEffect>();
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "CA %zu",
-                       scene.bus.layers.size());
-        e->name = buf;
-        selectedLayerId = e->id;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("+ Glitch")) {
-        auto* e = scene.bus.add<spacegen::GlitchEffect>();
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "Glitch %zu",
-                       scene.bus.layers.size());
-        e->name = buf;
-        selectedLayerId = e->id;
-    }
-    ImGui::SameLine();
     if (ImGui::Button("+ SDF Particles")) {
         auto* p = scene.bus.add<spacegen::SDFParticleLayer>();
         char buf[64];
@@ -321,26 +310,15 @@ void drawLayerRack(spacegen::Scene& scene,
         p->name = buf;
         selectedLayerId = p->id;
     }
-    // Volumetric beams violates the projection-mapping principle
-    // ("never show the light cone in air, only the projection on the
-    // stage"). The button exists for completeness but the render
-    // path is a stub — see MetalRenderer::renderVolumetricBeams.
-    if (ImGui::Button("+ Volumetric (off-spec)")) {
-        auto* v = scene.bus.add<spacegen::VolumetricBeamLayer>();
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "Volumetric %zu",
-                       scene.bus.layers.size());
-        v->name = buf;
-        v->state = spacegen::LayerState::Disabled;  // default OFF
-        selectedLayerId = v->id;
-    }
     ImGui::Separator();
 
-    // Layer rows
+    // Layer rows — scene-affecting layers only. Post-FX is rendered in
+    // its own panel via drawPostFxRack().
     uint32_t toRemove = 0;
     for (size_t i = 0; i < scene.bus.layers.size(); ++i) {
         auto& layer = scene.bus.layers[i];
         if (!layer) continue;
+        if (isPostFxLayer(layer.get())) continue;
         ImGui::PushID(static_cast<int>(layer->id));
 
         // Color tag
@@ -414,6 +392,106 @@ void drawLayerRack(spacegen::Scene& scene,
         // Don't remove the only StructureLayer if it's selected — for v1 the
         // StructureLayer is the only Structure type we have, so allow removal
         // (operator can re-add via a future menu). Keep simple.
+        scene.bus.remove(toRemove);
+        if (selectedLayerId == toRemove) selectedLayerId = 0;
+    }
+    ImGui::End();
+}
+
+// ---- Post-FX panel ---------------------------------------------------------
+// Separate panel for screen-space effects (Bloom, Motion Blur, CA, Glitch,
+// Volumetric). These render AFTER the structure pass and operate on the
+// already-rendered framebuffer rather than the 3D scene. Kept in their own
+// panel so the operator's mental model stays clean — Layers = "3D stuff",
+// Post-FX = "screen filters". The render order is still the bus order, so
+// add the post-fx layers AFTER your scene layers and they'll apply last.
+void drawPostFxRack(spacegen::Scene& scene,
+                     uint32_t& selectedLayerId,
+                     bool* open) {
+    if (!ImGui::Begin(kPostFxWindowName, open)) { ImGui::End(); return; }
+
+    // "+" buttons for post-fx layer types
+    if (ImGui::Button("+ Bloom")) {
+        auto* e = scene.bus.add<spacegen::BloomEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Bloom %zu",
+                       scene.bus.layers.size());
+        e->name = buf;
+        selectedLayerId = e->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Motion Blur")) {
+        auto* e = scene.bus.add<spacegen::MotionBlurEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Motion Blur %zu",
+                       scene.bus.layers.size());
+        e->name = buf;
+        selectedLayerId = e->id;
+    }
+    if (ImGui::Button("+ Chromatic Aberr.")) {
+        auto* e = scene.bus.add<spacegen::ChromaticAberrationEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "CA %zu",
+                       scene.bus.layers.size());
+        e->name = buf;
+        selectedLayerId = e->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Glitch")) {
+        auto* e = scene.bus.add<spacegen::GlitchEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Glitch %zu",
+                       scene.bus.layers.size());
+        e->name = buf;
+        selectedLayerId = e->id;
+    }
+    // Volumetric is off-spec per the projection-mapping principle but
+    // exposed here for completeness.
+    if (ImGui::Button("+ Volumetric (off-spec)")) {
+        auto* e = scene.bus.add<spacegen::VolumetricBeamLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Volumetric %zu",
+                       scene.bus.layers.size());
+        e->name = buf;
+        e->state = spacegen::LayerState::Disabled;
+        selectedLayerId = e->id;
+    }
+    ImGui::Separator();
+
+    // Post-fx rows (same shape as the layer rack rows but filtered)
+    uint32_t toRemove = 0;
+    for (size_t i = 0; i < scene.bus.layers.size(); ++i) {
+        auto& layer = scene.bus.layers[i];
+        if (!layer) continue;
+        if (!isPostFxLayer(layer.get())) continue;
+        ImGui::PushID(static_cast<int>(layer->id));
+
+        ImVec4 tag(layer->colorTag.x, layer->colorTag.y, layer->colorTag.z, 1.0f);
+        ImGui::ColorButton("##tag", tag,
+                            ImGuiColorEditFlags_NoTooltip
+                            | ImGuiColorEditFlags_NoBorder,
+                            ImVec2(12, 18));
+        ImGui::SameLine();
+        bool enabled = (layer->state == spacegen::LayerState::Enabled);
+        if (ImGui::Checkbox("##en", &enabled)) {
+            layer->state = enabled ? spacegen::LayerState::Enabled
+                                    : spacegen::LayerState::Disabled;
+        }
+        ImGui::SameLine();
+        bool isSelected = (layer->id == selectedLayerId);
+        char label[160];
+        std::snprintf(label, sizeof(label), "%s  [%s]##sel",
+                       layer->name.c_str(), layer->typeName());
+        if (ImGui::Selectable(label, isSelected,
+                               ImGuiSelectableFlags_None,
+                               ImVec2(ImGui::GetContentRegionAvail().x - 30, 0))) {
+            selectedLayerId = layer->id;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) toRemove = layer->id;
+        ImGui::PopID();
+    }
+    if (toRemove != 0) {
         scene.bus.remove(toRemove);
         if (selectedLayerId == toRemove) selectedLayerId = 0;
     }
@@ -1737,10 +1815,12 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
     }
 
     drawMainMenuBar(showStats_, showLayers_, showModulators_,
-                     showInspector_, showDemo_, showUvAnalysis_);
+                     showInspector_, showDemo_, showUvAnalysis_,
+                     showPostFx_);
     if (showStats_)      drawStatsPanel(scene, renderer,
                                         currentStats_, &showStats_);
     if (showLayers_)     drawLayerRack(scene, selectedLayerId_, &showLayers_);
+    if (showPostFx_)     drawPostFxRack(scene, selectedLayerId_, &showPostFx_);
     if (showModulators_) drawModulators(scene, &showModulators_);
     if (showUvAnalysis_) drawUvAnalysisPanel(scene, renderer, &showUvAnalysis_);
     if (showInspector_)  drawInspector(scene, selectedLayerId_, &showInspector_);

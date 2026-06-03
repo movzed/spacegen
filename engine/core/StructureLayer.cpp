@@ -6,6 +6,10 @@
 #include "Scene.h"
 #include "SyphonInputLayer.h"
 #include "../effects/light_cloner/LightClonerLayer.h"
+#include "../effects/hologram/HologramMaterialLayer.h"
+#include "../effects/procedural_material/ProceduralMaterialLayer.h"
+#include "../effects/mesh_deformation/MeshDeformationLayer.h"
+#include "../effects/mesh_fracture/MeshFractureLayer.h"
 #include "../backends/metal/MetalRenderer.h"
 
 #include "imgui.h"
@@ -33,6 +37,15 @@ void StructureLayer::render(RenderContext& ctx) {
     float          syphonProjFlatMix = 0.0f;
     float          syphonProjFlatThresh = 0.05f;
     std::vector<VirtualSpot> virtualSpots;
+    // Surface-FX MVP packing: each effect contributes its master opacity
+    // to one slot of surfaceFx. The shader knows what to do with each.
+    float surfaceHoloOpacity      = 0.0f;
+    float surfaceProcMix          = 0.0f;
+    float surfaceProcScale        = 2.0f;
+    float surfaceDeformAmount     = 0.0f;
+    float surfaceDeformScale      = 1.5f;
+    float surfaceFractureAmount   = 0.0f;
+    float surfaceFractureSeed     = 0.0f;
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -46,6 +59,19 @@ void StructureLayer::render(RenderContext& ctx) {
                 ambientColor += a->color * (a->intensity * a->opacity);
             } else if (auto* c = dynamic_cast<const LightClonerLayer*>(l.get())) {
                 c->expandSpots(ctx, virtualSpots);
+            } else if (auto* h = dynamic_cast<const HologramMaterialLayer*>(l.get())) {
+                surfaceHoloOpacity = std::max(surfaceHoloOpacity, h->opacity);
+            } else if (auto* p = dynamic_cast<const ProceduralMaterialLayer*>(l.get())) {
+                surfaceProcMix   = std::max(surfaceProcMix, p->opacity);
+                surfaceProcScale = 2.0f + 4.0f * p->opacity;
+            } else if (auto* d = dynamic_cast<const MeshDeformationLayer*>(l.get())) {
+                surfaceDeformAmount = std::max(surfaceDeformAmount,
+                                                d->opacity * 0.20f);
+                surfaceDeformScale  = 1.5f;
+            } else if (auto* f = dynamic_cast<const MeshFractureLayer*>(l.get())) {
+                surfaceFractureAmount = std::max(surfaceFractureAmount,
+                                                  f->opacity);
+                surfaceFractureSeed   = static_cast<float>(f->id) * 0.137f;
             } else if (auto* s = dynamic_cast<SyphonInputLayer*>(l.get())) {
                 if (!syphonTex) {
                     syphonTex   = s->currentTexture();
@@ -58,6 +84,11 @@ void StructureLayer::render(RenderContext& ctx) {
             }
         }
     }
+    glm::vec4 surfaceFxVec(surfaceHoloOpacity, surfaceProcMix,
+                            surfaceDeformAmount, surfaceFractureAmount);
+    glm::vec4 surfaceFxParamsVec(surfaceProcScale, surfaceDeformScale,
+                                   surfaceFractureSeed,
+                                   static_cast<float>(ctx.elapsedSeconds));
     ctx.renderer->renderStructureMeshes(ctx, *this, spots, dirs,
                                           ambientColor,
                                           syphonTex, syphonMix, syphonTint,
@@ -66,7 +97,9 @@ void StructureLayer::render(RenderContext& ctx) {
                                           stretchMetric, stretchUV,
                                           syphonProjFlatMix,
                                           syphonProjFlatThresh,
-                                          virtualSpots);
+                                          virtualSpots,
+                                          surfaceFxVec,
+                                          surfaceFxParamsVec);
 }
 
 void StructureLayer::drawInspector() {

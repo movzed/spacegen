@@ -98,6 +98,7 @@ private:
     bool             showInspector_    = true;
     bool             showModulators_   = true;
     bool             showUvAnalysis_   = true;
+    bool             showPostFx_       = true;
     bool             showDemo_         = false;
     bool             panelStateLoaded_ = false;
 

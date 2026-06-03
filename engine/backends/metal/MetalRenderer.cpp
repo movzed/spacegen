@@ -79,6 +79,13 @@ struct Uniforms {
     float4    fx;                   // .x displaceAmount, .y displaceScale, .z twistAmount
     float4    syphonMixTint;        // .x mix (0..1), .yzw tint RGB
     float4    syphonParams;         // .x useAtlasUVs (0/1), .z flipY (0/1)
+    // ---- Surface-effect MVP splice (Hologram / ProceduralMaterial /
+    //      MeshDeformation / MeshFracture, all packed into 2 vec4s). Each
+    //      effect's layer in the bus sets its slot; 0 = off, > 0 = active.
+    //      Full agent MSL stays in engine/effects/*/INTEGRATION.md for
+    //      future quality upgrades. ----
+    float4    surfaceFx;            // .x holoOpacity, .y procMix, .z deformAmt, .w fractureAmt
+    float4    surfaceFxParams;      // .x procScale, .y deformScale, .z fractureSeed, .w time
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
 };
@@ -112,6 +119,19 @@ vertex VertexOut vs_main(VertexIn in [[stage_in]],
         float n = vsHash(pos * displaceScale);
         // Move outward along the normal, modulated by noise.
         pos += in.normal * displaceAmount * (1.0 + n) * 0.5;
+    }
+
+    // ---- MeshDeformationLayer MVP: noise wave + outward bulge. Read
+    //      amount + scale from surfaceFx — when 0 the deformation
+    //      collapses to identity so the existing displace/twist path
+    //      stays untouched on scenes without a Deform layer. ----
+    float deformAmount = u.surfaceFx.z;
+    float deformScale  = u.surfaceFxParams.y;
+    float sfxTime      = u.surfaceFxParams.w;
+    if (deformAmount > 1e-4) {
+        float w = sin(pos.x * deformScale + sfxTime * 2.0)
+                * cos(pos.z * deformScale + sfxTime * 1.3);
+        pos += in.normal * deformAmount * w;
     }
 
     float4 world = u.model * float4(pos, 1.0);
@@ -167,6 +187,101 @@ static float3 pbrEvalDirect(float3 N, float3 V, float3 L,
     float3 kd   = (1.0 - F) * (1.0 - metallic);
     float3 diff = kd * baseColor / PI;
     return (diff + spec) * radiance * NdotL;
+}
+
+// ---- Surface-effect MVP helpers (MSL) ----
+// Minimum-viable visible implementations of the agent-designed surface
+// effects (Hologram / ProceduralMaterial / MeshDeformation / MeshFracture).
+// Activated when the respective surfaceFx slot > 0. Full agent MSL with
+// 10-pattern procedural / 7-sub-effect hologram / 8-deformer chain / 4-mode
+// fracture stays in engine/effects/*/INTEGRATION.md for incremental quality
+// upgrades — this is the "all of them at least show something" landing.
+
+// Simple hash + value-noise (Inigo Quilez canon).
+static float sfxHash21(float2 p) {
+    return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+}
+static float sfxHash31(float3 p) {
+    return fract(sin(dot(p, float3(127.1, 311.7, 74.7))) * 43758.5453);
+}
+static float sfxValueNoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = sfxHash21(i + float2(0,0));
+    float b = sfxHash21(i + float2(1,0));
+    float c = sfxHash21(i + float2(0,1));
+    float d = sfxHash21(i + float2(1,1));
+    return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
+// 2D voronoi (F1 cell distance). For procedural-material splice + cracks.
+static float sfxVoronoi(float2 p, thread float2& cellCenter) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    float best = 1e9;
+    cellCenter = i;
+    for (int yy = -1; yy <= 1; ++yy)
+    for (int xx = -1; xx <= 1; ++xx) {
+        float2 g = float2(xx, yy);
+        float2 o = float2(sfxHash21(i + g),
+                          sfxHash21(i + g + 17.0));
+        float2 d = g + o - f;
+        float dist = dot(d, d);
+        if (dist < best) { best = dist; cellCenter = i + g; }
+    }
+    return sqrt(best);
+}
+
+// Hologram overlay — Fresnel rim + scanlines + hue shift. Output is the
+// final fragment colour after applying opacity-controlled blend over PBR.
+static float3 sfxHologramOverlay(float3 baseLit, float3 N, float3 V,
+                                  float3 worldPos, float opacity,
+                                  float time) {
+    if (opacity < 1e-3) return baseLit;
+    // Fresnel rim (1 - N·V)^k.
+    float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+    float3 rimCol = float3(0.20, 0.85, 1.00) * fres * 2.5;
+    // Scanlines: horizontal stripes on screen-Y, animated. We use
+    // worldPos.z as a proxy here (screen Y not available without an
+    // extra varying — would be cleaner but overkill for MVP).
+    float scan = 0.5 + 0.5 * sin(worldPos.z * 80.0 + time * 4.0);
+    float3 scanCol = baseLit * (0.7 + 0.3 * scan);
+    // Combine.
+    float3 holo = scanCol + rimCol;
+    return mix(baseLit, holo, opacity);
+}
+
+// Procedural material — voronoi-cell colour replacement. Strength `mix01`
+// fades in the procedural look; `scale` controls cell size.
+static float3 sfxProceduralBase(float3 baseColor, float3 worldPos,
+                                 float mix01, float scale, float time) {
+    if (mix01 < 1e-3) return baseColor;
+    float2 cell;
+    float d = sfxVoronoi(worldPos.xy * scale + time * 0.3, cell);
+    // Per-cell hue from hash.
+    float h = sfxHash21(cell);
+    float3 cellCol = float3(0.5 + 0.5 * cos(6.2831 * h + float3(0.0, 2.0, 4.0)));
+    // Edge darkening (visible cell borders).
+    float edge = smoothstep(0.30, 0.45, d);
+    cellCol *= edge;
+    return mix(baseColor, cellCol, mix01);
+}
+
+// Fracture — emit thin crack lines and (at higher amounts) discard cells.
+// `amount` 0..1 ramps the visibility. The discard kicks in above 0.6 so
+// the operator gets a "cracks appearing then breaking apart" feel as the
+// modulator rises.
+static bool sfxFractureDiscardOrTint(float3 worldPos, float amount,
+                                      float seed,
+                                      thread float3& tintOut) {
+    if (amount < 1e-3) { tintOut = float3(0.0); return false; }
+    float2 cell;
+    float d = sfxVoronoi(worldPos.xy * 1.5 + seed, cell);
+    float crackBand = 1.0 - smoothstep(0.0, 0.05, d);
+    tintOut = float3(1.0, 0.35, 0.10) * crackBand * amount * 2.0;
+    // Hard discard for whole cells when amount > 0.6, based on cell hash.
+    float cellAlive = sfxHash21(cell);
+    return (amount > 0.6) && (cellAlive < (amount - 0.6) * 2.5);
 }
 
 fragment float4 fs_main(VertexOut in [[stage_in]],
@@ -305,6 +420,20 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
                      * u.matBaseColor.rgb
                      * baseTex.rgb;
     float3 baseColor = mix(baseMat, syphonSample, syphonMix);
+
+    // ---- ProceduralMaterialLayer MVP splice ----
+    baseColor = sfxProceduralBase(baseColor, in.worldPos,
+                                   u.surfaceFx.y,
+                                   u.surfaceFxParams.x,
+                                   u.surfaceFxParams.w);
+
+    // ---- MeshFractureLayer MVP splice: discard whole cells + tint cracks ----
+    float3 fractureTint;
+    bool fracDiscard = sfxFractureDiscardOrTint(in.worldPos,
+                                                  u.surfaceFx.w,
+                                                  u.surfaceFxParams.z,
+                                                  fractureTint);
+    if (fracDiscard) discard_fragment();
     float  roughness = max(u.baseColorRoughness.a
                           * u.matMR.y
                           * mrTex.g, 0.04);
@@ -378,6 +507,15 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     }
 
     float3 colorLin = ambient * baseColor + totalLight;
+
+    // ---- HologramMaterialLayer MVP splice (overlay) ----
+    colorLin = sfxHologramOverlay(colorLin, N, V, in.worldPos,
+                                    u.surfaceFx.x,
+                                    u.surfaceFxParams.w);
+
+    // ---- Fracture crack glow (additive on top of lit colour) ----
+    colorLin += fractureTint;
+
     float3 colorOut = pow(max(colorLin, 0.0), float3(1.0 / 2.2));
     return float4(colorOut, 1.0);
 }
@@ -411,6 +549,8 @@ struct Uniforms {
     glm::vec4 fx;                // .x displace, .y displaceScale, .z twist
     glm::vec4 syphonMixTint;     // .x mix, .yzw tint
     glm::vec4 syphonParams;      // .x useAtlasUVs (0/1), .z flipY (0/1)
+    glm::vec4 surfaceFx;         // .x holo .y proc .z deform .w fracture
+    glm::vec4 surfaceFxParams;   // .x procScale .y deformScale .z fracSeed .w time
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
 };
@@ -783,7 +923,9 @@ void MetalRenderer::renderStructureMeshes(
     int            heatmapUV,
     float          projectorOnFlatMix,
     float          projectorFlatnessThreshold,
-    const std::vector<VirtualSpot>& virtualSpots)
+    const std::vector<VirtualSpot>& virtualSpots,
+    const glm::vec4& surfaceFx,
+    const glm::vec4& surfaceFxParams)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -925,6 +1067,8 @@ void MetalRenderer::renderStructureMeshes(
                                      projectorFlatnessThreshold,
                                      syphonFlipY ? 1.0f : 0.0f,
                                      0.0f);
+        u.surfaceFx       = surfaceFx;
+        u.surfaceFxParams = surfaceFxParams;
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
 
