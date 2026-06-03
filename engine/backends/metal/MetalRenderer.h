@@ -19,6 +19,7 @@ class  Bus;
 class  StructureLayer;
 class  BeamLayer;
 class  DirectionalLightLayer;
+class  AreaLightLayer;
 
 // M3-B: layer-driven Metal backend.
 // Owns the pipelines + offscreen depth + per-mesh GPU buffers. Exposes
@@ -73,7 +74,11 @@ public:
         // MeshDeformation, MeshFracture — all four packed into 2 vec4s
         // so the splice is minimally invasive on the structure shader).
         const glm::vec4& surfaceFx       = glm::vec4(0.0f),
-        const glm::vec4& surfaceFxParams = glm::vec4(0.0f, 1.5f, 0.0f, 0.0f));
+        const glm::vec4& surfaceFxParams = glm::vec4(0.0f, 1.5f, 0.0f, 0.0f),
+        // AreaLightLayer panels — already updated by the bus walk in
+        // StructureLayer, so positionWorld / normalWorld / effectiveR
+        // are guaranteed fresh by the time we read them here.
+        const std::vector<const AreaLightLayer*>& areas = {});
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.

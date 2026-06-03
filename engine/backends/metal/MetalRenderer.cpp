@@ -7,6 +7,7 @@
 #include "../../core/DirectionalLightLayer.h"
 #include "../../core/ModulatorBank.h"
 #include "../../effects/light_cloner/LightClonerLayer.h"
+#include "../../effects/area_light/AreaLightLayer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +28,7 @@ constexpr int kMaxSpots = 64;   // up to ~4 rigs × 8 fixtures, plus
                                   // LightClonerLayer virtual-spot expansion
                                   // (Notch Cloner pattern, up to 64 clones).
 constexpr int kMaxDirs  = 4;
+constexpr int kMaxAreas = 8;    // AreaLightLayer panels — see effects/area_light.
 constexpr const char* kStructurePbrMSL = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
@@ -34,6 +36,7 @@ using namespace metal;
 constant float PI         = 3.14159265359;
 constant int   MAX_SPOTS  = 64;
 constant int   MAX_DIRS   = 4;
+constant int   MAX_AREAS  = 8;
 
 struct VertexIn {
     float3 position [[attribute(0)]];
@@ -62,13 +65,22 @@ struct DirLight {
     float4 color;          // .rgb
 };
 
+// AreaLightLayer: a finite-extent disc-equivalent panel that orbits the
+// structure. Karis 2013 representative-point GGX + Lagarde 2014 closed-
+// form Lambertian disc form-factor (see effects/area_light/INTEGRATION.md).
+struct AreaLight {
+    float4 posIntensity;   // .xyz position (world),     .w intensity
+    float4 normRange;      // .xyz panel normal (unit),  .w linear range
+    float4 colorRadius;    // .rgb color,                .a equivalent radius
+};
+
 struct Uniforms {
     float4x4  projection;
     float4x4  view;
     float4x4  model;
     float4    cameraWorldPos;
     float4    baseColorRoughness;   // .rgb operator tint, .a operator roughness multiplier
-    float4    metallicCounts;       // .x metallic operator, .z spotCount, .w dirCount
+    float4    metallicCounts;       // .x metallic operator, .y areaCount, .z spotCount, .w dirCount
     float4    ambientColor;         // .rgb ambient fill, .a unused
     float4    modeFlags;            // .x emitLightsOnly, .y heatmapEnabled,
                                      // .z heatmapMetric (0=ratio,1=symDir),
@@ -88,6 +100,7 @@ struct Uniforms {
     float4    surfaceFxParams;      // .x procScale, .y deformScale, .z fractureSeed, .w time
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
+    AreaLight areas[MAX_AREAS];
 };
 
 // Hash-based pseudo-random scalar in [-1, 1] from a 3D position.
@@ -496,7 +509,91 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
                                   baseColor, roughness, metallic, F0);
     }
 
-    float3 totalLight = LoDir + LoSpots + emission;
+    // ---- Area lights (representative-point, disc-equivalent) -----------
+    // Karis 2013 §§ 4.1-4.3 (UE4 sphere/disc lights) + Lagarde & de Rousiers
+    // 2014 closed-form Lambertian disc form factor. The AreaLightLayer's
+    // safety clamp guarantees the disc never enters the structure AABB, so
+    // we don't need to do a "light inside mesh" rejection here.
+    float3 LoAreas = float3(0.0);
+    int    areaCount = int(u.metallicCounts.y);
+    int    aN = min(areaCount, MAX_AREAS);
+    for (int i = 0; i < aN; i++) {
+        AreaLight a = u.areas[i];
+        float3 ap = a.posIntensity.xyz;
+        float  ai = a.posIntensity.w;
+        if (ai <= 0.0) continue;
+        float3 an = normalize(a.normRange.xyz);
+        float  ar = a.normRange.w;
+        float3 ac = a.colorRadius.rgb;
+        float  rd = max(a.colorRadius.a, 1e-4);
+
+        float3 toLight = ap - in.worldPos;
+        float  dist    = length(toLight);
+        if (dist > ar) continue;
+        float3 Lc      = toLight / max(dist, 1e-4);
+
+        // One-sided panel: an is the disc normal (face direction). We want
+        // the surface on the +an side, i.e. dot(an, -Lc) > 0.
+        float facing = dot(an, -Lc);
+        if (facing <= 0.0) continue;
+
+        float rangeFade = saturate(1.0 - dist / ar);
+
+        // Lagarde diffuse form factor: NdotLc * r^2 / (d^2 + r^2). Exact
+        // for small solid angles, very good for larger panels. `facing`
+        // is folded in so the diffuse fades smoothly at the silhouette
+        // instead of popping when the panel rolls past 90°.
+        float NdotLc   = max(dot(N, Lc), 0.0);
+        float discR2   = rd * rd;
+        float formFact = NdotLc * discR2 / max(dist * dist + discR2, 1e-4);
+        float3 radDiff = ac * ai * formFact * rangeFade * facing;
+
+        // Representative-point specular. Intersect the reflection ray with
+        // the disc; if it hits, L_rep = R. Otherwise project to the closest
+        // point on the disc rim and use that. Widen the GGX lobe by
+        // alpha' = saturate(alpha + r / (2*dist)) to compensate for the
+        // larger solid angle vs. a punctual source.
+        float3 R          = reflect(-V, N);
+        float  rDotLc     = dot(R, Lc);
+        float3 onAxis     = Lc * rDotLc;
+        float3 offAxis    = R  - onAxis;
+        float  offLen     = length(offAxis);
+        float3 closestOff = (offLen > 1e-5)
+                          ? (offAxis / offLen) * min(offLen, rd)
+                          : float3(0.0);
+        float3 closestPt  = ap + closestOff;
+        float3 toRep      = closestPt - in.worldPos;
+        float  repDist    = length(toRep);
+        float3 Lrep       = (repDist > 1e-4) ? (toRep / repDist) : Lc;
+
+        float aOrig  = roughness;
+        float aPrime = saturate(aOrig + rd / max(2.0 * dist, 1e-4));
+
+        float NdotL = max(dot(N, Lrep), 0.0);
+        float3 LoSpec = float3(0.0);
+        if (NdotL > 0.0) {
+            float3 H     = normalize(V + Lrep);
+            float  NdotV = max(dot(N, V), 0.0);
+            float  NdotH = max(dot(N, H), 0.0);
+            float  VdotH = max(dot(V, H), 0.0);
+            float3 F     = fresnelSchlick(VdotH, F0);
+            float  D     = distributionGGX(NdotH, aPrime);
+            float  G     = geometrySmith(NdotV, NdotL, aPrime);
+            // Karis energy compensation: divide by alpha^2 ratio so the
+            // peak doesn't brighten as the lobe widens.
+            float  norm  = (aOrig * aOrig + 1e-5) / (aPrime * aPrime + 1e-5);
+            float3 spec  = (D * G * F * norm)
+                         / max(4.0 * NdotV * NdotL, 1e-4);
+            float  specFade = saturate(1.0 - repDist / ar);
+            float3 radSpec  = ac * ai * specFade * facing;
+            LoSpec = spec * radSpec * NdotL;
+        }
+
+        float3 kdA = (1.0 - fresnelSchlick(NdotLc, F0)) * (1.0 - metallic);
+        LoAreas += kdA * (baseColor / PI) * radDiff + LoSpec;
+    }
+
+    float3 totalLight = LoDir + LoSpots + LoAreas + emission;
     bool   lightsOnly = u.modeFlags.x > 0.5;
 
     if (lightsOnly) {
@@ -537,13 +634,19 @@ struct GpuDir {
     glm::vec4 color;
 };
 
+struct GpuArea {
+    glm::vec4 posIntensity;   // .xyz pos, .w intensity
+    glm::vec4 normRange;      // .xyz normal, .w range
+    glm::vec4 colorRadius;    // .rgb color, .a equivalent radius
+};
+
 struct Uniforms {
     glm::mat4 projection;
     glm::mat4 view;
     glm::mat4 model;
     glm::vec4 cameraWorldPos;
     glm::vec4 baseColorRoughness;
-    glm::vec4 metallicCounts;    // .x metallic, .z spotCount, .w dirCount
+    glm::vec4 metallicCounts;    // .x metallic, .y areaCount, .z spotCount, .w dirCount
     glm::vec4 ambientColor;      // .rgb ambient fill
     glm::vec4 modeFlags;         // .x emitLightsOnly (0/1)
     glm::vec4 matBaseColor;      // material baseColorFactor (RGBA)
@@ -556,6 +659,7 @@ struct Uniforms {
     glm::vec4 surfaceFxParams;   // .x procScale .y deformScale .z fracSeed .w time
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
+    GpuArea   areas[kMaxAreas];
 };
 
 // (Volumetric beam pass removed in M3-B refresh: spot lights are now
@@ -928,7 +1032,8 @@ void MetalRenderer::renderStructureMeshes(
     float          projectorFlatnessThreshold,
     const std::vector<VirtualSpot>& virtualSpots,
     const glm::vec4& surfaceFx,
-    const glm::vec4& surfaceFxParams)
+    const glm::vec4& surfaceFxParams,
+    const std::vector<const AreaLightLayer*>& areas)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -1027,6 +1132,28 @@ void MetalRenderer::renderStructureMeshes(
         dirsPacked[i].color        = glm::vec4(d->color, 0.0f);
     }
 
+    // Pack area lights. positionWorld / normalWorld / effectiveR were
+    // already refreshed by StructureLayer's bus walk via a->update(ctx).
+    // We just apply LFO + opacity to the static intensity here.
+    int areaCount = std::min(static_cast<int>(areas.size()), kMaxAreas);
+    GpuArea areasPacked[kMaxAreas]{};
+    int areaWritten = 0;
+    for (int i = 0; i < areaCount; ++i) {
+        const AreaLightLayer* a = areas[i];
+        if (!a) continue;
+        float inten = a->intensity + a->intensityLFO.eval(t);
+        inten      *= a->opacity;
+        if (inten <= 0.0f) continue;
+        areasPacked[areaWritten].posIntensity =
+            glm::vec4(a->positionWorld, inten);
+        areasPacked[areaWritten].normRange    =
+            glm::vec4(a->normalWorld,    a->range);
+        areasPacked[areaWritten].colorRadius  =
+            glm::vec4(a->color,          a->effectiveR);
+        ++areaWritten;
+    }
+    areaCount = areaWritten;
+
     for (const auto& gm : gpuMeshes_) {
         // Resolve the material for this mesh (or the default).
         const GpuMaterial& mat =
@@ -1042,7 +1169,7 @@ void MetalRenderer::renderStructureMeshes(
         u.cameraWorldPos     = glm::vec4(ctx.cameraWorldPos, 1.0f);
         u.baseColorRoughness = glm::vec4(layer.baseColor, layer.roughness);
         u.metallicCounts     = glm::vec4(layer.metallic,
-                                          0.0f,
+                                          static_cast<float>(areaCount),
                                           static_cast<float>(spotCount),
                                           static_cast<float>(dirCount));
         u.ambientColor       = glm::vec4(ambientColor, 0.0f);
@@ -1074,6 +1201,7 @@ void MetalRenderer::renderStructureMeshes(
         u.surfaceFxParams = surfaceFxParams;
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
+        std::memcpy(u.areas, areasPacked, sizeof(GpuArea) * kMaxAreas);
 
         enc->setVertexBuffer(gm.positionBuffer, 0, 0);
         enc->setVertexBuffer(gm.normalBuffer,   0, 2);

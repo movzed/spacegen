@@ -6,6 +6,7 @@
 #include "Scene.h"
 #include "SyphonInputLayer.h"
 #include "../effects/light_cloner/LightClonerLayer.h"
+#include "../effects/area_light/AreaLightLayer.h"
 #include "../effects/hologram/HologramMaterialLayer.h"
 #include "../effects/procedural_material/ProceduralMaterialLayer.h"
 #include "../effects/mesh_deformation/MeshDeformationLayer.h"
@@ -29,6 +30,7 @@ void StructureLayer::render(RenderContext& ctx) {
     // integrates them in one pass — we don't render visible beams in air.
     std::vector<const BeamLayer*>             spots;
     std::vector<const DirectionalLightLayer*> dirs;
+    std::vector<const AreaLightLayer*>        areas;
     glm::vec3 ambientColor(0.0f);
     MTL::Texture*  syphonTex   = nullptr;
     float          syphonMix   = 0.0f;
@@ -59,6 +61,12 @@ void StructureLayer::render(RenderContext& ctx) {
                 ambientColor += a->color * (a->intensity * a->opacity);
             } else if (auto* c = dynamic_cast<const LightClonerLayer*>(l.get())) {
                 c->expandSpots(ctx, virtualSpots);
+            } else if (auto* ar = dynamic_cast<AreaLightLayer*>(l.get())) {
+                // Idempotent: bus has likely already called ar->render()
+                // (which calls update()) earlier this frame, but tick again
+                // so a freshly-added layer is ready on its first frame.
+                ar->update(ctx);
+                areas.push_back(ar);
             } else if (auto* h = dynamic_cast<const HologramMaterialLayer*>(l.get())) {
                 surfaceHoloOpacity = std::max(surfaceHoloOpacity, h->opacity);
             } else if (auto* p = dynamic_cast<const ProceduralMaterialLayer*>(l.get())) {
@@ -107,7 +115,8 @@ void StructureLayer::render(RenderContext& ctx) {
                                           syphonProjFlatThresh,
                                           virtualSpots,
                                           surfaceFxVec,
-                                          surfaceFxParamsVec);
+                                          surfaceFxParamsVec,
+                                          areas);
 }
 
 void StructureLayer::drawInspector() {
