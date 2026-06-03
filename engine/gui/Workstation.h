@@ -99,6 +99,7 @@ private:
     bool             showModulators_   = true;
     bool             showUvAnalysis_   = true;
     bool             showDemo_         = false;
+    bool             panelStateLoaded_ = false;
 
     // Currently selected layer (by id) — drives the Inspector contents.
     uint32_t         selectedLayerId_  = 0;

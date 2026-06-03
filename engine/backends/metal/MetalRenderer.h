@@ -62,7 +62,9 @@ public:
         // Tier 2: stretch heatmap diagnostic
         bool           showHeatmap = false,
         int            heatmapMetric = 0,
-        int            heatmapUV     = 1);
+        int            heatmapUV     = 1,
+        float          projectorOnFlatMix       = 0.0f,
+        float          projectorFlatnessThreshold = 0.05f);
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.

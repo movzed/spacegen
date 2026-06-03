@@ -25,6 +25,18 @@
 #include "../core/UvAtlas.h"
 #include "../core/UvAtlasGeogram.h"
 #include "../core/UvOptimize.h"
+// ---- Effect layers integrated from engine/effects/ ----
+#include "../effects/area_light/AreaLightLayer.h"
+#include "../effects/light_cloner/LightClonerLayer.h"
+#include "../effects/procedural_material/ProceduralMaterialLayer.h"
+#include "../effects/mesh_deformation/MeshDeformationLayer.h"
+#include "../effects/mesh_fracture/MeshFractureLayer.h"
+#include "../effects/bloom/BloomEffect.h"
+#include "../effects/motion_blur/MotionBlurEffect.h"
+#include "../effects/hologram/HologramMaterialLayer.h"
+
+#include <nlohmann/json.hpp>
+#include <fstream>
 #include "../backends/metal/MetalRenderer.h"
 
 #include <algorithm>
@@ -208,6 +220,76 @@ void drawLayerRack(spacegen::Scene& scene,
                        scene.bus.layers.size());
         s->name = buf;
         selectedLayerId = s->id;
+    }
+    // ---- New effect layers (designed by the 10 parallel agents) ----
+    if (ImGui::Button("+ Bloom")) {
+        auto* b = scene.bus.add<spacegen::BloomEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Bloom %zu",
+                       scene.bus.layers.size());
+        b->name = buf;
+        selectedLayerId = b->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Motion Blur")) {
+        auto* m = scene.bus.add<spacegen::MotionBlurEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Motion Blur %zu",
+                       scene.bus.layers.size());
+        m->name = buf;
+        selectedLayerId = m->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Hologram")) {
+        auto* h = scene.bus.add<spacegen::HologramMaterialLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Hologram %zu",
+                       scene.bus.layers.size());
+        h->name = buf;
+        selectedLayerId = h->id;
+    }
+    if (ImGui::Button("+ Procedural Mat")) {
+        auto* p = scene.bus.add<spacegen::ProceduralMaterialLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Procedural %zu",
+                       scene.bus.layers.size());
+        p->name = buf;
+        selectedLayerId = p->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Deform")) {
+        auto* d = scene.bus.add<spacegen::MeshDeformationLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Deformation %zu",
+                       scene.bus.layers.size());
+        d->name = buf;
+        selectedLayerId = d->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Fracture")) {
+        auto* f = scene.bus.add<spacegen::MeshFractureLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Fracture %zu",
+                       scene.bus.layers.size());
+        f->name = buf;
+        selectedLayerId = f->id;
+    }
+    if (ImGui::Button("+ Area Light")) {
+        auto* a = scene.bus.add<spacegen::AreaLightLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Area Light %zu",
+                       scene.bus.layers.size());
+        a->name = buf;
+        selectedLayerId = a->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Light Cloner")) {
+        auto* c = scene.bus.add<spacegen::LightClonerLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Light Cloner %zu",
+                       scene.bus.layers.size());
+        c->name = buf;
+        selectedLayerId = c->id;
     }
     ImGui::Separator();
 
@@ -407,11 +489,134 @@ struct UvAnalysisState {
 
 static UvAnalysisState gUvState;
 
+// Forward declarations — definitions live after the static gXxx globals
+// below so they can reference them. Bodies follow the slider statics.
+static void writePanelState(const spacegen::Scene& scene);
+static void readPanelState(spacegen::Scene& scene);
+
+#if 0
+// (real bodies moved further down — keep this stub block disabled to
+// preserve the diff and the original commentary near the bodies)
+static void writePanelState_stub(const spacegen::Scene& scene) {
+    using json = nlohmann::json;
+    json j;
+    j["meshKeepRatio"]        = gMeshKeepRatio;
+    j["sharpPreCut"]          = gUvSharpPreCut;
+    j["sharpAngleDeg"]        = gUvSharpAngleDeg;
+    j["bigCharts"]            = gUvBigCharts;
+    j["bruteForcePack"]       = gUvBruteForcePack;
+    j["atlasEngine"]          = gUvAtlasEngine;
+    j["optimizeRefine"]       = gUvOptimizeRefine;
+    j["optimizeMaxIter"]      = gUvOptimizeMaxIter;
+    j["optimizeVisExp"]       = gUvOptimizeVisExp;
+    j["optimizeVisFloor"]     = gUvOptimizeVisFloor;
+    j["optimizeProjAware"]    = gUvOptimizeProjAware;
+
+    // Walk bus for SyphonInputLayer + StructureLayer.
+    for (auto& l : scene.bus.layers) {
+        if (!l) continue;
+        if (auto* s = dynamic_cast<const spacegen::SyphonInputLayer*>(l.get())) {
+            j["syphon"] = {
+                {"mix",                s->mix},
+                {"tint",               {s->tint.x, s->tint.y, s->tint.z}},
+                {"flipY",              s->flipY},
+                {"projOnFlatMix",      s->projectorOnFlatMix},
+                {"projFlatThresh",     s->projectorFlatnessThreshold},
+            };
+            break;
+        }
+    }
+    for (auto& l : scene.bus.layers) {
+        if (auto* sl = dynamic_cast<const spacegen::StructureLayer*>(l.get())) {
+            j["structure"] = {
+                {"showStretchHeatmap", sl->showStretchHeatmap},
+                {"stretchMetric",      sl->stretchMetric},
+                {"stretchUV",          sl->stretchUV},
+            };
+            break;
+        }
+    }
+
+    std::ofstream f(panelStatePath(scene));
+    if (f) f << j.dump(2);
+}
+
+static void readPanelState(spacegen::Scene& scene) {
+    using json = nlohmann::json;
+    auto p = panelStatePath(scene);
+    if (!std::filesystem::exists(p)) return;
+    std::ifstream f(p);
+    if (!f) return;
+    json j;
+    try { f >> j; } catch (...) { return; }
+
+    auto getF = [&](const char* k, float def) {
+        return j.contains(k) ? j[k].get<float>() : def;
+    };
+    auto getB = [&](const char* k, bool def) {
+        return j.contains(k) ? j[k].get<bool>() : def;
+    };
+    auto getI = [&](const char* k, int def) {
+        return j.contains(k) ? j[k].get<int>() : def;
+    };
+
+    gMeshKeepRatio       = getF("meshKeepRatio",        gMeshKeepRatio);
+    gUvSharpPreCut       = getB("sharpPreCut",          gUvSharpPreCut);
+    gUvSharpAngleDeg     = getF("sharpAngleDeg",        gUvSharpAngleDeg);
+    gUvBigCharts         = getB("bigCharts",            gUvBigCharts);
+    gUvBruteForcePack    = getB("bruteForcePack",       gUvBruteForcePack);
+    gUvAtlasEngine       = getI("atlasEngine",          gUvAtlasEngine);
+    gUvOptimizeRefine    = getB("optimizeRefine",       gUvOptimizeRefine);
+    gUvOptimizeMaxIter   = getI("optimizeMaxIter",      gUvOptimizeMaxIter);
+    gUvOptimizeVisExp    = getF("optimizeVisExp",       gUvOptimizeVisExp);
+    gUvOptimizeVisFloor  = getF("optimizeVisFloor",     gUvOptimizeVisFloor);
+    gUvOptimizeProjAware = getB("optimizeProjAware",    gUvOptimizeProjAware);
+
+    if (j.contains("syphon")) {
+        for (auto& l : scene.bus.layers) {
+            if (auto* s = dynamic_cast<spacegen::SyphonInputLayer*>(l.get())) {
+                const auto& js = j["syphon"];
+                if (js.contains("mix"))            s->mix    = js["mix"].get<float>();
+                if (js.contains("tint")) {
+                    s->tint.x = js["tint"][0].get<float>();
+                    s->tint.y = js["tint"][1].get<float>();
+                    s->tint.z = js["tint"][2].get<float>();
+                }
+                if (js.contains("flipY"))          s->flipY  = js["flipY"].get<bool>();
+                if (js.contains("projOnFlatMix"))
+                    s->projectorOnFlatMix = js["projOnFlatMix"].get<float>();
+                if (js.contains("projFlatThresh"))
+                    s->projectorFlatnessThreshold = js["projFlatThresh"].get<float>();
+                break;
+            }
+        }
+    }
+    if (j.contains("structure")) {
+        for (auto& l : scene.bus.layers) {
+            if (auto* sl = dynamic_cast<spacegen::StructureLayer*>(l.get())) {
+                const auto& jsl = j["structure"];
+                if (jsl.contains("showStretchHeatmap"))
+                    sl->showStretchHeatmap = jsl["showStretchHeatmap"].get<bool>();
+                if (jsl.contains("stretchMetric"))
+                    sl->stretchMetric  = jsl["stretchMetric"].get<int>();
+                if (jsl.contains("stretchUV"))
+                    sl->stretchUV      = jsl["stretchUV"].get<int>();
+                break;
+            }
+        }
+    }
+    std::fprintf(stderr, "[Workstation] panel_state.json loaded from %s\n",
+                  p.string().c_str());
+}
+#endif // 0
+
 // Pre-cut control state, captured by the worker thread at button-click time.
 // Kept here (not in UvAnalysisState) because they are pure inputs that the
 // panel reads/writes, not part of the worker's lifecycle state machine.
-static bool  gUvSharpPreCut   = true;
-static float gUvSharpAngleDeg = 75.0f;     // 75° → only hard creases get cut
+static bool  gUvSharpPreCut   = false;     // off by default — Blender exports
+                                            // tend to have spurious degenerate
+                                            // edges that fake-trigger cuts.
+static float gUvSharpAngleDeg = 75.0f;     // 75° → only hard creases when on
 
 // Quality vs speed knobs for the xatlas chart phase.
 //   gUvBigCharts    = bias for fewer, larger charts (better for live video)
@@ -436,6 +641,129 @@ static int   gUvOptimizeMaxIter    = 12;
 static float gUvOptimizeVisExp     = 1.5f;
 static float gUvOptimizeVisFloor   = 0.10f;
 static bool  gUvOptimizeProjAware  = true;
+
+// ---- Persistent panel state implementations ----
+//
+// All operator-tuned sliders / toggles persist to panel_state.json next
+// to scene.json. The atlas UV1 cache (uv1_atlas.bin) and panel_state.json
+// together let the operator close the app and resume mid-calibration —
+// the atlas reloads in ms from the cache, all sliders restore to their
+// last-saved positions.
+
+static std::filesystem::path panelStatePath(const spacegen::Scene& scene) {
+    return std::filesystem::path(scene.folderPath) / "panel_state.json";
+}
+
+static void writePanelState(const spacegen::Scene& scene) {
+    using json = nlohmann::json;
+    json j;
+    j["meshKeepRatio"]        = gMeshKeepRatio;
+    j["sharpPreCut"]          = gUvSharpPreCut;
+    j["sharpAngleDeg"]        = gUvSharpAngleDeg;
+    j["bigCharts"]            = gUvBigCharts;
+    j["bruteForcePack"]       = gUvBruteForcePack;
+    j["atlasEngine"]          = gUvAtlasEngine;
+    j["optimizeRefine"]       = gUvOptimizeRefine;
+    j["optimizeMaxIter"]      = gUvOptimizeMaxIter;
+    j["optimizeVisExp"]       = gUvOptimizeVisExp;
+    j["optimizeVisFloor"]     = gUvOptimizeVisFloor;
+    j["optimizeProjAware"]    = gUvOptimizeProjAware;
+
+    for (auto& l : scene.bus.layers) {
+        if (!l) continue;
+        if (auto* s = dynamic_cast<const spacegen::SyphonInputLayer*>(l.get())) {
+            j["syphon"] = {
+                {"mix",                s->mix},
+                {"tint",               {s->tint.x, s->tint.y, s->tint.z}},
+                {"flipY",              s->flipY},
+                {"projOnFlatMix",      s->projectorOnFlatMix},
+                {"projFlatThresh",     s->projectorFlatnessThreshold},
+            };
+            break;
+        }
+    }
+    for (auto& l : scene.bus.layers) {
+        if (auto* sl = dynamic_cast<const spacegen::StructureLayer*>(l.get())) {
+            j["structure"] = {
+                {"showStretchHeatmap", sl->showStretchHeatmap},
+                {"stretchMetric",      sl->stretchMetric},
+                {"stretchUV",          sl->stretchUV},
+            };
+            break;
+        }
+    }
+
+    std::ofstream f(panelStatePath(scene));
+    if (f) f << j.dump(2);
+}
+
+static void readPanelState(spacegen::Scene& scene) {
+    using json = nlohmann::json;
+    auto p = panelStatePath(scene);
+    if (!std::filesystem::exists(p)) return;
+    std::ifstream f(p);
+    if (!f) return;
+    json j;
+    try { f >> j; } catch (...) { return; }
+
+    auto getF = [&](const char* k, float def) {
+        return j.contains(k) ? j[k].get<float>() : def;
+    };
+    auto getB = [&](const char* k, bool def) {
+        return j.contains(k) ? j[k].get<bool>() : def;
+    };
+    auto getI = [&](const char* k, int def) {
+        return j.contains(k) ? j[k].get<int>() : def;
+    };
+
+    gMeshKeepRatio       = getF("meshKeepRatio",        gMeshKeepRatio);
+    gUvSharpPreCut       = getB("sharpPreCut",          gUvSharpPreCut);
+    gUvSharpAngleDeg     = getF("sharpAngleDeg",        gUvSharpAngleDeg);
+    gUvBigCharts         = getB("bigCharts",            gUvBigCharts);
+    gUvBruteForcePack    = getB("bruteForcePack",       gUvBruteForcePack);
+    gUvAtlasEngine       = getI("atlasEngine",          gUvAtlasEngine);
+    gUvOptimizeRefine    = getB("optimizeRefine",       gUvOptimizeRefine);
+    gUvOptimizeMaxIter   = getI("optimizeMaxIter",      gUvOptimizeMaxIter);
+    gUvOptimizeVisExp    = getF("optimizeVisExp",       gUvOptimizeVisExp);
+    gUvOptimizeVisFloor  = getF("optimizeVisFloor",     gUvOptimizeVisFloor);
+    gUvOptimizeProjAware = getB("optimizeProjAware",    gUvOptimizeProjAware);
+
+    if (j.contains("syphon")) {
+        for (auto& l : scene.bus.layers) {
+            if (auto* s = dynamic_cast<spacegen::SyphonInputLayer*>(l.get())) {
+                const auto& js = j["syphon"];
+                if (js.contains("mix"))   s->mix   = js["mix"].get<float>();
+                if (js.contains("tint")) {
+                    s->tint.x = js["tint"][0].get<float>();
+                    s->tint.y = js["tint"][1].get<float>();
+                    s->tint.z = js["tint"][2].get<float>();
+                }
+                if (js.contains("flipY")) s->flipY = js["flipY"].get<bool>();
+                if (js.contains("projOnFlatMix"))
+                    s->projectorOnFlatMix = js["projOnFlatMix"].get<float>();
+                if (js.contains("projFlatThresh"))
+                    s->projectorFlatnessThreshold = js["projFlatThresh"].get<float>();
+                break;
+            }
+        }
+    }
+    if (j.contains("structure")) {
+        for (auto& l : scene.bus.layers) {
+            if (auto* sl = dynamic_cast<spacegen::StructureLayer*>(l.get())) {
+                const auto& jsl = j["structure"];
+                if (jsl.contains("showStretchHeatmap"))
+                    sl->showStretchHeatmap = jsl["showStretchHeatmap"].get<bool>();
+                if (jsl.contains("stretchMetric"))
+                    sl->stretchMetric  = jsl["stretchMetric"].get<int>();
+                if (jsl.contains("stretchUV"))
+                    sl->stretchUV      = jsl["stretchUV"].get<int>();
+                break;
+            }
+        }
+    }
+    std::fprintf(stderr, "[Workstation] panel_state.json loaded from %s\n",
+                  p.string().c_str());
+}
 
 // xatlas progress trampoline. Runs on the worker thread; writes to atomics
 // that the main thread reads each frame. Returns false when the operator
@@ -562,6 +890,17 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
         recomputeUvCoverage(m, gUvState);
     }
 
+    // ---- Persistent state ----
+    if (ImGui::Button("Save panel state to disk##savestate",
+                       ImVec2(-FLT_MIN, 24))) {
+        writePanelState(scene);
+        gUvState.lastOk  = true;
+        gUvState.lastMsg = "panel_state.json written next to scene.json.";
+    }
+    ImGui::TextDisabled("Auto-saved after every Generate. The atlas UV1");
+    ImGui::TextDisabled("cache (uv1_atlas.bin) loads at startup if the");
+    ImGui::TextDisabled("mesh fingerprint matches.");
+
     // ---- Active UV layer indicator ----
     ImGui::Separator();
     ImVec4 activeCol = scene.atlasApplied
@@ -668,6 +1007,44 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
             ImGui::TextDisabled("white = ideal     cyan ~ minor     "
                                  "green ~ moderate     red = broken");
             ImGui::TextDisabled("(Lighting bypassed in heatmap mode.)");
+        }
+    }
+
+    // ---- Camera-projected UV1 bake ----
+    // Lightning-fast alternative to xatlas for projection-mapping setups
+    // where scene-camera POV == physical projector POV. Computes
+    // uv1[i] = NDC(projection · view · position[i]) for every vertex.
+    // The texture stays baked to the surface (still a regular UV1 buffer),
+    // but each face shows the rectangular slice of the source video that
+    // corresponds to its screen-space rect — exactly what 1:1 projection
+    // mapping at matching camera/projector resolution should do.
+    ImGui::Separator();
+    ImGui::TextDisabled("Camera-projected UV1 (1:1 projection mapping)");
+    ImGui::TextWrapped("Bakes uv1 = NDC(camera · vertex) per vertex. "
+                        "Each face shows its corresponding rect of the "
+                        "video. Faces outside the frustum or behind the "
+                        "camera stay dark.");
+    if (ImGui::Button("Bake camera-projected UV1 (instant)##camproj",
+                       ImVec2(-FLT_MIN, 32))) {
+        std::vector<glm::vec2> bakedUv1;
+        spacegen::bakeCameraProjectedUv1(
+            m,
+            scene.camera.projection,
+            scene.camera.view,
+            bakedUv1);
+        m.uvs1 = std::move(bakedUv1);
+        scene.atlasApplied = true;
+        if (renderer.reloadMesh(0, m)) {
+            recomputeUvCoverage(m, gUvState);
+            gUvState.lastOk  = true;
+            gUvState.lastMsg = "Camera-projected UV1 baked from current "
+                                "camera. Each surface now maps to its "
+                                "screen-space slice of the video. "
+                                "Texture is baked — it stays on the surface "
+                                "as the engine renders.";
+        } else {
+            gUvState.lastOk  = false;
+            gUvState.lastMsg = "Bake OK but GPU reload failed.";
         }
     }
 
@@ -853,7 +1230,7 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                     // charts on 1.2 M tri proxy at normalDeviationW=10,
                     // which OOM'd SLIM. 25 yields ~500-3k charts on
                     // typical architectural meshes.
-                    opts.normalDeviationW   = gUvBigCharts ? 25.0f : 2.0f;
+                    opts.normalDeviationW   = gUvBigCharts ? 50.0f : 2.0f;
                     opts.roundnessW         = gUvBigCharts ? 0.0f  : 0.01f;
                     opts.straightnessW      = gUvBigCharts ? 0.0f  : 6.0f;
                     opts.normalSeamW        = gUvBigCharts ? 0.5f  : 4.0f;
@@ -1150,6 +1527,10 @@ void drawUvAnalysisPanel(spacegen::Scene& scene,
                                     "the xatlas conformal mapping — switch "
                                     "the Syphon layer's 'Use atlas' toggle "
                                     "to see it.";
+                // Persist the panel state immediately after a successful
+                // atlas bake so the operator's tuning isn't lost if they
+                // shut down before reaching the explicit save.
+                writePanelState(scene);
             } else {
                 gUvState.lastMsg += " (GPU upload failed; cache is on disk.)";
                 gUvState.lastOk = false;
@@ -1304,6 +1685,12 @@ void Workstation::endFrame(MTL::CommandBuffer* cb,
     if (!layoutBuilt_) {
         buildDefaultLayout(dockspace_id);
         layoutBuilt_ = true;
+    }
+
+    // First-frame: load panel state from disk if present.
+    if (!panelStateLoaded_) {
+        readPanelState(scene);
+        panelStateLoaded_ = true;
     }
 
     drawMainMenuBar(showStats_, showLayers_, showModulators_,

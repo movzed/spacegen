@@ -246,13 +246,53 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
     float3 syphonSample = float3(0.0);
     if (syphonMix > 1e-4) {
         bool   syphonFlipY = u.syphonParams.z > 0.5;
-        float2 uvDx        = dfdx(in.uv);
-        float2 uvDy        = dfdy(in.uv);
-        float  uvGrad      = abs(uvDx.x) + abs(uvDx.y)
-                            + abs(uvDy.x) + abs(uvDy.y);
-        float2 syphonUv    = (uvGrad > 1e-6) ? in.uv : in.uv1;
-        if (syphonFlipY) syphonUv.y = 1.0 - syphonUv.y;
-        syphonSample = syphonMap.sample(smp, syphonUv).rgb * u.syphonMixTint.yzw;
+        float  projMixMax  = u.syphonParams.x;
+        float  flatThresh  = max(u.syphonParams.y, 1e-4);
+
+        // UV0 gradient — used to pick UV0 vs UV1 (the existing hybrid).
+        float2 uvDx   = dfdx(in.uv);
+        float2 uvDy   = dfdy(in.uv);
+        float  uvGrad = abs(uvDx.x) + abs(uvDx.y)
+                      + abs(uvDy.x) + abs(uvDy.y);
+        bool   useUv0 = (uvGrad > 1e-6);
+
+        // Atlas / UV0 sample (the "texture" path).
+        float2 atlasUv = useUv0 ? in.uv : in.uv1;
+        if (syphonFlipY) atlasUv.y = 1.0 - atlasUv.y;
+        float3 atlasSample = syphonMap.sample(smp, atlasUv).rgb;
+
+        // Projector-on-flat: ONLY active where UV0 is degenerate (i.e.,
+        // we'd otherwise sample atlas), AND the surface is locally flat
+        // in screen-space (low normal curvature). Mixes between the atlas
+        // sample (good for curved 3D detail) and a projector-NDC sample
+        // (1:1 video → flat surface). Curved areas (mask UV0, or atlas
+        // areas with curvature) keep their texture mapping untouched.
+        float3 finalSample = atlasSample;
+        if (!useUv0 && projMixMax > 1e-4) {
+            float3 dNx = dfdx(in.worldNormal);
+            float3 dNy = dfdy(in.worldNormal);
+            float  normalCurv = abs(dNx.x) + abs(dNx.y) + abs(dNx.z)
+                              + abs(dNy.x) + abs(dNy.y) + abs(dNy.z);
+            // 0 at curvature ≥ threshold, 1 at curvature 0.
+            float flatness = 1.0 - saturate(normalCurv / flatThresh);
+            float projMix  = projMixMax * flatness;
+            if (projMix > 1e-4) {
+                // Compute projector NDC from worldPos.
+                float4 cp = u.projection * u.view * float4(in.worldPos, 1.0);
+                if (cp.w > 1e-4) {
+                    float2 ndc = cp.xy / cp.w;
+                    float2 puv = ndc * 0.5 + 0.5;
+                    puv.y = 1.0 - puv.y;
+                    if (syphonFlipY) puv.y = 1.0 - puv.y;
+                    if (puv.x >= 0.0 && puv.x <= 1.0
+                        && puv.y >= 0.0 && puv.y <= 1.0) {
+                        float3 projSample = syphonMap.sample(smp, puv).rgb;
+                        finalSample = mix(atlasSample, projSample, projMix);
+                    }
+                }
+            }
+        }
+        syphonSample = finalSample * u.syphonMixTint.yzw;
     }
 
     // Compose final material values:
@@ -737,7 +777,9 @@ void MetalRenderer::renderStructureMeshes(
     bool           syphonFlipY,
     bool           showHeatmap,
     int            heatmapMetric,
-    int            heatmapUV)
+    int            heatmapUV,
+    float          projectorOnFlatMix,
+    float          projectorFlatnessThreshold)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -862,8 +904,8 @@ void MetalRenderer::renderStructureMeshes(
         }
         u.fx = glm::vec4(dispEff, layer.displaceScale, twistEff, 0.0f);
         u.syphonMixTint = glm::vec4(syphonMix, syphonTint);
-        u.syphonParams  = glm::vec4(0.0f,
-                                     0.0f,
+        u.syphonParams  = glm::vec4(projectorOnFlatMix,
+                                     projectorFlatnessThreshold,
                                      syphonFlipY ? 1.0f : 0.0f,
                                      0.0f);
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);

@@ -384,7 +384,29 @@ uint64_t meshFingerprint(const MeshData& mesh) {
 //   uvs1               vec2 × vertexCount
 //   indices            uint32 × indexCount
 
-static constexpr char kCacheMagic[8] = { 'S','G','U','V','A','1','\0','\0' };
+// Cache format v2:
+//   magic        "SGUVA2\0\0"  (8 bytes)
+//   fingerprint  uint64
+//   vCount       uint32   — full-mesh vertex count, 0 in proxy mode
+//   iCount       uint32   — full-mesh index count,  0 in proxy mode
+//   uv1Count     uint32   — uvs1 buffer count; in proxy mode equals
+//                            dense mesh vertex count, in legacy equals
+//                            vCount. Stored explicitly so the proxy
+//                            pipeline can save uvs1 without bundling
+//                            positions / indices.
+//   chartCount   uint32
+//   atlasW       uint32
+//   atlasH       uint32
+//   if (vCount   > 0):   positions(vec3 × vCount),
+//                        normals(vec3 × vCount),
+//                        uvs0(vec2 × vCount)
+//   if (uv1Count > 0):   uvs1(vec2 × uv1Count)
+//   if (iCount   > 0):   indices(uint32 × iCount)
+//
+// v1 cache files are bytewise incompatible and ignored on load — they
+// were broken anyway (didn't save uvs1 in proxy mode), so no data of
+// value is being thrown away.
+static constexpr char kCacheMagic[8] = { 'S','G','U','V','A','2','\0','\0' };
 
 bool saveAtlasCache(const std::string& path,
                      uint64_t fingerprint,
@@ -399,21 +421,25 @@ bool saveAtlasCache(const std::string& path,
 
     write(kCacheMagic, sizeof(kCacheMagic));
     write(&fingerprint, sizeof(fingerprint));
-    uint32_t vc = static_cast<uint32_t>(res.positions.size());
-    uint32_t ic = static_cast<uint32_t>(res.indices.size());
-    uint32_t cc = static_cast<uint32_t>(res.chartCount);
-    uint32_t aw = static_cast<uint32_t>(res.atlasWidth);
-    uint32_t ah = static_cast<uint32_t>(res.atlasHeight);
-    write(&vc, sizeof(vc));
-    write(&ic, sizeof(ic));
-    write(&cc, sizeof(cc));
-    write(&aw, sizeof(aw));
-    write(&ah, sizeof(ah));
+    uint32_t vc  = static_cast<uint32_t>(res.positions.size());
+    uint32_t ic  = static_cast<uint32_t>(res.indices.size());
+    uint32_t u1c = static_cast<uint32_t>(res.uvs1.size());
+    uint32_t cc  = static_cast<uint32_t>(res.chartCount);
+    uint32_t aw  = static_cast<uint32_t>(res.atlasWidth);
+    uint32_t ah  = static_cast<uint32_t>(res.atlasHeight);
+    write(&vc,  sizeof(vc));
+    write(&ic,  sizeof(ic));
+    write(&u1c, sizeof(u1c));
+    write(&cc,  sizeof(cc));
+    write(&aw,  sizeof(aw));
+    write(&ah,  sizeof(ah));
     if (vc > 0) {
         write(res.positions.data(), vc * sizeof(glm::vec3));
         write(res.normals.data(),   vc * sizeof(glm::vec3));
         write(res.uvs0.data(),      vc * sizeof(glm::vec2));
-        write(res.uvs1.data(),      vc * sizeof(glm::vec2));
+    }
+    if (u1c > 0) {
+        write(res.uvs1.data(),      u1c * sizeof(glm::vec2));
     }
     if (ic > 0) {
         write(res.indices.data(),   ic * sizeof(uint32_t));
@@ -435,33 +461,41 @@ bool loadAtlasCache(const std::string& path,
 
     char magic[8] = {0};
     if (!read(magic, sizeof(magic))) return false;
-    if (std::memcmp(magic, kCacheMagic, sizeof(kCacheMagic)) != 0) return false;
+    if (std::memcmp(magic, kCacheMagic, sizeof(kCacheMagic)) != 0) {
+        std::fprintf(stderr,
+            "[UvAtlas] Cache %s magic mismatch (legacy v1 or unknown format) — "
+            "ignored. Will regenerate.\n", path.c_str());
+        return false;
+    }
     uint64_t fp = 0;
     if (!read(&fp, sizeof(fp))) return false;
     if (fp != expectedFingerprint) {
         std::fprintf(stderr,
-            "[UvAtlas] Cache %s exists but fingerprint mismatch (mesh changed). "
+            "[UvAtlas] Cache %s fingerprint mismatch (mesh changed). "
             "Will regenerate.\n", path.c_str());
         return false;
     }
-    uint32_t vc=0, ic=0, cc=0, aw=0, ah=0;
-    if (!read(&vc, sizeof(vc))) return false;
-    if (!read(&ic, sizeof(ic))) return false;
-    if (!read(&cc, sizeof(cc))) return false;
-    if (!read(&aw, sizeof(aw))) return false;
-    if (!read(&ah, sizeof(ah))) return false;
+    uint32_t vc=0, ic=0, u1c=0, cc=0, aw=0, ah=0;
+    if (!read(&vc,  sizeof(vc)))  return false;
+    if (!read(&ic,  sizeof(ic)))  return false;
+    if (!read(&u1c, sizeof(u1c))) return false;
+    if (!read(&cc,  sizeof(cc)))  return false;
+    if (!read(&aw,  sizeof(aw)))  return false;
+    if (!read(&ah,  sizeof(ah)))  return false;
 
     out.positions.resize(vc);
     out.normals.resize(vc);
     out.uvs0.resize(vc);
-    out.uvs1.resize(vc);
+    out.uvs1.resize(u1c);
     out.indices.resize(ic);
 
     if (vc > 0) {
         if (!read(out.positions.data(), vc * sizeof(glm::vec3))) return false;
         if (!read(out.normals.data(),   vc * sizeof(glm::vec3))) return false;
         if (!read(out.uvs0.data(),      vc * sizeof(glm::vec2))) return false;
-        if (!read(out.uvs1.data(),      vc * sizeof(glm::vec2))) return false;
+    }
+    if (u1c > 0) {
+        if (!read(out.uvs1.data(),      u1c * sizeof(glm::vec2))) return false;
     }
     if (ic > 0) {
         if (!read(out.indices.data(),   ic * sizeof(uint32_t))) return false;

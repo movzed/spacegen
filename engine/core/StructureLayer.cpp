@@ -29,6 +29,8 @@ void StructureLayer::render(RenderContext& ctx) {
     float          syphonMix   = 0.0f;
     glm::vec3      syphonTint(1.0f);
     bool           syphonFlipY = false;
+    float          syphonProjFlatMix = 0.0f;
+    float          syphonProjFlatThresh = 0.05f;
     if (ctx.scene) {
         for (auto& l : ctx.scene->bus.layers) {
             if (!l) continue;
@@ -46,6 +48,8 @@ void StructureLayer::render(RenderContext& ctx) {
                     syphonMix   = s->mix * s->opacity;
                     syphonTint  = s->tint;
                     syphonFlipY = s->flipY;
+                    syphonProjFlatMix    = s->projectorOnFlatMix;
+                    syphonProjFlatThresh = s->projectorFlatnessThreshold;
                 }
             }
         }
@@ -55,7 +59,9 @@ void StructureLayer::render(RenderContext& ctx) {
                                           syphonTex, syphonMix, syphonTint,
                                           syphonFlipY,
                                           showStretchHeatmap,
-                                          stretchMetric, stretchUV);
+                                          stretchMetric, stretchUV,
+                                          syphonProjFlatMix,
+                                          syphonProjFlatThresh);
 }
 
 void StructureLayer::drawInspector() {

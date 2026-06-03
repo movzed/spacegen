@@ -92,6 +92,37 @@ TransferResult transferUv1FromProxyToDense(
     TransferProgressFn cb = nullptr,
     void* user = nullptr);
 
+// ============================================================
+// Camera-projected UV1 bake
+// ============================================================
+//
+// For projection-mapping setups where the scene camera == the physical
+// projector POV, this is the simplest, most direct UV layout: each
+// vertex gets uv1 = NDC(camera_projection * camera_view * worldPos),
+// remapped to [0, 1]² with the standard image y-flip.
+//
+// Behaviour:
+//   - The texture STAYS BAKED to the surface (it's a regular UV1 buffer).
+//   - Each face of the structure shows the rectangular slice of the
+//     1920×1080 source video that corresponds to its screen-space
+//     position at the moment of bake.
+//   - A flat wall facing the camera shows its corresponding pixel rect.
+//   - Vertices behind the camera (w ≤ 0) get uv1 = (-1, -1) so the
+//     sampler returns 0 outside the frustum — those faces stay dark
+//     (correct: a real projector can't light them either).
+//
+// Computes uv1 for every vertex of `dense` and writes into `outUv1`
+// (resized to dense.positions.size()). No xatlas / SLIM / transfer
+// needed — it's literally a per-vertex projection. Fast: O(N) over
+// vertices, milliseconds even on 5 M vertex meshes.
+//
+// `projection` and `view` are the matrices that the engine uses for
+// the structure pass (same ones in scene.camera).
+void bakeCameraProjectedUv1(const MeshData& dense,
+                             const glm::mat4& projection,
+                             const glm::mat4& view,
+                             std::vector<glm::vec2>& outUv1);
+
 // Empirical estimate of xatlas + SLIM total wall time on the user's
 // M1 Max for a mesh of `triangleCount` triangles.
 //

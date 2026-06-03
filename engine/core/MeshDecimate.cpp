@@ -140,6 +140,84 @@ AtlasTimeRange estimateAtlasTimeRange(int triangleCount) {
 // UV-bake proxy pipeline
 // ============================================================
 
+// Weld vertices that share a 3D position. Blender's glTF exporter splits
+// vertices at every UV / normal / material seam, leaving the proxy
+// topologically disconnected: two faces that share an edge in 3D but were
+// authored across a seam have separate vertex indices.
+//
+// xatlas walks the index buffer to build its chart graph — disconnected
+// vertices → disconnected charts → fragmentation explosion. Welding by
+// position only (ignoring uv / normal) restores the connectivity that
+// matches the actual 3D geometry. We do NOT touch the dense mesh, so the
+// artist's UV0 unwrap on the render mesh is preserved.
+//
+// Uses meshopt_generateVertexRemap with a position-only buffer: it
+// produces a remap from (old vertex index) → (welded vertex index), and
+// we apply that remap to the index buffer while compacting the position
+// array. Returns the number of vertices removed.
+static int weldByPosition(MeshData& mesh) {
+    if (mesh.positions.empty() || mesh.indices.empty()) return 0;
+    const size_t vCount = mesh.positions.size();
+    std::vector<uint32_t> remap(vCount);
+    meshopt_Stream posStream { mesh.positions.data(), sizeof(glm::vec3),
+                                sizeof(glm::vec3) };
+    size_t newVCount = meshopt_generateVertexRemapMulti(
+        remap.data(),
+        mesh.indices.data(),
+        mesh.indices.size(),
+        vCount,
+        &posStream, 1);
+    if (newVCount == vCount) return 0;     // already welded
+
+    // Apply remap to the index buffer.
+    std::vector<uint32_t> newIndices(mesh.indices.size());
+    meshopt_remapIndexBuffer(newIndices.data(),
+                              mesh.indices.data(),
+                              mesh.indices.size(),
+                              remap.data());
+    mesh.indices = std::move(newIndices);
+
+    // Compact positions; drop normals/uvs (proxy doesn't need them for
+    // xatlas, and they'd require per-attribute remapping with potentially
+    // conflicting values at welded points).
+    std::vector<glm::vec3> newPositions(newVCount);
+    meshopt_remapVertexBuffer(newPositions.data(),
+                               mesh.positions.data(),
+                               vCount, sizeof(glm::vec3),
+                               remap.data());
+    mesh.positions = std::move(newPositions);
+    mesh.normals.clear();
+    mesh.uvs.clear();
+    mesh.uvs1.clear();
+    return static_cast<int>(vCount - newVCount);
+}
+
+// Strip triangles that are degenerate in 3D: any pair of vertex positions
+// equal within `eps`. These come from Blender exports where seams in
+// UV/normal space create distinct vertex indices at the SAME 3D point —
+// downstream tools (xatlas, our Sharp-Edges pre-cut) see them as either
+// zero-length edges or zero-area faces and inflate the chart count.
+static int dropDegenerateTriangles(MeshData& mesh, float eps = 1e-7f) {
+    if (mesh.indices.size() % 3 != 0 || mesh.positions.empty()) return 0;
+    const auto& P = mesh.positions;
+    std::vector<uint32_t> kept;
+    kept.reserve(mesh.indices.size());
+    int dropped = 0;
+    const size_t nT = mesh.indices.size() / 3;
+    for (size_t t = 0; t < nT; ++t) {
+        uint32_t i = mesh.indices[t*3+0], j = mesh.indices[t*3+1], k = mesh.indices[t*3+2];
+        if (i == j || j == k || i == k) { ++dropped; continue; }
+        const glm::vec3& a = P[i]; const glm::vec3& b = P[j]; const glm::vec3& c = P[k];
+        // Zero-area test: cross product magnitude ≈ 0.
+        glm::vec3 e0 = b - a, e1 = c - a;
+        float areaSq = glm::dot(glm::cross(e0, e1), glm::cross(e0, e1));
+        if (areaSq < eps) { ++dropped; continue; }
+        kept.push_back(i); kept.push_back(j); kept.push_back(k);
+    }
+    mesh.indices = std::move(kept);
+    return dropped;
+}
+
 MeshData buildUvBakeProxy(const MeshData& dense, float ratio) {
     MeshData proxy;
     proxy.name        = dense.name + "_uv_proxy";
@@ -151,16 +229,38 @@ MeshData buildUvBakeProxy(const MeshData& dense, float ratio) {
     proxy.uvs1        = {};                  // populated by xatlas
     proxy.indices     = dense.indices;       // start from full topology, then decimate
 
-    if (ratio >= 0.999f) {
-        // No-op proxy — return a full copy so the worker can treat it
-        // uniformly.
-        return proxy;
+    // Pre-clean: strip degenerate triangles BEFORE decimation. The
+    // Blender export carries thousands of zero-area faces from UV/normal
+    // seam splits; without this xatlas inflates the chart count by 10×
+    // because every degenerate face looks like a hard edge to it.
+    int dropped0 = dropDegenerateTriangles(proxy);
+    if (dropped0 > 0) {
+        std::printf("[MeshDecimate] proxy pre-clean: dropped %d degenerate "
+                     "triangles from dense before decimation\n", dropped0);
     }
-    DecimateResult dr = decimateMesh(proxy, ratio);
-    if (!dr.ok) {
-        std::fprintf(stderr,
-            "[MeshDecimate] proxy build failed: %s — returning full-density copy\n",
-            dr.error.c_str());
+
+    if (ratio < 0.999f) {
+        DecimateResult dr = decimateMesh(proxy, ratio);
+        if (!dr.ok) {
+            std::fprintf(stderr,
+                "[MeshDecimate] proxy build failed: %s — returning unwhittled copy\n",
+                dr.error.c_str());
+        }
+    }
+
+    // Post-clean: meshoptimizer occasionally emits new degenerate
+    // triangles on a noisy input. Belt-and-braces.
+    int dropped1 = dropDegenerateTriangles(proxy);
+    if (dropped1 > 0) {
+        std::printf("[MeshDecimate] proxy post-clean: dropped %d degenerate "
+                     "triangles after decimation\n", dropped1);
+    }
+    // Weld split vertices: without this, xatlas sees the proxy as
+    // disconnected per seam and fragments into 100k+ tiny charts.
+    int welded = weldByPosition(proxy);
+    if (welded > 0) {
+        std::printf("[MeshDecimate] proxy weld: merged %d duplicate-position "
+                     "vertices (xatlas connectivity restored)\n", welded);
     }
     return proxy;
 }
@@ -388,6 +488,33 @@ TransferResult transferUv1FromProxyToDense(
     std::printf("[MeshDecimate] UV1 transfer: %d dense verts ← %d proxy tris in %.2fs\n",
                  r.denseVerts, r.proxyTris, r.elapsedSec);
     return r;
+}
+
+void bakeCameraProjectedUv1(const MeshData& dense,
+                             const glm::mat4& projection,
+                             const glm::mat4& view,
+                             std::vector<glm::vec2>& outUv1)
+{
+    const size_t N = dense.positions.size();
+    outUv1.assign(N, glm::vec2(-1.0f));
+    if (N == 0) return;
+
+    const glm::mat4 vp = projection * view * dense.transform;
+    int outside = 0;
+    for (size_t i = 0; i < N; ++i) {
+        glm::vec4 clip = vp * glm::vec4(dense.positions[i], 1.0f);
+        if (clip.w <= 1e-4f) {
+            outUv1[i] = glm::vec2(-1.0f);   // behind / on camera plane
+            ++outside;
+            continue;
+        }
+        float u = (clip.x / clip.w) * 0.5f + 0.5f;
+        float v = 1.0f - ((clip.y / clip.w) * 0.5f + 0.5f);
+        outUv1[i] = glm::vec2(u, v);
+    }
+    std::printf("[MeshDecimate] camera-projected UV1 bake: %zu verts "
+                 "(%d behind camera → uv=(-1,-1))\n",
+                 N, outside);
 }
 
 double estimateAtlasTimeSeconds(int triangleCount) {

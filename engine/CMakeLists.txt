@@ -257,11 +257,28 @@ add_executable(spacegen
     core/UvOptimize.cpp
     backends/metal/MetalRenderer.cpp
     gui/Workstation.mm
+    # ---- Effects (designed by 10 parallel agents, see next_tasks/) ----
+    effects/area_light/AreaLightLayer.cpp
+    effects/light_cloner/LightClonerLayer.cpp
+    effects/procedural_material/ProceduralMaterialLayer.cpp
+    effects/mesh_deformation/MeshDeformationLayer.cpp
+    effects/mesh_fracture/MeshFractureLayer.cpp
+    effects/bloom/BloomEffect.cpp
+    effects/motion_blur/MotionBlurEffect.cpp
+    effects/hologram/HologramMaterialLayer.cpp
+    # The next 4 require engine-side helpers (ping-pong target, .literal
+    # generation, VolumetricUniforms) that need to be added before they
+    # link cleanly. Spec is in each effect's INTEGRATION.md.
+    #effects/post_fx/ChromaticAberrationEffect.cpp
+    #effects/post_fx/GlitchEffect.cpp
+    #effects/sdf_particles/SDFParticleLayer.cpp
+    #effects/volumetric_beams/VolumetricBeamLayer.cpp
     ${IMGUI_SOURCES}
 )
 
 target_include_directories(spacegen PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/core"
     "${imgui_SOURCE_DIR}"
     "${imgui_SOURCE_DIR}/backends"
 )

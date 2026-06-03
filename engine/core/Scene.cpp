@@ -568,18 +568,41 @@ Scene Scene::loadFromFolder(const std::string& folderPath) {
             UvAtlasResult atlas;
             if (loadAtlasCache(cachePath.string(), fp, atlas)) {
                 MeshData& m = scene.meshes[0];
-                std::printf("[Scene] xatlas cache loaded from %s: "
-                             "%zu → %zu verts, %zu indices, %d charts, atlas %dx%d\n",
-                             cachePath.string().c_str(),
-                             m.positions.size(), atlas.positions.size(),
-                             atlas.indices.size(), atlas.chartCount,
-                             atlas.atlasWidth, atlas.atlasHeight);
-                m.positions = std::move(atlas.positions);
-                m.normals   = std::move(atlas.normals);
-                m.uvs       = std::move(atlas.uvs0);
-                m.uvs1      = std::move(atlas.uvs1);
-                m.indices   = std::move(atlas.indices);
-                scene.atlasApplied = true;
+                // Cache format detection:
+                //   - Legacy full-mesh cache: positions/indices populated;
+                //     swap the whole mesh.
+                //   - Proxy-pipeline cache: positions empty, uvs1 sized to
+                //     dense.positions.size() — only update uvs1 on the
+                //     already-loaded dense mesh.
+                //   - Corrupt or stale: positions empty AND uvs1 wrong
+                //     size → ignore.
+                bool isProxyCache = atlas.positions.empty();
+                bool uvSizeOk     = atlas.uvs1.size() == m.positions.size();
+                if (isProxyCache && uvSizeOk) {
+                    m.uvs1 = std::move(atlas.uvs1);
+                    scene.atlasApplied = true;
+                    std::printf("[Scene] xatlas cache (proxy/uvs1-only) loaded: "
+                                 "%zu dense uvs1 applied, atlas %dx%d, %d charts\n",
+                                 m.uvs1.size(), atlas.atlasWidth, atlas.atlasHeight,
+                                 atlas.chartCount);
+                } else if (!isProxyCache
+                           && atlas.positions.size() > 0
+                           && atlas.indices.size() > 0) {
+                    std::printf("[Scene] xatlas cache (legacy full-mesh) loaded: "
+                                 "%zu → %zu verts, %zu indices, %d charts, atlas %dx%d\n",
+                                 m.positions.size(), atlas.positions.size(),
+                                 atlas.indices.size(), atlas.chartCount,
+                                 atlas.atlasWidth, atlas.atlasHeight);
+                    m.positions = std::move(atlas.positions);
+                    m.normals   = std::move(atlas.normals);
+                    m.uvs       = std::move(atlas.uvs0);
+                    m.uvs1      = std::move(atlas.uvs1);
+                    m.indices   = std::move(atlas.indices);
+                    scene.atlasApplied = true;
+                } else {
+                    std::printf("[Scene] xatlas cache loaded but had zero "
+                                 "vertices or uv-size mismatch — ignoring.\n");
+                }
             } else {
                 std::printf("[Scene] xatlas cache exists but couldn't load "
                              "(stale or corrupt). Ignoring; mesh keeps glTF UVs.\n");

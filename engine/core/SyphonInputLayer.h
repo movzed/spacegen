@@ -55,6 +55,23 @@ public:
     //
     // No mode toggle. The decision is automatic per-fragment.
 
+    // ---- Projector-on-flat blend ----
+    // When the per-fragment normal curvature (|dfdx(N)| + |dfdy(N)|) is
+    // below `projectorFlatnessThreshold`, the surface is "locally flat"
+    // in screen space and the atlas tends to allocate a small UV chart
+    // → video looks zoomed. Mix in the projector NDC sample to recover
+    // 1:1 projection-mapping correspondence on those big flat areas.
+    //
+    // Curved areas (3D details, circles, the mask) keep their full UV0
+    // or UV1 atlas mapping — projector is OFF on them by construction.
+    //
+    //   projectorOnFlatMix = 0.0 → pure atlas (3D detail preserved
+    //                              everywhere, flat walls may look zoomed)
+    //   projectorOnFlatMix = 1.0 → pure projector NDC on flat walls,
+    //                              atlas on curved (best of both worlds)
+    float projectorOnFlatMix       = 0.0f;
+    float projectorFlatnessThreshold = 0.05f;
+
     // Returns the last received Metal texture (may be null if no frame yet).
     MTL::Texture* currentTexture() const;
 

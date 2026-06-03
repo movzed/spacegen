@@ -138,12 +138,23 @@ void SyphonInputLayer::drawInspector() {
     ImGui::Separator();
 
     ImGui::TextDisabled("UV sampling: hybrid auto");
-    ImGui::TextWrapped("Where the Blender unwrap is valid (PRT_UVW) the "
-                        "shader samples by UV0 — preserving the artist's "
-                        "intent on the mask. Where UV0 is degenerate, the "
-                        "shader falls back to UV1 (xatlas atlas).");
-    ImGui::TextDisabled("Generate the atlas from the UV Analysis panel");
-    ImGui::TextDisabled("if you see solid-color faces on flat surfaces.");
+    ImGui::TextWrapped("UV0 (Blender unwrap) for the mask, UV1 (atlas) "
+                        "for curved 3D detail. On big flat surfaces the "
+                        "atlas chart can be too small → video looks zoomed, "
+                        "so we optionally mix in projector NDC on those.");
+    ImGui::SliderFloat("Projector on flat##projflat",
+                        &projectorOnFlatMix, 0.0f, 1.0f, "%.2f");
+    if (projectorOnFlatMix > 0.01f) {
+        ImGui::SliderFloat("Flatness threshold##flatth",
+                            &projectorFlatnessThreshold,
+                            0.001f, 0.5f, "%.3f");
+        ImGui::TextDisabled("Surfaces with |dfdx(N)| + |dfdy(N)| <");
+        ImGui::TextDisabled("threshold get projector NDC mixed in.");
+        ImGui::TextDisabled("Lower threshold = only the flattest walls.");
+    } else {
+        ImGui::TextDisabled("0.0 = atlas everywhere. Raise to fix zoom on");
+        ImGui::TextDisabled("big flat walls without losing 3D on details.");
+    }
 
     ImGui::Separator();
     NSArray* servers = [impl listServers];
