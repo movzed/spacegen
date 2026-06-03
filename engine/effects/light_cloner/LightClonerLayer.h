@@ -124,6 +124,51 @@ public:
     float       swarmRatioZ  = 0.79f;
 
     // --------------------------------------------------------------
+    // Effector stack (Notch-style). Each effector is a per-clone modifier
+    // whose strength is weighted by a spatial FALLOFF FIELD evaluated at the
+    // clone's position (1 at the field centre → 0 at its edge). Effectors
+    // STACK additively in declaration order. An empty stack = identity, so a
+    // freshly-added cloner behaves exactly as before (no regression).
+    //
+    // The four types mirror Notch's confirmed effector model:
+    //   Plain  — uniform offset across every clone in the field.
+    //   Random — deterministic per-clone hash offset (decorrelated).
+    //   Step   — offset ramps linearly by clone index (cloneIdx/cloneCount).
+    //   Sine   — animated offset sin(2π(freqHz·t + phase + idx·spread)).
+    //
+    // Each effector can push position, intensity, color and cone (the
+    // outer-cone half-angle in degrees). HARD RULE for projection mapping:
+    // posOffset moves the fixture in space, it does NOT re-aim it — the aim
+    // is recomputed from the moved position toward/away from the centroid by
+    // expandSpots, so clones keep illuminating the structure rather than
+    // radiating into empty air.
+    struct Effector {
+        enum class Type    : int { Plain = 0, Random = 1, Step = 2, Sine = 3 };
+        enum class Falloff : int { None  = 0, Sphere = 1, Box  = 2 };
+
+        Type     type     = Type::Plain;
+        bool     enabled  = true;
+
+        // Spatial weighting field. None = full strength everywhere (weight 1).
+        Falloff  falloff       = Falloff::None;
+        glm::vec3 falloffCenter = glm::vec3(0.0f, 0.0f, 2.0f);
+        float    falloffRadius = 4.0f;     // sphere radius / box half-extent (m)
+
+        // Per-channel maximum contributions (scaled by falloff weight, and
+        // by the per-type modulation in [-1,1] for Random/Step/Sine).
+        glm::vec3 posOffset       = glm::vec3(0.0f);  // meters
+        float     intensityOffset = 0.0f;             // added to intensity
+        glm::vec3 colorOffset     = glm::vec3(0.0f);  // added to RGB
+        float     coneOffset      = 0.0f;             // degrees on outer cone
+
+        // Sine animation params (only used by Type::Sine).
+        float    freqHz = 0.5f;            // cycles / second
+        float    phase  = 0.0f;            // cycles
+        float    spread = 0.15f;           // per-clone phase stagger (cycles)
+    };
+    std::vector<Effector> effectors;       // empty by default → no-op
+
+    // --------------------------------------------------------------
     // Template light (the "master" config every clone inherits from)
     // --------------------------------------------------------------
     // We embed a self-contained subset of BeamLayer's controls inline,
@@ -182,6 +227,11 @@ private:
 
     // Per-clone Lissajous offset (zero unless swarmEnabled).
     glm::vec3 swarmOffset(double t, int idx, int total) const;
+
+    // Falloff field weight in [0,1] for an effector at world position `p`.
+    // None → 1 everywhere; Sphere → smooth 1→0 from centre to radius;
+    // Box → 1→0 along the worst axis of the (axis-aligned) half-extent.
+    static float effectorWeight(const Effector& e, const glm::vec3& p);
 };
 
 } // namespace spacegen

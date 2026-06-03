@@ -311,6 +311,70 @@ glm::vec3 LightClonerLayer::swarmOffset(double t, int idx, int total) const {
     return dx * right + dy * up + dz * ax;
 }
 
+float LightClonerLayer::effectorWeight(const Effector& e, const glm::vec3& p) {
+    switch (e.falloff) {
+    case Effector::Falloff::None:
+        return 1.0f;
+
+    case Effector::Falloff::Sphere: {
+        const float r = std::max(1e-4f, e.falloffRadius);
+        float d = glm::length(p - e.falloffCenter) / r;       // 0 at centre
+        d = std::clamp(d, 0.0f, 1.0f);
+        // smoothstep-style ease so the field edge isn't a hard ring.
+        float w = 1.0f - d;
+        return w * w * (3.0f - 2.0f * w);
+    }
+
+    case Effector::Falloff::Box: {
+        const float r = std::max(1e-4f, e.falloffRadius);
+        glm::vec3 d = glm::abs(p - e.falloffCenter) / r;      // per-axis 0..1+
+        float m = std::clamp(std::max(d.x, std::max(d.y, d.z)), 0.0f, 1.0f);
+        float w = 1.0f - m;
+        return w * w * (3.0f - 2.0f * w);
+    }
+    }
+    return 1.0f;
+}
+
+namespace {
+
+// Per-clone modulation scalar in [-1, 1] for a given effector type. Plain is
+// uniform (+1) so its offsets apply at full strength across the field; the
+// others decorrelate / ramp / animate.
+float effectorModulation(const LightClonerLayer::Effector& e,
+                          int idx, int total, double t) {
+    using Type = LightClonerLayer::Effector::Type;
+    switch (e.type) {
+    case Type::Plain:
+        return 1.0f;
+
+    case Type::Random: {
+        // hash3's x-channel is already in (-1, 1]; offset the index so two
+        // Random effectors don't share the same sequence.
+        return hash3(0x9E3779B9u, idx * 3 + 1).x;
+    }
+
+    case Type::Step: {
+        // Ramp 0..1 across the clone count, remapped to [-1, 1] so the
+        // effector pushes symmetrically around the template.
+        float s = (total > 1)
+            ? static_cast<float>(idx) / static_cast<float>(total - 1)
+            : 0.0f;
+        return s * 2.0f - 1.0f;
+    }
+
+    case Type::Sine: {
+        float arg = kTwoPi * (e.freqHz * static_cast<float>(t)
+                              + e.phase
+                              + static_cast<float>(idx) * e.spread);
+        return std::sin(arg);
+    }
+    }
+    return 0.0f;
+}
+
+} // anon
+
 int LightClonerLayer::expandSpots(const RenderContext& ctx,
                                     std::vector<VirtualSpot>& sink) const
 {
@@ -334,10 +398,34 @@ int LightClonerLayer::expandSpots(const RenderContext& ctx,
 
     int emitted = 0;
     for (int i = 0; i < N; ++i) {
+        // --- Accumulate the effector stack for this clone --------------
+        // Effectors are weighted by their falloff field evaluated at the
+        // clone's BASE position (so a clone moving out of a field doesn't
+        // chase its own weight). Contributions stack additively in order.
+        glm::vec3 effPos   = glm::vec3(0.0f);
+        float     effInten = 0.0f;
+        glm::vec3 effColor = glm::vec3(0.0f);
+        float     effCone  = 0.0f;       // degrees on the outer cone
+        for (const Effector& e : effectors) {
+            if (!e.enabled) continue;
+            float w = effectorWeight(e, positions[i]);
+            if (w <= 0.0f) continue;
+            float m  = effectorModulation(e, i, N, t);
+            float wm = w * m;
+            effPos   += e.posOffset       * wm;
+            effInten += e.intensityOffset * wm;
+            effColor += e.colorOffset     * wm;
+            effCone  += e.coneOffset      * wm;
+        }
+
         VirtualSpot vs;
-        vs.worldPos = positions[i] + swarmOffset(t, i, N);
-        vs.direction = cloneDirection(t, i, N, centroid, positions[i], mods);
-        vs.color     = cloneColor(i, N);
+        // Position: base + swarm + effector offset. Aim is recomputed from
+        // the MOVED position so the clone keeps pointing at/away from the
+        // centroid (projection-mapping hard rule: effectors offset fixtures
+        // but never aim them blindly into empty air).
+        vs.worldPos  = positions[i] + swarmOffset(t, i, N) + effPos;
+        vs.direction = cloneDirection(t, i, N, centroid, vs.worldPos, mods);
+        vs.color     = glm::max(cloneColor(i, N) + effColor, glm::vec3(0.0f));
 
         // Per-clone phase also shifts intensity LFO + motion intensity.
         const float ph = (N > 1)
@@ -346,11 +434,22 @@ int LightClonerLayer::expandSpots(const RenderContext& ctx,
         auto motion = motionLFO.eval(t, ph);
         float inten = templateIntensity
                     + intensityLFO.eval(t, ph)
-                    + motion.intensity;
+                    + motion.intensity
+                    + effInten;
         vs.intensity = std::max(0.0f, inten) * opacity;
         vs.range     = templateRange;
-        vs.innerCos  = innerCos;
-        vs.outerCos  = outerCos;
+
+        // Cone: nudge the OUTER half-angle, keep inner <= outer and both in
+        // a valid (0, 89]deg range so cos() stays monotonic / well-formed.
+        if (effCone != 0.0f) {
+            float outerDeg = std::clamp(templateOuterDeg + effCone, 0.5f, 89.0f);
+            float innerDeg = std::min(templateInnerDeg, outerDeg);
+            vs.innerCos = std::cos(innerDeg * kPi / 180.0f);
+            vs.outerCos = std::cos(outerDeg * kPi / 180.0f);
+        } else {
+            vs.innerCos = innerCos;
+            vs.outerCos = outerCos;
+        }
         sink.push_back(vs);
         ++emitted;
     }
@@ -502,6 +601,82 @@ void LightClonerLayer::drawInspector() {
             ImGui::SliderFloat("Ratio Y##swarm",       &swarmRatioY, 0.1f, 3.0f);
             ImGui::SliderFloat("Ratio Z##swarm",       &swarmRatioZ, 0.1f, 3.0f);
             ImGui::TextDisabled("Irrational ratios = non-repeating orbit");
+        }
+    }
+
+    // -- Effector stack (Notch-style) ----
+    if (ImGui::CollapsingHeader("Effectors (falloff-weighted)",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("Per-clone modifiers weighted by a spatial field.");
+        ImGui::TextDisabled("Stack additively; empty = no change.");
+
+        if (ImGui::Button("Add effector##cloner")) {
+            effectors.emplace_back();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%d)", static_cast<int>(effectors.size()));
+
+        const char* effTypes[]    = { "Plain", "Random", "Step", "Sine" };
+        const char* effFalloffs[] = { "None", "Sphere", "Box" };
+
+        int removeIdx = -1;
+        for (int ei = 0; ei < static_cast<int>(effectors.size()); ++ei) {
+            Effector& e = effectors[static_cast<size_t>(ei)];
+            ImGui::PushID(ei);
+            ImGui::Separator();
+
+            ImGui::Checkbox("##effen", &e.enabled);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(110.0f);
+            int et = static_cast<int>(e.type);
+            if (ImGui::Combo("type", &et, effTypes, 4)) {
+                e.type = static_cast<Effector::Type>(et);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("X")) {
+                removeIdx = ei;
+            }
+
+            if (e.enabled) {
+                ImGui::Indent(12.0f);
+
+                // Falloff field.
+                ImGui::SetNextItemWidth(110.0f);
+                int ef = static_cast<int>(e.falloff);
+                if (ImGui::Combo("falloff", &ef, effFalloffs, 3)) {
+                    e.falloff = static_cast<Effector::Falloff>(ef);
+                }
+                if (e.falloff != Effector::Falloff::None) {
+                    ImGui::DragFloat3("center", &e.falloffCenter[0],
+                                      0.05f, -50.0f, 50.0f);
+                    ImGui::SliderFloat("radius (m)", &e.falloffRadius,
+                                       0.1f, 30.0f);
+                } else {
+                    ImGui::TextDisabled("(full strength everywhere)");
+                }
+
+                // Per-channel offsets.
+                ImGui::DragFloat3("pos offset (m)", &e.posOffset[0],
+                                  0.02f, -10.0f, 10.0f);
+                ImGui::SliderFloat("intensity off", &e.intensityOffset,
+                                   -20.0f, 20.0f);
+                ImGui::DragFloat3("color offset", &e.colorOffset[0],
+                                  0.01f, -1.0f, 1.0f);
+                ImGui::SliderFloat("cone off (deg)", &e.coneOffset,
+                                   -45.0f, 45.0f);
+
+                if (e.type == Effector::Type::Sine) {
+                    ImGui::SliderFloat("freq (Hz)", &e.freqHz, 0.0f, 4.0f);
+                    ImGui::SliderFloat("phase",     &e.phase,  0.0f, 1.0f);
+                    ImGui::SliderFloat("spread",    &e.spread, 0.0f, 1.0f);
+                }
+
+                ImGui::Unindent(12.0f);
+            }
+            ImGui::PopID();
+        }
+        if (removeIdx >= 0) {
+            effectors.erase(effectors.begin() + removeIdx);
         }
     }
 

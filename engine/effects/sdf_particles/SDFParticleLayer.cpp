@@ -380,10 +380,12 @@ void SDFParticleLayer::packUniforms(const RenderContext& ctx)
     // Apply modulator-bank bindings on top of operator-set values.
     float curlAmp  = curlAmplitude;
     float sdfStren = sdfStrength;
+    float vortStren = vortexStrength;
     if (ctx.scene) {
         const ModulatorBank* mods = &ctx.scene->modulators;
-        curlAmp  += mods->eval(curlAmpModSlot,     now) * curlAmpModDepth;
-        sdfStren += mods->eval(sdfStrengthModSlot, now) * sdfStrengthModDepth;
+        curlAmp   += mods->eval(curlAmpModSlot,        now) * curlAmpModDepth;
+        sdfStren  += mods->eval(sdfStrengthModSlot,    now) * sdfStrengthModDepth;
+        vortStren += mods->eval(vortexStrengthModSlot, now) * vortexStrengthModDepth;
     }
 
     u_.projection      = ctx.projection;
@@ -418,7 +420,22 @@ void SDFParticleLayer::packUniforms(const RenderContext& ctx)
     u_.alphaCurve      = alphaCurve;
     u_.pointOriginTriCount = glm::vec4(pointOrigin, (float)triCount_);
     u_.misc            = glm::vec4(triTotalArea_, (float)ctx.frameIndex,
-                                     0.0f, 0.0f);
+                                     surfaceCrawl    ? 1.0f : 0.0f,
+                                     collisionEnable ? 1.0f : 0.0f);
+
+    // ---- Affectors ----
+    u_.colorMid        = colorMid;
+    u_.sizeCurve       = sizeCurve;
+    u_.collision       = glm::vec4(skinOffset, restitution, tangentDrag,
+                                     vortexEnable ? 1.0f : 0.0f);
+
+    glm::vec3 vAxis = vortexAxis;
+    float axisLen = glm::length(vAxis);
+    vAxis = (axisLen > 1e-5f) ? (vAxis / axisLen) : glm::vec3(0.0f, 1.0f, 0.0f);
+    u_.vortexAxisStr   = glm::vec4(vAxis, vortStren);
+
+    glm::vec3 vCenter = vortexUseBBoxCenter ? c : vortexCenter;
+    u_.vortexCenterRadius = glm::vec4(vCenter, std::max(0.01f, vortexRadius));
 }
 
 // ---------------------------------------------------------------------------
@@ -588,14 +605,58 @@ void SDFParticleLayer::drawInspector()
         ImGui::SliderFloat("Mod depth##sm", &sdfStrengthModDepth, 0.0f, 5.0f);
     }
 
-    if (ImGui::CollapsingHeader("Color",
+    if (ImGui::CollapsingHeader("Surface crawl & collision",
                                  ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::ColorEdit4("Start##p", &colorStart[0],
-            ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_Float);
-        ImGui::ColorEdit4("End##p", &colorEnd[0],
-            ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_Float);
+        ImGui::Checkbox("Surface crawl (tangent curl)##p", &surfaceCrawl);
+        ImGui::TextDisabled("Projects curl onto the SDF tangent plane so");
+        ImGui::TextDisabled("energy crawls ON the structure, not into air.");
+        ImGui::Separator();
+        ImGui::Checkbox("SDF collision hug##p", &collisionEnable);
+        if (collisionEnable) {
+            ImGui::SliderFloat("Skin offset (m)##p", &skinOffset,
+                                 0.0f, 0.5f, "%.3f");
+            ImGui::SliderFloat("Restitution##p", &restitution,
+                                 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Tangent drag (/s)##p", &tangentDrag,
+                                 0.0f, 10.0f, "%.2f");
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Vortex affector")) {
+        ImGui::Checkbox("Enable##vx", &vortexEnable);
+        if (vortexEnable) {
+            ImGui::DragFloat3("Axis##vx", &vortexAxis[0], 0.01f);
+            ImGui::SliderFloat("Strength (rad/s)##vx", &vortexStrength,
+                                 -10.0f, 10.0f, "%.2f");
+            ImGui::SliderFloat("Radius (m)##vx", &vortexRadius,
+                                 0.05f, 10.0f, "%.2f");
+            ImGui::Checkbox("Center on bbox##vx", &vortexUseBBoxCenter);
+            if (!vortexUseBBoxCenter) {
+                ImGui::DragFloat3("Center##vx", &vortexCenter[0], 0.05f);
+            }
+            ImGui::SetNextItemWidth(90.0f);
+            ImGui::Combo("##vxmod", &vortexStrengthModSlot, kModNames, 9);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderFloat("Mod depth##vxm", &vortexStrengthModDepth,
+                                 0.0f, 10.0f);
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Color (3-stop HDR life ramp)",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        // RGB > 1 is intentional (feeds downstream Bloom). HDR flag lifts
+        // the ColorEdit clamp so operators can push energy past 1.0.
+        const ImGuiColorEditFlags kHdr =
+            ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_Float |
+            ImGuiColorEditFlags_HDR;
+        ImGui::ColorEdit4("Start (t=0)##p",  &colorStart[0], kHdr);
+        ImGui::ColorEdit4("Mid (t=0.5)##p",  &colorMid[0],   kHdr);
+        ImGui::ColorEdit4("End (t=1)##p",    &colorEnd[0],   kHdr);
         ImGui::TextDisabled("Alpha curve (4 pts, t=0 .. t=1):");
         ImGui::SliderFloat4("##ac", &alphaCurve[0], 0.0f, 1.0f, "%.2f");
+        ImGui::TextDisabled("Size-over-life curve (4 pts, ×size):");
+        ImGui::SliderFloat4("##sc", &sizeCurve[0], 0.0f, 3.0f, "%.2f");
     }
 
     if (ImGui::CollapsingHeader("Render",

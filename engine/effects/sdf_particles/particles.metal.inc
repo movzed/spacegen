@@ -42,11 +42,16 @@ struct ParticleUniforms {
     float4   bboxCenterLife;     // .xyz bbox center, .w lifetime base
     float4   bboxExtentSize;     // .xyz bbox half-extent, .w pointSizePx
     float4   viewportMode;       // .xy viewport, .z trailLen, .w emitterType
-    float4   colorStart;
-    float4   colorEnd;
+    float4   colorStart;         // 3-stop ramp, t=0 (HDR allowed)
+    float4   colorEnd;           // 3-stop ramp, t=1
     float4   alphaCurve;         // 4 control points
     float4   pointOriginTriCount;// .xyz pointOrigin, .w triCount
-    float4   misc;               // .x triTotalArea, .y frameIndex
+    float4   misc;               // .x triTotalArea, .y frameIndex, .z surfaceCrawl, .w collisionEnable
+    float4   colorMid;           // 3-stop ramp, t=0.5 (HDR allowed)
+    float4   sizeCurve;          // 4 control points, size-over-life multiplier
+    float4   collision;          // .x skinOffset, .y restitution, .z tangentDrag, .w vortexEnable
+    float4   vortexAxisStr;      // .xyz axis (unit), .w strength
+    float4   vortexCenterRadius; // .xyz center, .w radius
 };
 
 // Trail ring: per particle, [head, padX, padY, padZ] (uint+pad), then K float3.
@@ -326,22 +331,62 @@ kernel void update_particles(
     if (p.age >= p.lifetime) {
         p = respawn(rng, u, triCDF, triVerts);
     } else {
-        // Curl-noise contribution.
-        float3 vCurl = curl_noise(p.pos * u.noiseSdf.x, time) * u.noiseSdf.y;
-
-        // SDF gradient force.
         float3 bbC = u.bboxCenterLife.xyz;
         float3 bbE = u.bboxExtentSize.xyz;
+
+        // Surface normal (outward SDF gradient) — reused by crawl + collision.
+        float3 n = sdfGradBox(p.pos, bbC, bbE);
+
+        // --- Curl-noise contribution (Bridson 2007) ---
+        float3 vCurl = curl_noise(p.pos * u.noiseSdf.x, time) * u.noiseSdf.y;
+
+        // Surface-crawl: project the curl velocity onto the SDF tangent
+        // plane so energy crawls ALONG the structure, not off into empty
+        // air. (misc.z = surfaceCrawl flag.)
+        if (u.misc.z > 0.5) {
+            vCurl -= dot(vCurl, n) * n;
+        }
+
+        // --- SDF gradient force (attract toward / repel from surface) ---
         float  d   = sdBox(p.pos, bbC, bbE);
-        float3 g   = sdfGradBox(p.pos, bbC, bbE);
         float  fall = exp(-(d * d) / (u.noiseSdf.w * u.noiseSdf.w + 1e-6));
-        float3 vSdf = -u.noiseSdf.z * fall * g;
+        float3 vSdf = -u.noiseSdf.z * fall * n;
+
+        // --- Vortex affector (swirl around axis a through center o) ---
+        float3 vVort = float3(0.0);
+        if (u.collision.w > 0.5) {
+            float3 a  = normalize(u.vortexAxisStr.xyz + 1e-6);
+            float3 o  = u.vortexCenterRadius.xyz;
+            float  k  = u.vortexAxisStr.w;
+            float  R  = max(u.vortexCenterRadius.w, 1e-3);
+            float3 r  = p.pos - o;
+            float3 rp = r - dot(r, a) * a;          // perpendicular component
+            float  ftap = max(0.0, 1.0 - length(rp) / R);
+            vVort = cross(a, rp) * k * ftap;
+        }
 
         // Integrate.
-        p.vel += (vCurl + vSdf) * dt;
+        p.vel += (vCurl + vSdf + vVort) * dt;
         p.vel *= max(0.0, 1.0 - dragRate * dt);
         p.pos += p.vel * dt;
         p.age += dt;
+
+        // --- SDF surface collision "hug" (misc.w = collisionEnable) ---
+        // Keep particles within skinOffset of the surface so energy paints
+        // the structure. Recompute distance/normal at the new position.
+        if (u.misc.w > 0.5) {
+            float  skin        = u.collision.x;
+            float  restitution = u.collision.y;
+            float  tanDrag     = u.collision.z;
+            float  dsurf = sdBox(p.pos, bbC, bbE);
+            if (dsurf < skin) {
+                float3 ng = sdfGradBox(p.pos, bbC, bbE);
+                p.pos += ng * (skin - dsurf);            // push out to skin
+                float vn = dot(p.vel, ng);
+                p.vel -= (1.0 + restitution) * min(vn, 0.0) * ng; // bounce inward only
+                p.vel *= max(0.0, 1.0 - tanDrag * dt);   // settle to a crawl
+            }
+        }
     }
     P[tid] = p;
 
@@ -376,6 +421,14 @@ static float sampleAlphaCurve(float t, float4 curve) {
     return mix(a, b, f);
 }
 
+// 3-stop life colour ramp: start (t=0) -> mid (t=0.5) -> end (t=1).
+// RGB may exceed 1.0 (HDR) so downstream Bloom catches the energy.
+static float4 sampleColorRamp(float t, constant ParticleUniforms& u) {
+    t = clamp(t, 0.0, 1.0);
+    if (t < 0.5) return mix(u.colorStart, u.colorMid, t * 2.0);
+    return mix(u.colorMid, u.colorEnd, (t - 0.5) * 2.0);
+}
+
 vertex SpriteVSOut vs_sprite(
     device const Particle*       P  [[buffer(0)]],
     constant ParticleUniforms&   u  [[buffer(1)]],
@@ -397,13 +450,14 @@ vertex SpriteVSOut vs_sprite(
     float4 clip = u.projection * u.view * float4(p.pos, 1.0);
     o.position  = clip;
 
-    float4 c = mix(u.colorStart, u.colorEnd, t);
+    float4 c = sampleColorRamp(t, u);              // HDR 3-stop ramp
     c.a *= sampleAlphaCurve(t, u.alphaCurve);
     o.color     = c;
 
-    // Slight perspective scaling so distant particles shrink.
+    // Perspective scaling × size-over-life curve.
     float distScale = max(0.2, 1.0 / max(clip.w, 0.1));
-    o.pointSize = max(1.0, u.bboxExtentSize.w * distScale);
+    float sizeMul   = sampleAlphaCurve(t, u.sizeCurve);  // reuse 4-pt sampler
+    o.pointSize = max(1.0, u.bboxExtentSize.w * distScale * sizeMul);
     return o;
 }
 
@@ -458,7 +512,7 @@ vertex TrailVSOut vs_trail(
 
     float ageT = clamp(p.age / max(p.lifetime, 1e-3), 0.0, 1.0);
     float taper = 1.0 - float(vid) / float(max(K - 1u, 1u));   // 1 at head -> 0 at tail
-    float4 c = mix(u.colorStart, u.colorEnd, ageT);
+    float4 c = sampleColorRamp(ageT, u);            // HDR 3-stop ramp
     c.a *= sampleAlphaCurve(ageT, u.alphaCurve) * taper;
     o.color = c;
     return o;

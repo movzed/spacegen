@@ -86,14 +86,22 @@ public:
     // Velocity damping (per second). 0 = no drag, 1 = halve every second.
     float drag          = 0.10f;
 
-    // Per-particle color over age. Color is `mix(start, end, age/life)`.
+    // Per-particle color over a 3-stop life ramp:
+    //   t<0.5 : mix(colorStart, colorMid, t*2)
+    //   t>=0.5: mix(colorMid,   colorEnd, (t-0.5)*2)
+    // RGB may exceed 1.0 (HDR) so the downstream Bloom catches the energy.
     // Alpha is multiplied by the alpha-curve sample at age/life.
-    glm::vec4 colorStart = glm::vec4(0.9f, 0.7f, 0.3f, 1.0f); // warm
-    glm::vec4 colorEnd   = glm::vec4(0.2f, 0.4f, 1.0f, 0.0f); // cool / fade
+    glm::vec4 colorStart = glm::vec4(2.4f, 1.3f, 0.4f, 1.0f); // hot HDR amber
+    glm::vec4 colorMid   = glm::vec4(1.1f, 0.5f, 1.4f, 1.0f); // magenta core
+    glm::vec4 colorEnd   = glm::vec4(0.15f, 0.35f, 1.2f, 0.0f); // cool / fade
 
     // Sampled alpha curve (4 points = ease-out by default). Linear-interp
     // in shader. Domain: x = age/life ∈ [0,1]. Range: y = alpha multiplier.
     glm::vec4 alphaCurve = glm::vec4(1.0f, 0.95f, 0.55f, 0.0f);
+
+    // Sampled size-over-life curve (4 points, multiplies pointSizePx /
+    // trail width). Domain t = age/life. Default = quick bloom then taper.
+    glm::vec4 sizeCurve  = glm::vec4(0.4f, 1.0f, 0.8f, 0.15f);
 
     // Trail length: 1 = point sprites, 2..32 = ribbon-line trails.
     int   trailLength    = 1;
@@ -105,11 +113,44 @@ public:
     EmitterType emitter      = EmitterType::Surface;
     glm::vec3   pointOrigin  = glm::vec3(0.0f, 0.0f, 0.0f); // for Point mode
 
+    // ---- Affectors (Notch-style) ----------------------------------------
+    // Projection-mapping rule: particles must read as crawling ON or within
+    // ~5 cm of the physical structure surface, never a free cloud drifting
+    // into empty air. Surface-crawl is ON by default; keep curl short-
+    // wavelength (high scale, modest amplitude); bias the SDF force to
+    // attract so escapees snap back.
+
+    // Surface-crawl: project the curl-noise velocity onto the SDF tangent
+    // plane (remove the surface-normal component) so energy crawls ALONG
+    // the structure instead of lifting off it. DEFAULT ON.
+    bool  surfaceCrawl   = true;
+
+    // SDF collision "hug": keep particles within skinOffset of the surface.
+    bool  collisionEnable = true;
+    // Skin band thickness (m). Particles closer than this are pushed out to
+    // exactly skinOffset; ~5 cm reads as "painting" the structure.
+    float skinOffset     = 0.05f;
+    // Bounce on inward velocity at the skin. 0 = stick, 1 = perfect bounce.
+    float restitution    = 0.10f;
+    // Tangential drag applied while hugging (per second) — bleeds speed so
+    // particles settle and crawl rather than skating off.
+    float tangentDrag    = 2.0f;
+
+    // Vortex affector: swirl around an axis through a center, within radius.
+    bool      vortexEnable   = false;
+    glm::vec3 vortexAxis     = glm::vec3(0.0f, 1.0f, 0.0f); // normalized at pack
+    glm::vec3 vortexCenter   = glm::vec3(0.0f, 0.0f, 0.0f); // 0 => bbox center
+    bool      vortexUseBBoxCenter = true;
+    float     vortexStrength = 2.0f;                        // rad/s scale
+    float     vortexRadius   = 2.0f;                        // m falloff
+
     // ---- ModulatorBank bindings (LFO/audio-reactive plumbing) ----
     int   curlAmpModSlot      = 0;
     float curlAmpModDepth     = 1.0f;
     int   sdfStrengthModSlot  = 0;
     float sdfStrengthModDepth = 1.0f;
+    int   vortexStrengthModSlot  = 0;
+    float vortexStrengthModDepth = 1.0f;
 
 private:
     // -------- GPU resources --------
@@ -153,16 +194,26 @@ private:
         glm::vec4 bboxExtentSize;
         // .xy = viewport size (px), .z = trailLength, .w = emitterType
         glm::vec4 viewportMode;
-        // .rgba colorStart
+        // .rgba colorStart (3-stop ramp, t=0)
         glm::vec4 colorStart;
-        // .rgba colorEnd
+        // .rgba colorEnd (3-stop ramp, t=1)
         glm::vec4 colorEnd;
         // 4 alpha curve points (linear-interp domain 0..1)
         glm::vec4 alphaCurve;
         // .xyz pointOrigin, .w triCount
         glm::vec4 pointOriginTriCount;
-        // .x triTotalArea, .y frameIndex, .z unused, .w unused
+        // .x triTotalArea, .y frameIndex, .z surfaceCrawl(0/1), .w collisionEnable(0/1)
         glm::vec4 misc;
+        // .rgba colorMid (3-stop ramp, t=0.5)
+        glm::vec4 colorMid;
+        // 4 size-over-life curve points (linear-interp domain 0..1)
+        glm::vec4 sizeCurve;
+        // .x skinOffset, .y restitution, .z tangentDrag, .w vortexEnable(0/1)
+        glm::vec4 collision;
+        // .xyz vortex axis (unit), .w vortex strength (post-modulator)
+        glm::vec4 vortexAxisStr;
+        // .xyz vortex center, .w vortex radius
+        glm::vec4 vortexCenterRadius;
     } u_;
     static_assert(sizeof(Uniforms) % 16 == 0, "Uniforms must be 16-byte aligned");
 
