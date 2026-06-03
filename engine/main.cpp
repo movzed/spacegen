@@ -187,15 +187,20 @@ int main(int argc, char** argv) {
     std::printf("[SpaceGen] Renderer: %zu meshes, %zu triangles total on GPU\n",
                  renderer->meshCount(), renderer->totalTriangles());
 
-    // Populate the bus with the default starter layers. Everything except
-    // Structure starts disabled so the operator sees a dark stage and adds
-    // light explicitly — no implicit gray fill on the relief.
+    // Populate the bus with the default starter layers.
+    //
+    // Lighting model (operator feedback): the bright follow-spot used to
+    // wash out surface effects, so it's DISABLED by default. A gentle
+    // Ambient fill stays on so the bare structure is faintly visible while
+    // self-illuminated material effects (procedural, outline glow) read on
+    // their own light. Shape effects (deform/fracture) run before lighting
+    // and the lights respond to the modified mesh (see fs_main normals).
     scene.bus.add<spacegen::StructureLayer>();
     {
         auto* a = scene.bus.add<spacegen::AmbientLightLayer>();
         a->name      = "Ambient";
-        a->intensity = 0.02f;
-        a->state     = spacegen::LayerState::Disabled;
+        a->intensity = 0.15f;     // gentle fill — structure visible, no wash-out
+        a->state     = spacegen::LayerState::Enabled;
     }
     {
         auto* d = scene.bus.add<spacegen::DirectionalLightLayer>();
@@ -215,6 +220,7 @@ int main(int argc, char** argv) {
         b->intensity    = 4.0f;
         b->innerDeg     = 12.0f;
         b->outerDeg     = 22.0f;
+        b->state        = spacegen::LayerState::Disabled;  // off by default
     }
     // Post-FX (Bloom, MotionBlur, CA, Glitch) are NOT auto-added — the
     // operator adds them from the Post-FX panel when wanted. The default

@@ -1336,13 +1336,13 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
 
     float3 colorLin = ambient * baseColor + totalLight;
 
-    // Procedural emissive floor: blend a fraction of the (unlit) procedural
-    // colour back in so the texture is readable even on an unlit stage.
-    // Without this, procedural is pure albedo × lighting and vanishes when
-    // no light layers are enabled (the default scene). 35% reads clearly
-    // while still letting 65% respond to the lighting.
+    // Material effects are SELF-ILLUMINATED ("luz propia"): the procedural
+    // colour shows on its own light, independent of stage lights, so adding
+    // a texture is visible on a dark stage. 80% pure emissive + 20% lit so
+    // it still picks up a little shading for depth. (Shape effects —
+    // deform/fracture — stay lit by the lights via the recomputed normals.)
     if (procMix > 1e-3) {
-        colorLin = mix(colorLin, procColSaved, 0.35 * procMix);
+        colorLin = mix(colorLin, procColSaved, 0.80 * procMix);
     }
 
     // ---- HologramMaterialLayer: full configurable sub-effects ----
