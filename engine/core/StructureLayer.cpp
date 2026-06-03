@@ -33,6 +33,7 @@ void StructureLayer::render(RenderContext& ctx) {
     std::vector<const AreaLightLayer*>        areas;
     const MeshDeformationLayer*               deformLayer = nullptr;
     const MeshFractureLayer*                  fracLayer   = nullptr;
+    const HologramMaterialLayer*              holoLayer   = nullptr;
     ProceduralMaterialUniforms                procUniforms{};
     bool                                      procPacked = false;
     glm::vec3 ambientColor(0.0f);
@@ -74,6 +75,10 @@ void StructureLayer::render(RenderContext& ctx) {
                 ar->update(ctx);
                 areas.push_back(ar);
             } else if (auto* h = dynamic_cast<const HologramMaterialLayer*>(l.get())) {
+                // Forward the first hologram layer; the renderer reads
+                // effectMask() + effectiveOpacity() and packs the full
+                // sub-effect param set. mask without HMASK_ENABLE → skip.
+                if (!holoLayer) holoLayer = h;
                 surfaceHoloOpacity = std::max(surfaceHoloOpacity, h->opacity);
             } else if (auto* p = dynamic_cast<const ProceduralMaterialLayer*>(l.get())) {
                 // Pack the full 10-pattern block (triplanar, palette,
@@ -140,7 +145,8 @@ void StructureLayer::render(RenderContext& ctx) {
                                           areas,
                                           deformLayer,
                                           procPacked ? &procUniforms : nullptr,
-                                          fracLayer);
+                                          fracLayer,
+                                          holoLayer);
 }
 
 void StructureLayer::drawInspector() {

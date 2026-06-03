@@ -11,6 +11,7 @@
 #include "../../effects/mesh_deformation/MeshDeformationLayer.h"
 #include "../../effects/procedural_material/ProceduralMaterialLayer.h"
 #include "../../effects/mesh_fracture/MeshFractureLayer.h"
+#include "../../effects/hologram/HologramMaterialLayer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -142,6 +143,17 @@ struct Uniforms {
     float4    fracExplode;          // .x shardDensity, .y jitter, .z spin, .w strength
     float4    fracMeshCenter;       // .xyz world mesh centroid, .w explodeCap(m)
     float4    fracGlitch;           // .x freq, .y magnitude, .z speed, .w dropout
+    // ---- HologramMaterialLayer (surface-valid sub-effects) ----
+    float4    holoMeta;             // .x mask(bits), .y opacity, .z time, .w pureReplace
+    float4    holoScan;             // .x freq, .y speed, .z intensity, .w harmonic
+    float4    holoFresnel;          // .rgb fresnel colour, .w power
+    float4    holoFresnel2;         // .x intensity, .y flickerRate, .z flickerProb, .w flickerDur
+    float4    holoFlickerCol;       // .rgb flicker colour, .w unused
+    float4    holoWire;             // .rgb wire colour, .w thickness
+    float4    holoWire2;            // .x sharpness, .y intensity, .z hueSpeed, .w hueOffset
+    float4    holoDissolve;         // .x axis, .y origin, .z speed, .w band
+    float4    holoDissolve2;        // .x noiseAmp, .yzw unused
+    float4    holoGlow;             // .rgb master glow colour, .w unused
     DirLight  dirs[MAX_DIRS];
     SpotLight spots[MAX_SPOTS];
     AreaLight areas[MAX_AREAS];
@@ -508,23 +520,125 @@ static float sfxVoronoi(float2 p, thread float2& cellCenter) {
     return sqrt(best);
 }
 
-// Hologram overlay — Fresnel rim + scanlines + hue shift. Output is the
-// final fragment colour after applying opacity-controlled blend over PBR.
+// Hologram mask bits (mirror HologramMaterialLayer::EffectMask).
+constant uint HMASK_ENABLE        = 1u << 0;
+constant uint HMASK_REPLACE       = 1u << 1;
+constant uint HMASK_SCAN          = 1u << 2;
+constant uint HMASK_SCAN_HARMONIC = 1u << 3;
+constant uint HMASK_FRESNEL       = 1u << 4;
+constant uint HMASK_FLICKER       = 1u << 5;
+constant uint HMASK_WIRE_DERIV    = 1u << 8;
+constant uint HMASK_HUE_SHIFT     = 1u << 10;
+constant uint HMASK_DISSOLVE      = 1u << 12;
+constant uint HMASK_DISSOLVE_NOISE= 1u << 13;
+
+static float holoHash11(float x) {
+    return fract(sin(x * 127.1) * 43758.5453);
+}
+
+// Luminance-preserving YIQ hue rotation (Graphics Gems).
+static float3 holoHueRot(float3 c, float angle) {
+    float cs = cos(angle), sn = sin(angle);
+    float3x3 m = float3x3(
+        float3(0.299 + 0.701 * cs + 0.168 * sn,
+               0.587 - 0.587 * cs + 0.330 * sn,
+               0.114 - 0.114 * cs - 0.497 * sn),
+        float3(0.299 - 0.299 * cs - 0.328 * sn,
+               0.587 + 0.413 * cs + 0.035 * sn,
+               0.114 - 0.114 * cs + 0.292 * sn),
+        float3(0.299 - 0.300 * cs + 1.250 * sn,
+               0.587 - 0.588 * cs - 1.050 * sn,
+               0.114 + 0.886 * cs - 0.203 * sn));
+    return m * c;
+}
+
+// Full hologram — configurable scan / fresnel / flicker / hue / wire /
+// dissolve. All world-space so the look stays locked to the physical
+// structure (projection-mapping invariant). Screen-space glitch bars +
+// chroma aberration intentionally live in the Post-FX Glitch / CA layers.
+static float3 sfxHologramFull(float3 baseLit, float3 N, float3 V,
+                               float3 worldPos, constant Uniforms& u) {
+    uint  mask = uint(u.holoMeta.x + 0.5);
+    if ((mask & HMASK_ENABLE) == 0u) return baseLit;
+    float opacity = u.holoMeta.y;
+    if (opacity < 1e-3) return baseLit;
+    float time = u.holoMeta.z;
+    float3 glow = u.holoGlow.rgb;
+
+    // Start from PBR (overlay) or a dark base (pure replace).
+    bool replace = u.holoMeta.w > 0.5;
+    float3 holo = replace ? float3(0.02) : baseLit;
+
+    // SCAN — animated world-space stripes (use the dominant world axis Z).
+    if ((mask & HMASK_SCAN) != 0u) {
+        float freq = u.holoScan.x, speed = u.holoScan.y, inten = u.holoScan.z;
+        float s = 0.5 + 0.5 * sin(worldPos.z * freq + time * speed * 6.2831);
+        if ((mask & HMASK_SCAN_HARMONIC) != 0u) {
+            s = mix(s, 0.5 + 0.5 * sin(worldPos.z * freq * 3.0
+                                        + time * speed * 12.566), 0.4);
+        }
+        holo *= (1.0 - inten) + inten * s;
+    }
+
+    // FRESNEL rim.
+    if ((mask & HMASK_FRESNEL) != 0u) {
+        float fres = pow(1.0 - max(dot(N, V), 0.0), max(u.holoFresnel.w, 0.1));
+        float3 rim = u.holoFresnel.rgb * glow * fres * u.holoFresnel2.x;
+        // FLICKER modulates the rim (time-bucketed random gate).
+        float fl = 1.0;
+        if ((mask & HMASK_FLICKER) != 0u) {
+            float bucket = floor(time * u.holoFresnel2.y);
+            float h = holoHash11(bucket);
+            float phase = fract(time * u.holoFresnel2.y);
+            fl = (h < u.holoFresnel2.z && phase < u.holoFresnel2.w) ? 0.2 : 1.0;
+        }
+        holo += rim * fl;
+    }
+
+    // WIRE — derivative-based edge lines on world position.
+    if ((mask & HMASK_WIRE_DERIV) != 0u) {
+        float3 d = fwidth(worldPos);
+        float3 g = abs(fract(worldPos) - 0.5);
+        float3 lines = smoothstep(d * u.holoWire.w,
+                                   float3(0.0), g);
+        float wire = max(max(lines.x, lines.y), lines.z);
+        wire = pow(wire, max(u.holoWire2.x, 0.1));
+        holo += u.holoWire.rgb * glow * wire * u.holoWire2.y;
+    }
+
+    // HUE shift.
+    if ((mask & HMASK_HUE_SHIFT) != 0u) {
+        holo = holoHueRot(holo, u.holoWire2.w + time * u.holoWire2.z);
+    }
+
+    // DISSOLVE — axis-swept reveal with soft leading edge + optional noise.
+    float reveal = 1.0;
+    if ((mask & HMASK_DISSOLVE) != 0u) {
+        int axis = int(u.holoDissolve.x + 0.5);
+        float coord = (axis == 0) ? worldPos.x
+                    : (axis == 1) ? worldPos.y : worldPos.z;
+        float lead = u.holoDissolve.y + u.holoDissolve.z * time;
+        float band = max(u.holoDissolve.w, 1e-3);
+        float n = ((mask & HMASK_DISSOLVE_NOISE) != 0u)
+                ? (sfxValueNoise(worldPos.xy * 3.0) - 0.5) * u.holoDissolve2.x
+                : 0.0;
+        reveal = smoothstep(lead + band, lead - band, coord + n);
+    }
+
+    float3 outc = mix(baseLit, holo, opacity);
+    return mix(baseLit, outc, reveal);
+}
+
+// (legacy MVP overlay kept for reference / fallback)
 static float3 sfxHologramOverlay(float3 baseLit, float3 N, float3 V,
                                   float3 worldPos, float opacity,
                                   float time) {
     if (opacity < 1e-3) return baseLit;
-    // Fresnel rim (1 - N·V)^k.
     float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     float3 rimCol = float3(0.20, 0.85, 1.00) * fres * 2.5;
-    // Scanlines: horizontal stripes on screen-Y, animated. We use
-    // worldPos.z as a proxy here (screen Y not available without an
-    // extra varying — would be cleaner but overkill for MVP).
     float scan = 0.5 + 0.5 * sin(worldPos.z * 80.0 + time * 4.0);
     float3 scanCol = baseLit * (0.7 + 0.3 * scan);
-    // Combine.
-    float3 holo = scanCol + rimCol;
-    return mix(baseLit, holo, opacity);
+    return mix(baseLit, scanCol + rimCol, opacity);
 }
 
 // Procedural material — voronoi-cell colour replacement. Strength `mix01`
@@ -1151,10 +1265,8 @@ fragment float4 fs_main(VertexOut in [[stage_in]],
 
     float3 colorLin = ambient * baseColor + totalLight;
 
-    // ---- HologramMaterialLayer MVP splice (overlay) ----
-    colorLin = sfxHologramOverlay(colorLin, N, V, in.worldPos,
-                                    u.surfaceFx.x,
-                                    u.surfaceFxParams.w);
+    // ---- HologramMaterialLayer: full configurable sub-effects ----
+    colorLin = sfxHologramFull(colorLin, N, V, in.worldPos, u);
 
     // ---- Fracture crack glow (additive on top of lit colour) ----
     colorLin += fractureTint;
@@ -1225,6 +1337,16 @@ struct Uniforms {
     glm::vec4 fracExplode;       // shardDensity, jitter, spin, strength
     glm::vec4 fracMeshCenter;    // centroid.xyz, explodeCap(m)
     glm::vec4 fracGlitch;        // freq, magnitude, speed, dropout
+    glm::vec4 holoMeta;          // mask, opacity, time, pureReplace
+    glm::vec4 holoScan;          // freq, speed, intensity, harmonic
+    glm::vec4 holoFresnel;       // color.rgb, power
+    glm::vec4 holoFresnel2;      // intensity, flickerRate, flickerProb, flickerDur
+    glm::vec4 holoFlickerCol;    // flickerColor.rgb
+    glm::vec4 holoWire;          // wireColor.rgb, thickness
+    glm::vec4 holoWire2;         // sharpness, intensity, hueSpeed, hueOffset
+    glm::vec4 holoDissolve;      // axis, origin, speed, band
+    glm::vec4 holoDissolve2;     // noiseAmp
+    glm::vec4 holoGlow;          // masterGlowColor.rgb
     GpuDir    dirs[kMaxDirs];
     GpuSpot   spots[kMaxSpots];
     GpuArea   areas[kMaxAreas];
@@ -1604,7 +1726,8 @@ void MetalRenderer::renderStructureMeshes(
     const std::vector<const AreaLightLayer*>& areas,
     const MeshDeformationLayer* deformLayer,
     const ProceduralMaterialUniforms* procMat,
-    const MeshFractureLayer* fracLayer)
+    const MeshFractureLayer* fracLayer,
+    const HologramMaterialLayer* holoLayer)
 {
     if (!ctx.cmdBuf || !ctx.colorTarget) return;
     onResize(static_cast<int>(ctx.colorTarget->width()),
@@ -1789,6 +1912,46 @@ void MetalRenderer::renderStructureMeshes(
         }
     }
 
+    // Pack hologram params once. holoMeta.x (mask) == 0 → shader skip.
+    glm::vec4 holoMeta(0.0f), holoScan(0.0f), holoFresnel(0.0f);
+    glm::vec4 holoFresnel2(0.0f), holoFlickerCol(0.0f), holoWire(0.0f);
+    glm::vec4 holoWire2(0.0f), holoDissolve(0.0f), holoDissolve2(0.0f);
+    glm::vec4 holoGlow(0.0f);
+    if (holoLayer) {
+        const ModulatorBank* hmods = ctx.scene ? &ctx.scene->modulators
+                                               : nullptr;
+        uint32_t mask = holoLayer->effectMask();
+        float    op   = holoLayer->effectiveOpacity(t, hmods);
+        if ((mask & HologramMaterialLayer::HMASK_ENABLE) && op > 1e-3f) {
+            holoMeta = glm::vec4(static_cast<float>(mask), op,
+                                  static_cast<float>(t),
+                                  holoLayer->pureReplace ? 1.0f : 0.0f);
+            holoScan = glm::vec4(holoLayer->scanFreq, holoLayer->scanSpeed,
+                                  holoLayer->scanIntensity,
+                                  holoLayer->scanHarmonic ? 1.0f : 0.0f);
+            holoFresnel  = glm::vec4(holoLayer->fresnelColor,
+                                      holoLayer->fresnelPower);
+            holoFresnel2 = glm::vec4(holoLayer->fresnelIntensity,
+                                      holoLayer->flickerRate,
+                                      holoLayer->flickerProb,
+                                      holoLayer->flickerDuration);
+            holoFlickerCol = glm::vec4(holoLayer->flickerColor, 0.0f);
+            holoWire  = glm::vec4(holoLayer->wireColor,
+                                   holoLayer->wireThickness);
+            holoWire2 = glm::vec4(holoLayer->wireSharpness,
+                                   holoLayer->wireIntensity,
+                                   holoLayer->hueSpeed,
+                                   holoLayer->hueOffset);
+            holoDissolve  = glm::vec4(static_cast<float>(holoLayer->dissolveAxis),
+                                       holoLayer->dissolveOrigin,
+                                       holoLayer->dissolveSpeed,
+                                       holoLayer->dissolveBand);
+            holoDissolve2 = glm::vec4(holoLayer->dissolveNoiseAmp,
+                                       0.0f, 0.0f, 0.0f);
+            holoGlow = glm::vec4(holoLayer->masterGlowColor, 0.0f);
+        }
+    }
+
     for (const auto& gm : gpuMeshes_) {
         // Resolve the material for this mesh (or the default).
         const GpuMaterial& mat =
@@ -1867,6 +2030,17 @@ void MetalRenderer::renderStructureMeshes(
         u.fracExplode       = fracExplode;
         u.fracMeshCenter    = fracMeshCenter;
         u.fracGlitch        = fracGlitch;
+        // Hologram params (holoMeta.x == 0 → shader skip).
+        u.holoMeta          = holoMeta;
+        u.holoScan          = holoScan;
+        u.holoFresnel       = holoFresnel;
+        u.holoFresnel2      = holoFresnel2;
+        u.holoFlickerCol    = holoFlickerCol;
+        u.holoWire          = holoWire;
+        u.holoWire2         = holoWire2;
+        u.holoDissolve      = holoDissolve;
+        u.holoDissolve2     = holoDissolve2;
+        u.holoGlow          = holoGlow;
         std::memcpy(u.dirs,  dirsPacked,  sizeof(GpuDir)  * kMaxDirs);
         std::memcpy(u.spots, spotsPacked, sizeof(GpuSpot) * kMaxSpots);
         std::memcpy(u.areas, areasPacked, sizeof(GpuArea) * kMaxAreas);

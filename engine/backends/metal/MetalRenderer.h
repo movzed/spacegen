@@ -22,6 +22,7 @@ class  DirectionalLightLayer;
 class  AreaLightLayer;
 class  MeshDeformationLayer;
 class  MeshFractureLayer;
+class  HologramMaterialLayer;
 struct ProceduralMaterialUniforms;
 
 // M3-B: layer-driven Metal backend.
@@ -91,7 +92,10 @@ public:
         const ProceduralMaterialUniforms* procMat = nullptr,
         // MeshFractureLayer (4 modes). When non-null with mode != 0 the
         // renderer evaluates effectiveAmount() and packs the per-mode params.
-        const MeshFractureLayer* fracLayer = nullptr);
+        const MeshFractureLayer* fracLayer = nullptr,
+        // HologramMaterialLayer. When non-null with the master bit set the
+        // renderer packs its sub-effect params for the fragment overlay.
+        const HologramMaterialLayer* holoLayer = nullptr);
 
     // Hot-swap the GPU buffers for one mesh in-place. Used by the UV
     // Analysis panel to apply a freshly generated atlas without restart.
