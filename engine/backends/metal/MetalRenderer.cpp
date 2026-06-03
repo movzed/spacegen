@@ -268,9 +268,11 @@ static float3 sfxProceduralBase(float3 baseColor, float3 worldPos,
 }
 
 // Fracture — emit thin crack lines and (at higher amounts) discard cells.
-// `amount` 0..1 ramps the visibility. The discard kicks in above 0.6 so
-// the operator gets a "cracks appearing then breaking apart" feel as the
-// modulator rises.
+// `amount` is already scaled by StructureLayer (opacity * 0.5) so the
+// inspector slider 0..1 lands here as 0..0.5 → cracks only, no discard.
+// The whole-cell discard tier kicks in above 0.8 — operator has to
+// intentionally amplify (via modulator bank or layer stacking) to start
+// shattering pieces of the structure.
 static bool sfxFractureDiscardOrTint(float3 worldPos, float amount,
                                       float seed,
                                       thread float3& tintOut) {
@@ -279,9 +281,10 @@ static bool sfxFractureDiscardOrTint(float3 worldPos, float amount,
     float d = sfxVoronoi(worldPos.xy * 1.5 + seed, cell);
     float crackBand = 1.0 - smoothstep(0.0, 0.05, d);
     tintOut = float3(1.0, 0.35, 0.10) * crackBand * amount * 2.0;
-    // Hard discard for whole cells when amount > 0.6, based on cell hash.
+    // Hard discard for whole cells only above 0.8. Below that, just cracks.
+    if (amount <= 0.8) return false;
     float cellAlive = sfxHash21(cell);
-    return (amount > 0.6) && (cellAlive < (amount - 0.6) * 2.5);
+    return cellAlive < (amount - 0.8) * 3.0;
 }
 
 fragment float4 fs_main(VertexOut in [[stage_in]],

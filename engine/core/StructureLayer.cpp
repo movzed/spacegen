@@ -69,8 +69,16 @@ void StructureLayer::render(RenderContext& ctx) {
                                                 d->opacity * 0.20f);
                 surfaceDeformScale  = 1.5f;
             } else if (auto* f = dynamic_cast<const MeshFractureLayer*>(l.get())) {
+                // Default opacity is 1.0 on every ILayer. If we passed
+                // that straight through, the shader's discard threshold
+                // (> 0.6) annihilated the structure as soon as the layer
+                // was added. Scale by 0.5 so opacity=1.0 produces visible
+                // cracks WITHOUT the discard tier — operator dials past
+                // ~1.2 (i.e. opacity 1 + masterAmount > 1) to start
+                // shattering whole cells, which they have to do
+                // intentionally.
                 surfaceFractureAmount = std::max(surfaceFractureAmount,
-                                                  f->opacity);
+                                                  f->opacity * 0.5f);
                 surfaceFractureSeed   = static_cast<float>(f->id) * 0.137f;
             } else if (auto* s = dynamic_cast<SyphonInputLayer*>(l.get())) {
                 if (!syphonTex) {
