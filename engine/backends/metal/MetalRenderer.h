@@ -81,6 +81,57 @@ public:
     size_t meshCount() const { return gpuMeshes_.size(); }
     size_t totalTriangles() const;
 
+    // ---- Helpers for the effect layers (added 2026-05 alongside the
+    //      11 agent-designed effects under engine/effects/). They expose
+    //      the bits of MetalRenderer state that those effects need
+    //      without making them friend-class everything. ----
+
+    // Post-FX ping-pong: returns a partner texture matching
+    // ctx.colorTarget (size + format) the effect can render into.
+    // Lazily allocated, reused across frames. After the effect renders
+    // into it, call swapPingPong(ctx) — ctx.colorTarget is reassigned
+    // to the new texture, so the next layer down the bus sees the
+    // post-FX result as its input.
+    MTL::Texture*      acquirePingPongTarget(RenderContext& ctx);
+    void               swapPingPong(RenderContext& ctx);
+    MTL::SamplerState* postFxSampler();
+
+    // Compute / particle effects need raw access to the underlying
+    // Metal device and the depth texture used by the structure pass.
+    // Returned as void* / MTL::Texture* so callers can include whatever
+    // subset of Metal-cpp headers they want.
+    void*              devicePublic()  const { return device_; }
+    MTL::Texture*      depthTexturePublic() const { return depthTex_; }
+
+    // ---- Volumetric beam render path (used by VolumetricBeamLayer).
+    //      Layout matches what the agent-designed VolumetricBeamLayer.cpp
+    //      packs at the call site (see engine/effects/volumetric_beams/).
+    //      The implementation in MetalRenderer.cpp is a stub by default —
+    //      the projection-mapping principle ("no light cones visible in
+    //      air, only the projection on the stage") makes this effect
+    //      DEFAULT-OFF in production. Enable + complete the raymarch in
+    //      MetalRenderer::renderVolumetricBeams when intentionally going
+    //      against the rule.
+    struct VolumetricSpotPacked {
+        glm::vec4 posIntensity;    // .xyz pos, .w intensity
+        glm::vec4 dirRange;        // .xyz dir (FROM light), .w range
+        glm::vec4 colorInner;      // .rgb color, .a innerCos
+        glm::vec4 outerMul;        // .x outerCos
+    };
+    struct VolumetricUniforms {
+        const VolumetricSpotPacked* spots          = nullptr;
+        int                         spotCount      = 0;
+        float                       density        = 0.0f;
+        float                       anisotropy     = 0.0f;
+        int                         sampleCount    = 32;
+        float                       jitterStrength = 0.5f;
+        glm::vec3                   tint           {1.0f};
+        bool                        beerLambert    = false;
+        float                       layerOpacity   = 1.0f;
+    };
+    void               renderVolumetricBeams(RenderContext& ctx,
+                                              const VolumetricUniforms& u);
+
 private:
     void buildPipeline();
     void releaseDepthTexture();

@@ -138,7 +138,13 @@ void VolumetricBeamLayer::render(RenderContext& ctx) {
     // INTEGRATION.md for the shape and rationale. The renderer owns the
     // depth texture and the (volumetric-specific) pipeline state.
     MetalRenderer::VolumetricUniforms vu{};
-    vu.spots         = packed;
+    // Layout-compatible cast: local PackedSpot has the same 4xvec4 shape
+    // as MetalRenderer::VolumetricSpotPacked. Keeping them as distinct
+    // types lets each side own its definition without a cross-header dep.
+    static_assert(sizeof(PackedSpot)
+                   == sizeof(MetalRenderer::VolumetricSpotPacked),
+                  "PackedSpot/VolumetricSpotPacked layout drift");
+    vu.spots = reinterpret_cast<const MetalRenderer::VolumetricSpotPacked*>(packed);
     vu.spotCount     = spotCount;
     vu.density       = density;
     vu.anisotropy    = std::clamp(anisotropy, -kAnisotropyClamp, kAnisotropyClamp);

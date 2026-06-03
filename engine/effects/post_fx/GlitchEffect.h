@@ -20,7 +20,8 @@
 // pattern is stable within a beat and re-rolls on the next downbeat. This
 // is the "snap to grid" behaviour VJs expect.
 
-#include "../../../core/Layer.h"
+#include "Layer.h"
+#include <Metal/Metal.hpp>
 
 namespace MTL {
 class RenderPipelineState;

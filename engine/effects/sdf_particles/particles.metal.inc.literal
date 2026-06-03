@@ -1,0 +1,475 @@
+R"PARTICLES_MSL(
+// particles.metal.inc — MSL source for SDFParticleLayer.
+//
+// Included by SDFParticleLayer.cpp as a raw C++ string (R"MSL(...)MSL"),
+// compiled at runtime via MTL::Device::newLibrary. Keep header struct
+// layouts in sync with Uniforms in SDFParticleLayer.h and Particle layout
+// in this file.
+//
+// Three entry points:
+//   - init_particles    (kernel)  — one-time seed of the buffer
+//   - update_particles  (kernel)  — per-frame advection + respawn + trail
+//   - vs_sprite/fs_sprite         — render as additive point sprites
+//   - vs_trail/fs_trail           — render as line-strip trails
+//
+// References:
+//   Bridson 2007 (curl noise), Quilez (sdBox, gradient via tetrahedra),
+//   Gustavson (simplex noise canonical port), Osada 2002 (area-weighted
+//   triangle sampling).
+
+#include <metal_stdlib>
+using namespace metal;
+
+// ============================================================
+// 1. Shared layouts
+// ============================================================
+
+// 32 B exactly — using packed_float3 (12 B, no padding) so the GPU layout
+// matches the CPU layout in SDFParticleLayer.cpp 1:1.
+struct Particle {
+    packed_float3 pos;       // 12
+    packed_float3 vel;       // 12
+    float         age;       //  4
+    float         lifetime;  //  4
+};   // = 32 B
+
+struct ParticleUniforms {
+    float4x4 projection;
+    float4x4 view;
+    float4   cameraWorldPos;     // .xyz = pos, .w = aspect
+
+    float4   timing;             // .x dt, .y t, .z drag, .w particleCount
+    float4   noiseSdf;           // .x curlScale, .y curlAmp, .z sdfStr, .w sdfRange
+    float4   bboxCenterLife;     // .xyz bbox center, .w lifetime base
+    float4   bboxExtentSize;     // .xyz bbox half-extent, .w pointSizePx
+    float4   viewportMode;       // .xy viewport, .z trailLen, .w emitterType
+    float4   colorStart;
+    float4   colorEnd;
+    float4   alphaCurve;         // 4 control points
+    float4   pointOriginTriCount;// .xyz pointOrigin, .w triCount
+    float4   misc;               // .x triTotalArea, .y frameIndex
+};
+
+// Trail ring: per particle, [head, padX, padY, padZ] (uint+pad), then K float3.
+// Strided as 1 float4 header + K float4 entries.
+struct TrailEntry {
+    float3 pos;
+    float  _pad;
+};
+
+// ============================================================
+// 2. Hashing + PRNG (Xorshift32)
+// ============================================================
+
+static uint xorshift32(thread uint& state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+static float rand01(thread uint& state) {
+    return float(xorshift32(state)) * (1.0 / 4294967296.0);
+}
+
+// ============================================================
+// 3. Simplex noise (Stefan Gustavson canonical port)
+// ============================================================
+// 3D simplex noise returning a scalar in approximately [-1, 1].
+// ~30 ALU per evaluation; suitable for 6 evals/particle for curl.
+
+static float3 mod289_v3(float3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+static float4 mod289_v4(float4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+static float4 permute(float4 x)   { return mod289_v4(((x * 34.0) + 1.0) * x); }
+static float4 taylorInvSqrt(float4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+static float snoise(float3 v) {
+    const float2  C = float2(1.0/6.0, 1.0/3.0);
+    const float4  D = float4(0.0, 0.5, 1.0, 2.0);
+
+    float3 i  = floor(v + dot(v, C.yyy));
+    float3 x0 = v   - i + dot(i, C.xxx);
+
+    float3 g = step(x0.yzx, x0.xyz);
+    float3 l = 1.0 - g;
+    float3 i1 = min(g.xyz, l.zxy);
+    float3 i2 = max(g.xyz, l.zxy);
+
+    float3 x1 = x0 - i1 + C.xxx;
+    float3 x2 = x0 - i2 + C.yyy;
+    float3 x3 = x0 - D.yyy;
+
+    i = mod289_v3(i);
+    float4 p = permute(permute(permute(
+                 i.z + float4(0.0, i1.z, i2.z, 1.0))
+               + i.y + float4(0.0, i1.y, i2.y, 1.0))
+               + i.x + float4(0.0, i1.x, i2.x, 1.0));
+
+    float  n_ = 0.142857142857;
+    float3 ns = n_ * D.wyz - D.xzx;
+
+    float4 j = p - 49.0 * floor(p * ns.z * ns.z);
+
+    float4 x_ = floor(j * ns.z);
+    float4 y_ = floor(j - 7.0 * x_);
+
+    float4 x = x_ * ns.x + ns.yyyy;
+    float4 y = y_ * ns.x + ns.yyyy;
+    float4 h = 1.0 - abs(x) - abs(y);
+
+    float4 b0 = float4(x.xy, y.xy);
+    float4 b1 = float4(x.zw, y.zw);
+
+    float4 s0 = floor(b0) * 2.0 + 1.0;
+    float4 s1 = floor(b1) * 2.0 + 1.0;
+    float4 sh = -step(h, float4(0.0));
+
+    float4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+    float4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+
+    float3 p0 = float3(a0.xy, h.x);
+    float3 p1 = float3(a0.zw, h.y);
+    float3 p2 = float3(a1.xy, h.z);
+    float3 p3 = float3(a1.zw, h.w);
+
+    float4 norm = taylorInvSqrt(float4(
+        dot(p0, p0), dot(p1, p1),
+        dot(p2, p2), dot(p3, p3)));
+    p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+
+    float4 m = max(0.6 - float4(
+        dot(x0, x0), dot(x1, x1),
+        dot(x2, x2), dot(x3, x3)), 0.0);
+    m = m * m;
+    return 42.0 * dot(m * m, float4(
+        dot(p0, x0), dot(p1, x1),
+        dot(p2, x2), dot(p3, x3)));
+}
+
+// ============================================================
+// 4. Curl noise (Bridson 2007)
+// ============================================================
+// curl(Ψ(x)) where Ψ is three decorrelated simplex noises.
+// Central differences with ε; outputs a divergence-free velocity field.
+
+static float3 curl_noise(float3 p, float t) {
+    const float eps = 0.01;
+    const float3 offY = float3(31.41, 17.71, 53.13);
+    const float3 offZ = float3(89.97, 71.55, 113.07);
+    const float  tau  = 0.07 * t;
+
+    // Ψ_x components
+    float n1 = snoise(float3(p.x,         p.y + eps, p.z) + tau);
+    float n2 = snoise(float3(p.x,         p.y - eps, p.z) + tau);
+    float a  = (n1 - n2) / (2.0 * eps);
+
+    float n3 = snoise(float3(p.x, p.y, p.z + eps) + tau);
+    float n4 = snoise(float3(p.x, p.y, p.z - eps) + tau);
+    float b  = (n3 - n4) / (2.0 * eps);
+
+    // Ψ_y components
+    float n5 = snoise(float3(p.x, p.y, p.z + eps) + offY + tau);
+    float n6 = snoise(float3(p.x, p.y, p.z - eps) + offY + tau);
+    float c  = (n5 - n6) / (2.0 * eps);
+
+    float n7 = snoise(float3(p.x + eps, p.y, p.z) + offY + tau);
+    float n8 = snoise(float3(p.x - eps, p.y, p.z) + offY + tau);
+    float d  = (n7 - n8) / (2.0 * eps);
+
+    // Ψ_z components
+    float n9  = snoise(float3(p.x + eps, p.y, p.z) + offZ + tau);
+    float n10 = snoise(float3(p.x - eps, p.y, p.z) + offZ + tau);
+    float e   = (n9 - n10) / (2.0 * eps);
+
+    float n11 = snoise(float3(p.x, p.y + eps, p.z) + offZ + tau);
+    float n12 = snoise(float3(p.x, p.y - eps, p.z) + offZ + tau);
+    float f   = (n11 - n12) / (2.0 * eps);
+
+    return float3(c - b, e - d, a - f);   // ∇ × Ψ
+}
+
+// ============================================================
+// 5. Box SDF + gradient (Quilez canon)
+// ============================================================
+
+static float sdBox(float3 p, float3 c, float3 half_extent) {
+    float3 q = abs(p - c) - half_extent;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+static float3 sdfGradBox(float3 p, float3 c, float3 half_extent) {
+    const float h = 0.005;
+    const float2 k = float2(1.0, -1.0);
+    float3 g = k.xyy * sdBox(p + k.xyy * h, c, half_extent)
+             + k.yyx * sdBox(p + k.yyx * h, c, half_extent)
+             + k.yxy * sdBox(p + k.yxy * h, c, half_extent)
+             + k.xxx * sdBox(p + k.xxx * h, c, half_extent);
+    float L = length(g);
+    return (L > 1e-6) ? g / L : float3(0.0, 0.0, 1.0);
+}
+
+// ============================================================
+// 6. Mesh surface sampling (area-weighted, binary search the CDF)
+// ============================================================
+// Osada 2002. Pre-built `triCDF` is a prefix sum of tri areas.
+
+static uint findTriBinSearch(device const float* triCDF,
+                              uint                count,
+                              float               u_scaled)
+{
+    uint lo = 0u, hi = count;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1;
+        if (triCDF[mid] < u_scaled) lo = mid + 1u;
+        else                         hi = mid;
+    }
+    return min(lo, count - 1u);
+}
+
+static float3 sampleBaryOnTri(thread uint& rng,
+                               device const packed_float3* triVerts,
+                               uint   triIdx)
+{
+    float r1 = rand01(rng);
+    float r2 = rand01(rng);
+    float s1 = sqrt(r1);
+    float a = 1.0 - s1, b = s1 * (1.0 - r2), c = s1 * r2;
+    float3 v0 = float3(triVerts[triIdx * 3u + 0u]);
+    float3 v1 = float3(triVerts[triIdx * 3u + 1u]);
+    float3 v2 = float3(triVerts[triIdx * 3u + 2u]);
+    return v0 * a + v1 * b + v2 * c;
+}
+
+// ============================================================
+// 7. Respawn logic
+// ============================================================
+static Particle respawn(thread uint& rng,
+                         constant ParticleUniforms& u,
+                         device const float*         triCDF,
+                         device const packed_float3* triVerts)
+{
+    Particle q;
+
+    int emitter = int(u.viewportMode.w + 0.5);
+    if (emitter == 0 && u.pointOriginTriCount.w > 0.5) {
+        // Surface
+        float r = rand01(rng) * u.misc.x;  // u.misc.x = totalArea
+        uint  k = findTriBinSearch(triCDF,
+                                    uint(u.pointOriginTriCount.w + 0.5), r);
+        q.pos = sampleBaryOnTri(rng, triVerts, k);
+    } else if (emitter == 1) {
+        // Volume
+        float3 c   = u.bboxCenterLife.xyz;
+        float3 e   = u.bboxExtentSize.xyz;
+        q.pos = c + float3(
+            (rand01(rng) * 2.0 - 1.0) * e.x,
+            (rand01(rng) * 2.0 - 1.0) * e.y,
+            (rand01(rng) * 2.0 - 1.0) * e.z);
+    } else {
+        // Point
+        q.pos = u.pointOriginTriCount.xyz;
+    }
+
+    // Small random initial kick — keeps particles from clumping at t=0.
+    float3 dir = normalize(float3(
+        rand01(rng) - 0.5, rand01(rng) - 0.5, rand01(rng) - 0.5) + 1e-6);
+    q.vel = dir * 0.05;
+
+    q.age      = 0.0;
+    q.lifetime = u.bboxCenterLife.w
+                 * (0.7 + 0.6 * rand01(rng));      // ±30% jitter
+    return q;
+}
+
+// ============================================================
+// 8. Init kernel — seed each slot once
+// ============================================================
+kernel void init_particles(
+    device Particle*                 P        [[buffer(0)]],
+    constant ParticleUniforms&       u        [[buffer(1)]],
+    device const float*              triCDF   [[buffer(2)]],
+    device const packed_float3*      triVerts [[buffer(3)]],
+    constant uint&                   seed     [[buffer(4)]],
+    uint                             tid      [[thread_position_in_grid]])
+{
+    uint count = uint(u.timing.w + 0.5);
+    if (tid >= count) return;
+    uint rng = tid * 1664525u + seed;
+    P[tid] = respawn(rng, u, triCDF, triVerts);
+    // Spread initial ages so particles don't all expire on the same frame.
+    P[tid].age = rand01(rng) * P[tid].lifetime;
+}
+
+// ============================================================
+// 9. Update kernel — per-frame advection
+// ============================================================
+kernel void update_particles(
+    device Particle*                 P         [[buffer(0)]],
+    constant ParticleUniforms&       u         [[buffer(1)]],
+    device const float*              triCDF    [[buffer(2)]],
+    device const packed_float3*      triVerts  [[buffer(3)]],
+    device TrailEntry*               trails    [[buffer(4)]],
+    device uint*                     trailHead [[buffer(5)]],
+    uint                             tid       [[thread_position_in_grid]])
+{
+    uint count = uint(u.timing.w + 0.5);
+    if (tid >= count) return;
+
+    float dt   = u.timing.x;
+    float time = u.timing.y;
+    float dragRate = u.timing.z;
+
+    uint rng = tid ^ (uint(u.misc.y) * 0x9E3779B9u + 0x12345678u);
+
+    Particle p = P[tid];
+
+    // Respawn dead particles.
+    if (p.age >= p.lifetime) {
+        p = respawn(rng, u, triCDF, triVerts);
+    } else {
+        // Curl-noise contribution.
+        float3 vCurl = curl_noise(p.pos * u.noiseSdf.x, time) * u.noiseSdf.y;
+
+        // SDF gradient force.
+        float3 bbC = u.bboxCenterLife.xyz;
+        float3 bbE = u.bboxExtentSize.xyz;
+        float  d   = sdBox(p.pos, bbC, bbE);
+        float3 g   = sdfGradBox(p.pos, bbC, bbE);
+        float  fall = exp(-(d * d) / (u.noiseSdf.w * u.noiseSdf.w + 1e-6));
+        float3 vSdf = -u.noiseSdf.z * fall * g;
+
+        // Integrate.
+        p.vel += (vCurl + vSdf) * dt;
+        p.vel *= max(0.0, 1.0 - dragRate * dt);
+        p.pos += p.vel * dt;
+        p.age += dt;
+    }
+    P[tid] = p;
+
+    // Trail update — push current pos at (head+1) % K, advance head.
+    int trailLen = int(u.viewportMode.z + 0.5);
+    if (trailLen > 1) {
+        uint K = uint(trailLen);
+        uint head = (trailHead[tid] + 1u) % K;
+        trails[tid * K + head] = (TrailEntry){ p.pos, 0.0 };
+        trailHead[tid] = head;
+    }
+}
+
+// ============================================================
+// 10. Render — point sprites (additive)
+// ============================================================
+
+struct SpriteVSOut {
+    float4 position [[position]];
+    float  pointSize [[point_size]];
+    float4 color;
+};
+
+static float sampleAlphaCurve(float t, float4 curve) {
+    // 4 control points uniformly spaced at t = 0, 1/3, 2/3, 1.
+    t = clamp(t, 0.0, 1.0);
+    float seg = t * 3.0;
+    int   i   = int(min(seg, 2.0));
+    float f   = seg - float(i);
+    float a = curve[i];
+    float b = curve[i + 1];
+    return mix(a, b, f);
+}
+
+vertex SpriteVSOut vs_sprite(
+    device const Particle*       P  [[buffer(0)]],
+    constant ParticleUniforms&   u  [[buffer(1)]],
+    uint                         vid [[vertex_id]])
+{
+    SpriteVSOut o;
+    Particle p = P[vid];
+
+    // Cull dead particles by collapsing to NDC (-2, -2) — outside clip range.
+    if (p.age >= p.lifetime || p.lifetime <= 0.0) {
+        o.position  = float4(-2.0, -2.0, -2.0, 1.0);
+        o.color     = float4(0.0);
+        o.pointSize = 0.0;
+        return o;
+    }
+
+    float t = clamp(p.age / max(p.lifetime, 1e-3), 0.0, 1.0);
+
+    float4 clip = u.projection * u.view * float4(p.pos, 1.0);
+    o.position  = clip;
+
+    float4 c = mix(u.colorStart, u.colorEnd, t);
+    c.a *= sampleAlphaCurve(t, u.alphaCurve);
+    o.color     = c;
+
+    // Slight perspective scaling so distant particles shrink.
+    float distScale = max(0.2, 1.0 / max(clip.w, 0.1));
+    o.pointSize = max(1.0, u.bboxExtentSize.w * distScale);
+    return o;
+}
+
+fragment float4 fs_sprite(SpriteVSOut in [[stage_in]],
+                          float2     pc  [[point_coord]])
+{
+    // Radial soft disk.
+    float2 d = pc - 0.5;
+    float  r2 = dot(d, d) * 4.0;          // 0 at centre, 1 at edge
+    float  alpha = max(0.0, 1.0 - r2);
+    alpha *= alpha;                        // ease-out
+    float4 c = in.color;
+    c.rgb *= c.a * alpha;                  // additive premultiplied
+    c.a    = c.a * alpha;
+    return c;
+}
+
+// ============================================================
+// 11. Render — trails (line strip per particle)
+// ============================================================
+// Issued as drawPrimitives(LineStrip, particleIdx_offset, K). Each instance
+// = one particle. vertex_id ∈ [0, K). Reads from trailRing.
+
+struct TrailVSOut {
+    float4 position [[position]];
+    float4 color;
+};
+
+vertex TrailVSOut vs_trail(
+    device const Particle*       P         [[buffer(0)]],
+    constant ParticleUniforms&   u         [[buffer(1)]],
+    device const TrailEntry*     trails    [[buffer(4)]],
+    device const uint*           trailHead [[buffer(5)]],
+    uint                         vid       [[vertex_id]],
+    uint                         iid       [[instance_id]])
+{
+    TrailVSOut o;
+    uint K = uint(u.viewportMode.z + 0.5);
+    Particle p = P[iid];
+    if (p.age >= p.lifetime || p.lifetime <= 0.0) {
+        o.position = float4(-2.0, -2.0, -2.0, 1.0);
+        o.color    = float4(0.0);
+        return o;
+    }
+
+    // vid = 0 -> head (newest); vid = K-1 -> tail (oldest).
+    uint head = trailHead[iid];
+    uint idx  = (head + K - vid) % K;
+    float3 pos = trails[iid * K + idx].pos;
+
+    o.position = u.projection * u.view * float4(pos, 1.0);
+
+    float ageT = clamp(p.age / max(p.lifetime, 1e-3), 0.0, 1.0);
+    float taper = 1.0 - float(vid) / float(max(K - 1u, 1u));   // 1 at head -> 0 at tail
+    float4 c = mix(u.colorStart, u.colorEnd, ageT);
+    c.a *= sampleAlphaCurve(ageT, u.alphaCurve) * taper;
+    o.color = c;
+    return o;
+}
+
+fragment float4 fs_trail(TrailVSOut in [[stage_in]])
+{
+    float4 c = in.color;
+    c.rgb *= c.a;     // additive premultiplied
+    return c;
+}
+
+)PARTICLES_MSL"

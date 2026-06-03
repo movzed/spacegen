@@ -266,13 +266,10 @@ add_executable(spacegen
     effects/bloom/BloomEffect.cpp
     effects/motion_blur/MotionBlurEffect.cpp
     effects/hologram/HologramMaterialLayer.cpp
-    # The next 4 require engine-side helpers (ping-pong target, .literal
-    # generation, VolumetricUniforms) that need to be added before they
-    # link cleanly. Spec is in each effect's INTEGRATION.md.
-    #effects/post_fx/ChromaticAberrationEffect.cpp
-    #effects/post_fx/GlitchEffect.cpp
-    #effects/sdf_particles/SDFParticleLayer.cpp
-    #effects/volumetric_beams/VolumetricBeamLayer.cpp
+    effects/post_fx/ChromaticAberrationEffect.cpp
+    effects/post_fx/GlitchEffect.cpp
+    effects/sdf_particles/SDFParticleLayer.cpp
+    effects/volumetric_beams/VolumetricBeamLayer.cpp
     ${IMGUI_SOURCES}
 )
 

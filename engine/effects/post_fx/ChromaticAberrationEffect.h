@@ -14,7 +14,8 @@
 //
 // Single fullscreen-quad pass. No mesh data required.
 
-#include "../../../core/Layer.h"
+#include "Layer.h"
+#include <Metal/Metal.hpp>
 
 namespace MTL {
 class RenderPipelineState;

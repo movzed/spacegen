@@ -1012,4 +1012,87 @@ bool MetalRenderer::reloadMesh(size_t meshIdx, const MeshData& m) {
     return true;
 }
 
+// =============================================================================
+// Effect-layer helpers (added 2026-05 alongside the 11 agent-designed
+// effects under engine/effects/).
+// =============================================================================
+
+namespace {
+// Lazy storage for the post-FX ping-pong scratch + sampler. Keeping them
+// in an anonymous namespace local to this TU means we don't need to
+// expand the MetalRenderer's private state to support the helpers.
+struct PostFxState {
+    MTL::Texture*      scratch    = nullptr;
+    int                width      = 0;
+    int                height     = 0;
+    MTL::PixelFormat   format     = MTL::PixelFormatBGRA8Unorm;
+    MTL::SamplerState* sampler    = nullptr;
+};
+static PostFxState gPostFx;
+
+MTL::Texture* ensurePingPongScratch(MTL::Device* dev, MTL::Texture* ref) {
+    int w = static_cast<int>(ref->width());
+    int h = static_cast<int>(ref->height());
+    MTL::PixelFormat fmt = ref->pixelFormat();
+    if (gPostFx.scratch && gPostFx.width == w && gPostFx.height == h
+        && gPostFx.format == fmt) return gPostFx.scratch;
+    if (gPostFx.scratch) gPostFx.scratch->release();
+    MTL::TextureDescriptor* td = MTL::TextureDescriptor::texture2DDescriptor(
+        fmt, w, h, false);
+    td->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+    td->setStorageMode(MTL::StorageModePrivate);
+    gPostFx.scratch = dev->newTexture(td);
+    gPostFx.width   = w;
+    gPostFx.height  = h;
+    gPostFx.format  = fmt;
+    return gPostFx.scratch;
+}
+} // anonymous namespace
+
+MTL::Texture* MetalRenderer::acquirePingPongTarget(RenderContext& ctx) {
+    if (!ctx.colorTarget) return nullptr;
+    return ensurePingPongScratch(device_, ctx.colorTarget);
+}
+
+void MetalRenderer::swapPingPong(RenderContext& ctx) {
+    // After an effect rendered into the partner, swap so subsequent
+    // layers see that as colorTarget. We retain/release to avoid the
+    // engine owning the lifetime confusion: gPostFx.scratch holds a
+    // strong reference; ctx.colorTarget is just a non-owning pointer
+    // managed by the offscreen texture pool in Workstation.
+    if (!ctx.colorTarget || !gPostFx.scratch) return;
+    // Swap pointers: whatever ctx.colorTarget used to point at becomes
+    // the new ping-pong scratch; ctx.colorTarget now points at what
+    // was the scratch (and just got written).
+    MTL::Texture* oldColor = ctx.colorTarget;
+    ctx.colorTarget = gPostFx.scratch;
+    gPostFx.scratch = oldColor;
+    // (Sizes and format are guaranteed identical by ensurePingPongScratch.)
+}
+
+MTL::SamplerState* MetalRenderer::postFxSampler() {
+    if (gPostFx.sampler) return gPostFx.sampler;
+    MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+    sd->setMinFilter(MTL::SamplerMinMagFilterLinear);
+    sd->setMagFilter(MTL::SamplerMinMagFilterLinear);
+    sd->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
+    sd->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
+    sd->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
+    gPostFx.sampler = device_->newSamplerState(sd);
+    sd->release();
+    return gPostFx.sampler;
+}
+
+void MetalRenderer::renderVolumetricBeams(RenderContext& ctx,
+                                           const VolumetricUniforms& u)
+{
+    // Stub implementation — the volumetric beams effect is DEFAULT-OFF
+    // per the operator constraint ("never show a light cone in air,
+    // only the projection on the stage"). When you intentionally enable
+    // it, this stub renders nothing; the full raymarch path is documented
+    // in engine/effects/volumetric_beams/INTEGRATION.md and lives there
+    // until somebody decides to break the projection-mapping rule.
+    (void)ctx; (void)u;
+}
+
 } // namespace spacegen

@@ -34,6 +34,10 @@
 #include "../effects/bloom/BloomEffect.h"
 #include "../effects/motion_blur/MotionBlurEffect.h"
 #include "../effects/hologram/HologramMaterialLayer.h"
+#include "../effects/post_fx/ChromaticAberrationEffect.h"
+#include "../effects/post_fx/GlitchEffect.h"
+#include "../effects/sdf_particles/SDFParticleLayer.h"
+#include "../effects/volumetric_beams/VolumetricBeamLayer.h"
 
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -290,6 +294,45 @@ void drawLayerRack(spacegen::Scene& scene,
                        scene.bus.layers.size());
         c->name = buf;
         selectedLayerId = c->id;
+    }
+    if (ImGui::Button("+ Chromatic Aberr.")) {
+        auto* e = scene.bus.add<spacegen::ChromaticAberrationEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "CA %zu",
+                       scene.bus.layers.size());
+        e->name = buf;
+        selectedLayerId = e->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Glitch")) {
+        auto* e = scene.bus.add<spacegen::GlitchEffect>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Glitch %zu",
+                       scene.bus.layers.size());
+        e->name = buf;
+        selectedLayerId = e->id;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ SDF Particles")) {
+        auto* p = scene.bus.add<spacegen::SDFParticleLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "SDF Particles %zu",
+                       scene.bus.layers.size());
+        p->name = buf;
+        selectedLayerId = p->id;
+    }
+    // Volumetric beams violates the projection-mapping principle
+    // ("never show the light cone in air, only the projection on the
+    // stage"). The button exists for completeness but the render
+    // path is a stub — see MetalRenderer::renderVolumetricBeams.
+    if (ImGui::Button("+ Volumetric (off-spec)")) {
+        auto* v = scene.bus.add<spacegen::VolumetricBeamLayer>();
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "Volumetric %zu",
+                       scene.bus.layers.size());
+        v->name = buf;
+        v->state = spacegen::LayerState::Disabled;  // default OFF
+        selectedLayerId = v->id;
     }
     ImGui::Separator();
 
